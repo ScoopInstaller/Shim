@@ -1,21 +1,20 @@
-Param([Switch]$Fast)
 Push-Location $psscriptroot
-. "$psscriptroot\..\..\lib\install.ps1"
 
-if(!$Fast) {
-    Write-Host "Install dependencies ..."
-    Invoke-Expression "$psscriptroot\install.ps1"
-}
+# Prepare
+$build = "$PSScriptRoot\build"
+$src = "$PSScriptRoot\src"
+New-Item -ItemType Directory -Path $build -ErrorAction SilentlyContinue | Out-Null
+Remove-Item "$build\*" -Recurse -Force | Out-Null
 
-$output = "$psscriptroot\bin"
+# Build
 Write-Output 'Compiling shim.cs ...'
-& "$psscriptroot\packages\Microsoft.Net.Compilers\tools\csc.exe" /deterministic /platform:anycpu /nologo /optimize /target:exe /out:"$output\shim.exe" shim.cs
+& "$PSScriptRoot\packages\Microsoft.Net.Compilers\tools\csc.exe" /deterministic /platform:anycpu /nologo /optimize /target:exe /out:"$build\shim.exe" "$src\shim.cs"
 
+# Checksums
 Write-Output 'Computing checksums ...'
-Remove-Item "$psscriptroot\bin\checksum.sha256" -ErrorAction Ignore
-Remove-Item "$psscriptroot\bin\checksum.sha512" -ErrorAction Ignore
-Get-ChildItem "$psscriptroot\bin\*" -Include *.exe,*.dll | ForEach-Object {
-    "$(compute_hash $_ 'sha256') *$($_.Name)" | Out-File "$psscriptroot\bin\checksum.sha256" -Append -Encoding oem
-    "$(compute_hash $_ 'sha512') *$($_.Name)" | Out-File "$psscriptroot\bin\checksum.sha512" -Append -Encoding oem
+Get-ChildItem "$build\*" -Include *.exe,*.dll -Recurse | ForEach-Object {
+    $checksum = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
+    "$checksum *$($_.Name)" | Tee-Object -FilePath "$build\$($_.Name).sha256" -Append
 }
+
 Pop-Location
