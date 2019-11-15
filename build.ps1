@@ -8,7 +8,7 @@ Remove-Item "$build\*" -Recurse -Force | Out-Null
 
 # Build
 Write-Output 'Compiling shim.cs ...'
-& "$PSScriptRoot\packages\Microsoft.Net.Compilers\tools\csc.exe" /deterministic /platform:anycpu /nologo /optimize /target:exe /out:"$build\shim.exe" "$src\shim.cs"
+& "$PSScriptRoot\packages\Microsoft.Net.Compilers\tools\csc.exe" /deterministic /platform:anycpu /nologo /optimize /target:winexe /out:"$build\shim.exe" "$src\shim.cs"
 
 # Checksums
 Write-Output 'Computing checksums ...'
