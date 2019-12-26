@@ -6,7 +6,6 @@ $src = "$PSScriptRoot\src"
 New-Item -ItemType Directory -Path $build -ErrorAction SilentlyContinue | Out-Null
 Remove-Item "$build\*" -Recurse -Force | Out-Null
 
-#cmd.exe /c "call `"C:\Program Files (x86)\Microsoft Visual Studio\2017\BuildTools\VC\Auxiliary\Build\vcvars64.bat`" && set > %temp%\vcvars.txt"
 cmd.exe /c "call `"C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvars64.bat`" && set > %temp%\vcvars.txt"
 
 Get-Content "$env:temp\vcvars.txt" | Foreach-Object {
@@ -16,8 +15,10 @@ Get-Content "$env:temp\vcvars.txt" | Foreach-Object {
 }
 
 # Build
-Write-Output 'Compiling shim.cs ...'
-& "cl.exe" /O1 /Fe"$build\shim.exe" "$src\shim.c"
+Write-Output 'Compiling shim.c ...'
+& cmd /c cl.exe /O1 /Fe"$build\shim.exe" "$src\shim.c" '2>&1'
+
+if($LastExitCode -ne 0) { $host.SetShouldExit($LastExitCode )  }
 
 # Checksums
 Write-Output 'Computing checksums ...'
