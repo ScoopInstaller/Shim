@@ -6,7 +6,7 @@ $src = "$PSScriptRoot\src"
 New-Item -ItemType Directory -Path $build -ErrorAction SilentlyContinue | Out-Null
 Remove-Item "$build\*" -Recurse -Force | Out-Null
 
-cmd.exe /c "call `"C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvars64.bat`" && set > %temp%\vcvars.txt"
+cmd.exe /c "call `"C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvars32.bat`" && set > %temp%\vcvars.txt"
 
 Get-Content "$env:temp\vcvars.txt" | Foreach-Object {
   if ($_ -match "^(.*?)=(.*)$") {
