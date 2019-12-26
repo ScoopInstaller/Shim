@@ -6,9 +6,18 @@ $src = "$PSScriptRoot\src"
 New-Item -ItemType Directory -Path $build -ErrorAction SilentlyContinue | Out-Null
 Remove-Item "$build\*" -Recurse -Force | Out-Null
 
+#cmd.exe /c "call `"C:\Program Files (x86)\Microsoft Visual Studio\2017\BuildTools\VC\Auxiliary\Build\vcvars64.bat`" && set > %temp%\vcvars.txt"
+cmd.exe /c "call `"C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvars64.bat`" && set > %temp%\vcvars.txt"
+
+Get-Content "$env:temp\vcvars.txt" | Foreach-Object {
+  if ($_ -match "^(.*?)=(.*)$") {
+    Set-Content "env:\$($matches[1])" $matches[2]
+  }
+}
+
 # Build
 Write-Output 'Compiling shim.cs ...'
-& "$PSScriptRoot\packages\Microsoft.Net.Compilers\tools\csc.exe" /deterministic /platform:anycpu /nologo /optimize /target:exe /out:"$build\shim.exe" "$src\shim.cs"
+& "cl.exe" /O1 /Fe"$build\shim.exe" "$src\shim.c"
 
 # Checksums
 Write-Output 'Computing checksums ...'
