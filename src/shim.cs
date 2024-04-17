@@ -11,7 +11,7 @@ using System.Runtime.InteropServices;
 
 namespace Scoop {
 
-    class Program {
+    public class Program {
         [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
         static extern bool CreateProcess(string lpApplicationName,
             string lpCommandLine, IntPtr lpProcessAttributes,
@@ -159,13 +159,13 @@ namespace Scoop {
             return cmdLine.Substring(space + 1);
         }
 
-        static string Get(Dictionary<string, string> dic, string key) {
+        public static string Get(Dictionary<string, string> dic, string key) {
             string value = null;
             dic.TryGetValue(key, out value);
             return value;
         }
 
-        static Dictionary<string, string> Config(string path) {
+        public static Dictionary<string, string> Config(string path) {
             var config = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach(var line in File.ReadAllLines(path)) {
                 var m = Regex.Match(line, @"([^=]+)=(.*)");

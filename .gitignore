@@ -1,1 +1,4 @@
-packages/
+dist/
+bin/
+obj/
+.vs/
