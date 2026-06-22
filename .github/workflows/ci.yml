@@ -163,8 +163,7 @@ jobs:
                 "target": "$1"
               }
             ],
-            "pr_template": "- #{{TITLE}} (#{{NUMBER}})",
-            "commit_template": "- #{{TITLE}} (#{{MERGE_SHA}})"
+            "commit_template": "- #{{TITLE}} (thanks @#{{AUTHOR}})"
           }
         includeOnlyPaths: |
           ${{ matrix.component }}/
