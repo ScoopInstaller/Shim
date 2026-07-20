@@ -29,7 +29,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{ .default_target = CrossTarget{
         .os_tag = .windows,
-        .abi = .gnu,
+        .cpu_arch = .x86_64,
+        .abi = .msvc,
     } });
     const strip = b.option(bool, "strip", "Strip debug symbols from the executable") orelse false;
 

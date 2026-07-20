@@ -131,7 +131,7 @@ inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
             si.hStdInput = nullptr;
         }
     }
-    
+
     // Check stdout
     if (si.hStdOutput == nullptr || si.hStdOutput == INVALID_HANDLE_VALUE)
     {
@@ -141,7 +141,7 @@ inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
             si.hStdOutput = nullptr;
         }
     }
-    
+
     // Check stderr
     if (si.hStdError == nullptr || si.hStdError == INVALID_HANDLE_VALUE)
     {
@@ -190,7 +190,8 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 // - Trailing backslashes inside a quoted argument are doubled
 [[nodiscard]] std::wstring QuoteArg(std::wstring_view arg)
 {
-    if (arg.empty()) return L"\"\"";
+    if (arg.empty())
+        return L"\"\"";
 
     bool needsQuoting = false;
     for (wchar_t c : arg)
@@ -202,7 +203,8 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         }
     }
 
-    if (!needsQuoting) return std::wstring(arg);
+    if (!needsQuoting)
+        return std::wstring(arg);
 
     std::wstring result;
     result.reserve(arg.size() + 8);
@@ -214,7 +216,8 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         if (arg[i] == L'\\')
         {
             size_t bsStart = i;
-            while (i < arg.size() && arg[i] == L'\\') ++i;
+            while (i < arg.size() && arg[i] == L'\\')
+                ++i;
 
             if (i == arg.size())
             {
@@ -252,8 +255,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 }
 
 // Build a properly quoted command line from individual arguments
-[[nodiscard]] std::wstring BuildCommandLine(const std::wstring& exePath,
-                                            const std::vector<std::wstring>& args)
+[[nodiscard]] std::wstring BuildCommandLine(const std::wstring& exePath, const std::vector<std::wstring>& args)
 {
     std::wstring cmd = QuoteArg(exePath);
     for (const auto& arg : args)
@@ -270,7 +272,8 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     std::wstring params;
     for (size_t i = 0; i < args.size(); ++i)
     {
-        if (i > 0) params += L' ';
+        if (i > 0)
+            params += L' ';
         params += QuoteArg(args[i]);
     }
     return params;
@@ -291,8 +294,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         return false;
     }
 
-    const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-        reinterpret_cast<const BYTE*>(hModule) + dosHeader->e_lfanew);
+    const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const BYTE*>(hModule) + dosHeader->e_lfanew);
     if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) [[unlikely]]
     {
         return false;
@@ -304,10 +306,9 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 // Parse boolean-like value: "true", "1", "yes" -> true
 [[nodiscard]] bool ParseBool(std::wstring_view value) noexcept
 {
-    return !value.empty() &&
-        (_wcsicmp(value.data(), L"true") == 0 ||
-         _wcsicmp(value.data(), L"1") == 0 ||
-         _wcsicmp(value.data(), L"yes") == 0);
+    // _wcsnicmp compares exactly N chars — safe on non-null-terminated views
+    return (value.size() == 4 && _wcsnicmp(value.data(), L"true", 4) == 0) || (value.size() == 1 && value[0] == L'1') ||
+           (value.size() == 3 && _wcsnicmp(value.data(), L"yes", 3) == 0);
 }
 
 // Expand %ENV_VAR% references using Windows native API
@@ -364,7 +365,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         toResolve.append(path);
     }
 
-    std::array<wchar_t, MAX_PATH + 2> resolved{};
+    std::array<wchar_t, MAX_PATH + 2> resolved {};
     wchar_t* filePart = nullptr;
     DWORD len = GetFullPathNameW(toResolve.c_str(), MAX_PATH, resolved.data(), &filePart);
     if (len == 0 || len >= MAX_PATH) [[unlikely]]
@@ -373,9 +374,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         return toResolve;
     }
 
-    size_t dirLen = (filePart != nullptr)
-        ? static_cast<size_t>(filePart - resolved.data())
-        : len;
+    size_t dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - resolved.data()) : len;
 
     // Ensure trailing backslash
     if (dirLen > 0 && (resolved[dirLen - 1] == L'\\' || resolved[dirLen - 1] == L'/'))
@@ -386,41 +385,47 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
 // Parse a trimmed .shim line into (name, value) pair.
 // Returns nullopt for empty lines, comments, or lines without " = " separator.
-[[nodiscard]] std::optional<std::pair<std::wstring_view, std::wstring_view>>
-ParseShimLine(std::wstring_view line) noexcept
+[[nodiscard]] std::optional<std::pair<std::wstring_view, std::wstring_view>> ParseShimLine(std::wstring_view line) noexcept
 {
     // Skip leading whitespace (any Unicode whitespace, not just ASCII)
     auto skipWS = [](std::wstring_view s, size_t start = 0) -> size_t {
-        while (start < s.size() && iswspace(s[start])) ++start;
+        while (start < s.size() && iswspace(s[start]))
+            ++start;
         return start;
     };
     auto rskipWS = [](std::wstring_view s) -> size_t {
         size_t i = s.size();
-        while (i > 0 && iswspace(s[i - 1])) --i;
+        while (i > 0 && iswspace(s[i - 1]))
+            --i;
         return i;
     };
 
     // Skip comments
     auto first = skipWS(line);
-    if (first >= line.size() || line[first] == L'#' || line[first] == L';') return std::nullopt;
-    if (line.substr(first).starts_with(L"//")) return std::nullopt;
+    if (first >= line.size() || line[first] == L'#' || line[first] == L';')
+        return std::nullopt;
+    if (line.substr(first).starts_with(L"//"))
+        return std::nullopt;
 
     auto sepPos = line.find(c_separator);
-    if (sepPos == std::wstring_view::npos) return std::nullopt;
+    if (sepPos == std::wstring_view::npos)
+        return std::nullopt;
 
     const auto nameRaw = line.substr(0, sepPos);
     const auto valueRaw = line.substr(sepPos + c_separator.size());
 
     auto nameStart = skipWS(nameRaw);
     auto nameEnd = rskipWS(nameRaw);
-    if (nameStart >= nameEnd) return std::nullopt;
+    if (nameStart >= nameEnd)
+        return std::nullopt;
     auto name = nameRaw.substr(nameStart, nameEnd - nameStart);
-    if (name.empty()) return std::nullopt;
+    if (name.empty())
+        return std::nullopt;
 
     auto valueStart = skipWS(valueRaw);
     auto value = (valueStart >= valueRaw.size()) ? L""sv : valueRaw.substr(valueStart);
 
-    return std::pair{name, value};
+    return std::pair {name, value};
 }
 
 [[nodiscard]] ShimInfo GetShimInfo()
@@ -460,12 +465,13 @@ ParseShimLine(std::wstring_view line) noexcept
     // First pass: find path, resolve to absolute, compute targetDir.
     // %~dp0 expands to the directory containing the target executable,
     // resolved relative to the shim's own directory.
-    std::wstring targetDir{curDir};
+    std::wstring targetDir {curDir};
     for (const auto& rawLine : allLines)
     {
         auto line = TrimTrailingWhitespace(rawLine);
         auto parsed = ParseShimLine(line);
-        if (!parsed || parsed->first != c_pathPrefix) continue;
+        if (!parsed || parsed->first != c_pathPrefix)
+            continue;
 
         std::wstring expanded = ExpandAndUnquote(parsed->second);
         targetDir = ResolveAgainstBase(expanded, curDir);
@@ -478,7 +484,8 @@ ParseShimLine(std::wstring_view line) noexcept
     {
         auto line = TrimTrailingWhitespace(rawLine);
         auto parsed = ParseShimLine(line);
-        if (!parsed) continue;
+        if (!parsed)
+            continue;
 
         const auto& [name, value] = *parsed;
 
@@ -524,11 +531,7 @@ ParseShimLine(std::wstring_view line) noexcept
     return info;
 }
 
-[[nodiscard]] ProcessResult LaunchElevated(
-    const std::wstring& path,
-    const std::wstring& params,
-    const wchar_t* cwd,
-    HANDLE jobHandle) noexcept
+[[nodiscard]] ProcessResult LaunchElevated(const std::wstring& path, const std::wstring& params, const wchar_t* cwd, HANDLE jobHandle) noexcept
 {
     ProcessResult result;
 
