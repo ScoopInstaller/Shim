@@ -9,6 +9,7 @@ target/
 
 # Generated resource files
 shim.rc
+cs/Properties/AssemblyInfo.cs
 
 # Compiler/linker intermediate files
 *.obj

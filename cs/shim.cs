@@ -404,13 +404,13 @@ namespace Scoop
 
         static ShimInfo ParseShimInfo()
         {
-			// Get filename of current executable
+            // Get filename of current executable
             var exePath = GetModulePath();
             var dir = "";
             int sep = Math.Max(exePath.LastIndexOf('\\'), exePath.LastIndexOf('/'));
             if (sep >= 0) dir = exePath.Substring(0, sep);
 
-			// Replace .exe with .shim
+            // Replace .exe with .shim
             var configPath = exePath.Substring(0, exePath.Length - 4) + ".shim";
 
             if (!File.Exists(configPath))
