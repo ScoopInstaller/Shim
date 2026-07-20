@@ -76,7 +76,7 @@ jobs:
         fetch-tags: true
     - name: Setup .NET
       if: matrix.setup == 'dotnet'
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
     - name: Setup Zig
       if: matrix.setup == 'zig'
       uses: mlugg/setup-zig@v2
