@@ -12,9 +12,11 @@ fn main() {
         res.set("FileVersion", &ver);
         res.set("ProductVersion", &ver);
         res.set("ProductName", "Scoop Shim Ex");
-        res.set("FileDescription", "Scoop helper program for shimming executables.");
         res.set("CompanyName", "Scoop contributors");
-        res.set("LegalCopyright", "Copyright (c) 2013-present Scoop contributors");
+        res.set(
+            "LegalCopyright",
+            "Copyright (c) 2013-present Scoop contributors",
+        );
         res.set("OriginalFilename", "shim.exe");
         res.compile().expect("failed to compile Windows resource");
     }

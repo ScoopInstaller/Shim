@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 // Scoop shim — Rust implementation
 
 use std::ffi::OsStr;
@@ -14,12 +14,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetFullPathNameW, WriteFile, FILE_SHARE_MODE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GetStdHandle, SetConsoleCtrlHandler,
-    STD_ERROR_HANDLE,
+    AttachConsole, FreeConsole, GetStdHandle, SetConsoleCtrlHandler, STD_ERROR_HANDLE,
 };
-use windows_sys::Win32::System::Environment::{
-    ExpandEnvironmentStringsW, SetEnvironmentVariableW,
-};
+use windows_sys::Win32::System::Environment::{ExpandEnvironmentStringsW, SetEnvironmentVariableW};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -31,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{
-    CommandLineToArgvW, ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS,
+    CommandLineToArgvW, ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
@@ -294,7 +291,8 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
         };
 
         // Ensure trailing backslash
-        if dir_len > 0 && (resolved[dir_len - 1] == b'\\' as u16 || resolved[dir_len - 1] == b'/' as u16)
+        if dir_len > 0
+            && (resolved[dir_len - 1] == b'\\' as u16 || resolved[dir_len - 1] == b'/' as u16)
         {
             return String::from_utf16_lossy(&resolved[..dir_len]);
         }
@@ -443,7 +441,11 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
     let mut target_dir = cur_dir.to_string();
     let mut first_line = true;
     for line in &all_lines {
-        let line = if first_line { line.trim_start_matches('\u{feff}') } else { line };
+        let line = if first_line {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
         first_line = false;
         if let Some((key, value)) = parse_shim_line(line) {
             if key != "path" {
@@ -458,9 +460,15 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
     // Second pass: parse all fields with target_dir for %~dp0
     let mut first_line = true;
     for line in &all_lines {
-        let line = if first_line { line.trim_start_matches('\u{feff}') } else { line };
+        let line = if first_line {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
         first_line = false;
-        let Some((key, value)) = parse_shim_line(line) else { continue };
+        let Some((key, value)) = parse_shim_line(line) else {
+            continue;
+        };
 
         match key.as_str() {
             "path" => {
@@ -484,7 +492,8 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
                 info.elevate = parse_bool(&value);
             }
             _ => {
-                info.env_vars.push((key.to_string(), expand_and_strip_quotes(&value)));
+                info.env_vars
+                    .push((key.to_string(), expand_and_strip_quotes(&value)));
             }
         }
     }
@@ -533,7 +542,7 @@ unsafe fn launch_elevated(
 // Process creation
 // ---------------------------------------------------------------------------
 
-unsafe fn make_process(info: &ShimInfo, is_gui: bool, job_handle: HANDLE) -> (HANDLE, HANDLE) {
+unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     let path = match &info.path {
         Some(p) => p,
         None => return (NULL_HANDLE, NULL_HANDLE),
@@ -554,7 +563,9 @@ unsafe fn make_process(info: &ShimInfo, is_gui: bool, job_handle: HANDLE) -> (HA
     let params = {
         let mut p = String::new();
         for (i, arg) in info.args.iter().enumerate() {
-            if i > 0 { p.push(' '); }
+            if i > 0 {
+                p.push(' ');
+            }
             p.push_str(&quote_arg(arg));
         }
         to_wide_null(&p)
@@ -564,9 +575,7 @@ unsafe fn make_process(info: &ShimInfo, is_gui: bool, job_handle: HANDLE) -> (HA
     let mut si: STARTUPINFOW = std::mem::zeroed();
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     GetStartupInfoW(&mut si);
-    if is_gui {
-        ensure_standard_handles(&mut si);
-    }
+    ensure_standard_handles(&mut si);
 
     let cwd_w = info.cwd.as_ref().map(|c| to_wide_null(c));
     let cwd_ptr = match &cwd_w {
@@ -648,9 +657,13 @@ fn main() {
     let is_gui = unsafe { is_gui_subsystem() };
     if is_gui {
         if has_user_args || !info.args.is_empty() {
-            unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+            unsafe {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
         } else {
-            unsafe { FreeConsole(); }
+            unsafe {
+                FreeConsole();
+            }
         }
     }
 
@@ -672,10 +685,12 @@ fn main() {
     }
 
     // Register Ctrl+C handler before process creation
-    unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1); }
+    unsafe {
+        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+    }
 
     // Launch process
-    let (process_handle, thread_handle) = unsafe { make_process(&info, is_gui, job_handle) };
+    let (process_handle, thread_handle) = unsafe { make_process(&info, job_handle) };
 
     if process_handle == NULL_HANDLE {
         std::process::exit(1);
