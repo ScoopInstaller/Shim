@@ -60,6 +60,37 @@ jobs:
         if (-not $filtered) { $filtered = @() }
         echo "value=$($filtered | ConvertTo-Json -Compress -AsArray)" >> $env:GITHUB_OUTPUT
 
+  format:
+    needs: detect
+    if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup .NET
+      if: matrix.setup == 'dotnet'
+      uses: actions/setup-dotnet@v6
+    - name: Setup Zig
+      if: matrix.setup == 'zig'
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.16.0
+    - name: Setup Rust
+      if: matrix.setup == 'rust'
+      uses: dtolnay/rust-toolchain@stable
+    - name: Check ${{ matrix.component }} formatting
+      shell: pwsh
+      run: |
+        switch ('${{ matrix.component }}') {
+          'cpp'  { clang-format --dry-run --Werror cpp/shim.cpp }
+          'rust' { Push-Location rust; cargo fmt --check; Pop-Location }
+          'zig'  { Push-Location zig; zig fmt --check shim.zig; Pop-Location }
+          'cs'   { dotnet format cs/shim.csproj --verify-no-changes }
+        }
+
   build:
     permissions:
       contents: write
