@@ -185,6 +185,15 @@ Invoke-ShimTest "%~VAR% expansion in path" -Setup {
     @{ Pass = $r.Output -match [regex]::Escape("TEMP=$env:TEMP"); Message = "Output: $($r.Output)" }
 }
 
+Invoke-ShimTest "Unknown %VAR% preserved as-is" -Setup {
+    param($d)
+    Write-Batch "$d\echoargs.cmd" "echo %*"
+    Write-Shim $d "test" "path = $d\echoargs.cmd`nargs = %NONEXISTENT_SHIM_TEST_VAR%"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match [regex]::Escape("%NONEXISTENT_SHIM_TEST_VAR%"); Message = "Output: $($r.Output)" }
+}
+
 # --- Environment variables from .shim -----------------------------------------
 
 Invoke-ShimTest "Environment variables from .shim" -Setup {
@@ -366,6 +375,17 @@ Invoke-ShimTest "cwd value with quotes stripped" -Setup {
     @{ Pass = $r.Output -match [regex]::Escape("$($r.TestDir)\workdir"); Message = "Output: $($r.Output)" }
 }
 
+Invoke-ShimTest "workdir alias for cwd" -Setup {
+    param($d)
+    $wdDir = "$d\wd"
+    New-Item -ItemType Directory -Path $wdDir -Force | Out-Null
+    Write-Batch "$d\echocwd.cmd" "echo %CD%"
+    Write-Shim $d "test" "path = $d\echocwd.cmd`nworkdir = $wdDir"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match [regex]::Escape("$($r.TestDir)\wd"); Message = "Output: $($r.Output)" }
+}
+
 # --- Process lifecycle ---------------------------------------------------------
 
 # Direct-child-only: complex process chain — uses Start-Process + Wait-Process
@@ -411,6 +431,27 @@ Invoke-ShimTest "Special keys not leaked as env vars" -Setup {
 } -Assert {
     param($r)
     @{ Pass = ($r.Output -notmatch "ELEVATE_ENV=\S") -and ($r.Output -notmatch "CWD_ENV=\S"); Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "runas alias not leaked as env var" -Setup {
+    param($d)
+    Write-Batch "$d\checkenv.cmd" "echo RUNAS_ENV=%runas%"
+    Write-Shim $d "test" "path = $d\checkenv.cmd`nrunas = false"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -notmatch "RUNAS_ENV=\S"; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "elevate = true triggers elevation path" -Setup {
+    param($d)
+    Write-Batch "$d\app.cmd" "echo ELEVATE_MARKER"
+    Write-Shim $d "test" "path = $d\app.cmd`nelevate = true"
+} -Assert {
+    param($r)
+    # Elevation path (ShellExecuteExW) runs child in a separate console — output
+    # never reaches this pipe. Bug path (CreateProcessW) inherits our console.
+    $bugPresent = ($r.Output -match "ELEVATE_MARKER") -and ($r.ExitCode -eq 0)
+    @{ Pass = -not $bugPresent; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
 # --- GUI subsystem -------------------------------------------------------------
