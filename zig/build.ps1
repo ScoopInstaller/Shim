@@ -51,7 +51,6 @@ BEGIN
       VALUE "FileVersion",      "$ver"
       VALUE "ProductVersion",   "$ver"
       VALUE "ProductName",      "Scoop Shim Ex"
-      VALUE "FileDescription",  "Scoop helper program for shimming executables."
       VALUE "CompanyName",      "Scoop contributors"
       VALUE "LegalCopyright",   "Copyright (c) 2013-present Scoop contributors"
       VALUE "OriginalFilename", "shim.exe"
@@ -95,5 +94,8 @@ Remove-Item -Path $binDir -Recurse -Force -ErrorAction SilentlyContinue
 
 if ($Target) { Invoke-Build $Target }
 else { foreach ($t in @('x86', 'x64', 'arm64')) { Invoke-Build $t } }
+
+# Cleanup generated resource files
+Remove-Item -Path (Join-Path $PSScriptRoot 'shim.rc') -ErrorAction SilentlyContinue
 
 Write-Host "Done: $binDir" -ForegroundColor Green
