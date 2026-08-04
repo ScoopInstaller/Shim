@@ -20,13 +20,13 @@ Lines starting with `#`, `;`, or `//`, as well as blank lines, are ignored.
 
 ### Fields
 
-| Field | Description |
-|-------|-------------|
-| `path` | **(Required)** Path to the target executable |
-| `args` | Arguments passed to the target |
-| `cwd` (`workdir`) | Working directory for the target process |
+| Field               | Description                                             |
+| ------------------- | ------------------------------------------------------- |
+| `path`              | **(Required)** Path to the target executable            |
+| `args`              | Arguments passed to the target                          |
+| `cwd` (`workdir`)   | Working directory for the target process                |
 | `elevate` (`runas`) | Request UAC elevation. Valid values: `true`, `1`, `yes` |
-| Any other name | Environment variable set for the target process |
+| Any other name      | Environment variable set for the target process         |
 
 ### Value Quoting
 
@@ -61,7 +61,7 @@ Copy-Item -Path .\cpp\bin\x64\shim.exe -Destination .\test.exe
 
 ## Implementations
 
-- **C#** — .NET Framework 4.5 (CLR). Maintained as the legacy lane.
+- **C#** — .NET Framework 4.5 (CLR).
 - **C++** — Native executable with no runtime dependencies. Zig build (default).
 - **Rust** — Native executable using `windows-sys` raw FFI bindings. Cargo build.
 - **Zig** — Native executable using custom `wWinMainCRTStartup` entry. Zig build only.
@@ -70,25 +70,25 @@ All implementations share the same `.shim` format.
 
 ## Binary Size
 
-| Implementation | Build Tool | x86 | x64 | arm64 |
-|----------------|-----------|----:|----:|------:|
-| C# | dotnet | 15.0 KB | 14.5 KB | 14.5 KB |
-| C++ | Zig | 130.5 KB | 158.0 KB | 151.5 KB |
-| C++ | MSBuild | 129.5 KB | 155.0 KB | 140.5 KB |
-| Rust | Cargo | 108.0 KB | 121.5 KB | 119.0 KB |
-| Zig | Zig | 81.5 KB | 71.5 KB | 21.0 KB |
+| Implementation | Build Tool |      x86 |      x64 |    arm64 |
+| -------------- | ---------- | -------: | -------: | -------: |
+| C#             | dotnet     |  15.0 KB |  14.5 KB |  14.5 KB |
+| C++            | Zig        | 130.5 KB | 158.0 KB | 151.5 KB |
+| C++            | MSBuild    | 129.5 KB | 155.0 KB | 140.5 KB |
+| Rust           | Cargo      | 108.0 KB | 121.5 KB | 119.0 KB |
+| Zig            | Zig        |  81.5 KB |  71.5 KB |  21.0 KB |
 
 ## Startup Latency
 
 Benchmarked with `C:\Windows\System32\whoami.exe` (built-in) via [hyperfine](https://github.com/sharkdp/hyperfine) — 20 warmup + 50 measured runs per implementation (randomized order). Architecture: x64.
 
-| Implementation | Mean [ms] | vs Direct | Extra [ms] |
-|---------------|----------:|----------:|-----------:|
-| direct | 89.9 ± 39.7 | 1.00 | — |
-| C# | 113.8 ± 11.4 | 1.27× ± 0.57 | +23.9 |
-| C++ | 176.1 ± 33.7 | 1.96× ± 0.94 | +86.2 |
-| Zig | 178.6 ± 32.9 | 1.99× ± 0.95 | +88.7 |
-| Rust | 193.0 ± 24.0 | 2.15× ± 0.99 | +103.2 |
+| Implementation |    Mean [ms] |    vs Direct | Extra [ms] |
+| -------------- | -----------: | -----------: | ---------: |
+| direct         |  89.9 ± 39.7 |         1.00 |          — |
+| C#             | 113.8 ± 11.4 | 1.27× ± 0.57 |      +23.9 |
+| C++            | 176.1 ± 33.7 | 1.96× ± 0.94 |      +86.2 |
+| Zig            | 178.6 ± 32.9 | 1.99× ± 0.95 |      +88.7 |
+| Rust           | 193.0 ± 24.0 | 2.15× ± 0.99 |     +103.2 |
 
 All shims share the same `.shim` format overhead; variance is dominated by process creation and file I/O. C# benefits from the CLR already being warm in typical Scoop sessions.
 
