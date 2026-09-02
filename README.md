@@ -76,7 +76,7 @@ All implementations share the same `.shim` format.
 | C++            | Zig        | 130.5 KB | 158.0 KB | 151.5 KB |
 | C++            | MSBuild    | 129.5 KB | 155.0 KB | 140.5 KB |
 | Rust           | Cargo      | 108.0 KB | 121.5 KB | 119.0 KB |
-| Zig            | Zig        |  81.5 KB |  71.5 KB |  21.0 KB |
+| Zig            | Zig        |  81.5 KB |  72.0 KB |  21.5 KB |
 
 ## Startup Latency
 

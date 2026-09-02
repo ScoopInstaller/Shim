@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Scoop shim — Zig implementation
+// Scoop shim - Zig implementation
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -20,6 +20,7 @@ const HMODULE = windows.HMODULE;
 const CHAR = windows.CHAR;
 const WCHAR = windows.WCHAR;
 const INFINITE: windows.DWORD = std.math.maxInt(windows.DWORD);
+const INVALID_FILE_SIZE: windows.DWORD = std.math.maxInt(windows.DWORD);
 
 const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
 
@@ -39,6 +40,12 @@ const JobObjectExtendedLimitInformation = 9;
 const ATTACH_PARENT_PROCESS = @as(i32, -1);
 
 const ERROR_ELEVATION_REQUIRED = 740;
+const ERROR_INVALID_FUNCTION = 1;
+
+const FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100;
+const FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;
+const FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000;
+const FORMAT_MESSAGE_MAX_WIDTH_MASK = 0x000000FF;
 
 const SEE_MASK_NOCLOSEPROCESS = 0x00000040;
 
@@ -48,7 +55,7 @@ const CTRL_CLOSE_EVENT = 2;
 const CTRL_LOGOFF_EVENT = 5;
 const CTRL_SHUTDOWN_EVENT = 6;
 
-/// Compile-time UTF-8 → WCHAR literal.
+/// Compile-time UTF-8 -> WCHAR literal.
 const w = std.unicode.utf8ToUtf16LeStringLiteral;
 
 extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) ?HANDLE;
@@ -75,6 +82,7 @@ extern "kernel32" fn WriteConsoleW(
     lpNumberOfCharsWritten: ?*DWORD,
     lpReserved: ?*anyopaque,
 ) callconv(.winapi) BOOL;
+extern "kernel32" fn GetFileType(hFile: HANDLE) callconv(.winapi) DWORD;
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const WCHAR) callconv(.winapi) ?HMODULE;
 extern "kernel32" fn GetModuleFileNameW(hModule: ?HMODULE, lpFilename: [*:0]WCHAR, nSize: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn CreateFileW(
@@ -106,6 +114,25 @@ extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const WCHAR, lpBuffer:
 extern "kernel32" fn SetEnvironmentVariableW(lpName: [*:0]const WCHAR, lpValue: ?[*:0]const WCHAR) callconv(.winapi) BOOL;
 extern "shell32" fn CommandLineToArgvW(lpCmdLine: [*:0]const WCHAR, pNumArgs: *i32) callconv(.winapi) ?[*]const [*:0]const WCHAR;
 extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn FormatMessageW(
+    dwFlags: DWORD,
+    lpSource: ?*anyopaque,
+    dwMessageId: DWORD,
+    dwLanguageId: DWORD,
+    lpBuffer: [*]WCHAR,
+    nBufferSize: DWORD,
+    Arguments: ?[*]?*anyopaque,
+) callconv(.winapi) DWORD;
+extern "kernel32" fn WideCharToMultiByte(
+    codePage: DWORD,
+    dwFlags: DWORD,
+    lpWideCharStr: [*]const WCHAR,
+    cWideCharLen: i32,
+    lpMultiByteStr: ?[*]u8,
+    cbMultiByte: i32,
+    lpDefaultChar: ?[*]const CHAR,
+    lpUsedDefaultChar: ?*BOOL,
+) callconv(.winapi) i32;
 
 const SHELLEXECUTEINFOW = extern struct {
     cbSize: DWORD,
@@ -174,21 +201,59 @@ extern "kernel32" fn CreateProcessW(
     lpProcessInformation: *windows.PROCESS.INFORMATION,
 ) callconv(.winapi) BOOL;
 
-/// Write byte message to stderr.
 fn writeError(msg: []const u8) void {
     const hErr = GetStdHandle(STD_ERROR_HANDLE) orelse return;
     var written: DWORD = 0;
     _ = WriteFile(hErr, msg.ptr, @intCast(msg.len), &written, null);
 }
 
-/// Write WCHAR message to stderr (for console).
-fn writeErrorW(msg: []const WCHAR) void {
-    const hErr = GetStdHandle(STD_ERROR_HANDLE) orelse return;
-    var written: DWORD = 0;
-    _ = WriteConsoleW(hErr, msg.ptr, @intCast(msg.len), &written, null);
+fn writeErrorDec(v: u32) void {
+    var buf: [10]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+    writeError(s);
 }
 
-/// Open CONIN$/CONOUT$ to ensure stdin/stdout/stderr are valid handles.
+// System error text follows the OS language.
+fn writeErrorSys(err: DWORD) void {
+    writeError(" (error ");
+    writeErrorDec(err);
+    writeError(": ");
+    var buf: [256]WCHAR = undefined;
+    const n = FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_MAX_WIDTH_MASK,
+        null,
+        err,
+        0,
+        &buf,
+        buf.len,
+        null,
+    );
+    if (n != 0) writeErrorUtf8(trimTrailingWhitespace(buf[0..n]));
+    writeError(").\n");
+}
+
+// WriteConsoleW fails on redirected handles, so route by file type.
+fn writeErrorUtf8(s: []const WCHAR) void {
+    if (s.len == 0) return;
+    const hErr = GetStdHandle(STD_ERROR_HANDLE) orelse return;
+    if (GetFileType(hErr) == 2) { // FILE_TYPE_CHAR
+        var written: DWORD = 0;
+        _ = WriteConsoleW(hErr, s.ptr, @intCast(s.len), &written, null);
+        return;
+    }
+    var remaining = s;
+    while (remaining.len > 0) {
+        // worst case 4 UTF-8 bytes per WCHAR (surrogate pair); chunk keeps buf bounded
+        const chunk = remaining[0..@min(remaining.len, 512)];
+        var buf: [2048]u8 = undefined;
+        const n = WideCharToMultiByte(65001, 0, chunk.ptr, @intCast(chunk.len), &buf, @intCast(buf.len), null, null);
+        if (n <= 0) return;
+        writeError(buf[0..@intCast(n)]);
+        remaining = remaining[chunk.len..];
+    }
+}
+
+// GUI/redirected launches can yield null or INVALID_HANDLE_VALUE std handles.
 fn ensureStandardHandles(si: *windows.STARTUPINFOW) void {
     if (si.hStdInput == null or si.hStdInput == INVALID_HANDLE_VALUE) {
         const h = CreateFileW(w("CONIN$"), .{ .GENERIC = .{ .READ = true } }, .{ .READ = true }, null, .OPEN_EXISTING, 0, null);
@@ -204,7 +269,6 @@ fn ensureStandardHandles(si: *windows.STARTUPINFOW) void {
     }
 }
 
-/// Return the parent directory of `exe` (strip trailing filename component).
 fn getDirectory(exe: []const WCHAR) []const WCHAR {
     if (std.mem.lastIndexOfScalar(WCHAR, exe, '\\')) |pos| {
         return exe[0..pos];
@@ -215,7 +279,7 @@ fn getDirectory(exe: []const WCHAR) []const WCHAR {
     return exe;
 }
 
-/// Check if a WCHAR is Unicode whitespace
+// Unicode whitespace, not just ASCII.
 fn isWS(ch: WCHAR) bool {
     return ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or
         ch == 0x00A0 or ch == 0x1680 or
@@ -223,15 +287,13 @@ fn isWS(ch: WCHAR) bool {
         ch == 0x202F or ch == 0x205F or ch == 0x3000;
 }
 
-/// Trim trailing whitespace from a WCHAR slice.
 fn trimTrailingWhitespace(sv: []const WCHAR) []const WCHAR {
     var end = sv.len;
     while (end > 0 and isWS(sv[end - 1])) end -= 1;
     return sv[0..end];
 }
 
-/// Replace `%~dp0` placeholder in `args` with `curDir`, shifting content in-place.
-/// Returns the new length of the slice.
+/// Replace `%~dp0` in `args` in-place; returns the new length.
 fn normalizeArgs(args: []WCHAR, curDir: []const WCHAR) usize {
     const placeholder = w("%~dp0");
     if (std.mem.indexOf(WCHAR, args, placeholder)) |pos| {
@@ -241,13 +303,15 @@ fn normalizeArgs(args: []WCHAR, curDir: []const WCHAR) usize {
         if (needs_slash) replacement_len += 1;
 
         const after_pos = pos + placeholder.len;
-        const shift = replacement_len - placeholder.len;
-        const new_len = args.len + shift;
+        // Signed: a drive-root target dir is shorter than the placeholder; usize would underflow.
+        const shift: isize = @as(isize, @intCast(replacement_len)) - @as(isize, @intCast(placeholder.len));
+        const new_len: usize = @intCast(@as(isize, @intCast(args.len)) + shift);
 
         if (shift > 0) {
-            std.mem.copyBackwards(WCHAR, args[after_pos + shift .. new_len], args[after_pos..args.len]);
+            std.mem.copyBackwards(WCHAR, args[after_pos + @as(usize, @intCast(shift)) .. new_len], args[after_pos..args.len]);
         } else {
-            std.mem.copyForwards(WCHAR, args[after_pos + shift .. args.len + shift], args[after_pos..args.len]);
+            const neg: usize = @intCast(-shift);
+            std.mem.copyForwards(WCHAR, args[after_pos - neg .. args.len - neg], args[after_pos..args.len]);
         }
 
         std.mem.copyForwards(WCHAR, args[pos .. pos + curDir.len], curDir);
@@ -258,8 +322,7 @@ fn normalizeArgs(args: []WCHAR, curDir: []const WCHAR) usize {
     return args.len;
 }
 
-/// Quote a single argument per Windows CreateProcessW quoting rules.
-/// Caller owns the returned slice.
+/// Windows CreateProcessW quoting rules. Caller owns the result.
 fn quoteArg(allocator: std.mem.Allocator, arg: []const WCHAR) ![]WCHAR {
     if (arg.len == 0) {
         const r = try allocator.alloc(WCHAR, 2);
@@ -313,8 +376,7 @@ fn quoteArg(allocator: std.mem.Allocator, arg: []const WCHAR) ![]WCHAR {
     return try result.toOwnedSlice(allocator);
 }
 
-/// Build a properly quoted command line (null-terminated) from path and args.
-/// Caller owns the returned slice.
+/// Caller owns the result.
 fn buildCmdLine(allocator: std.mem.Allocator, path: []const WCHAR, args: []const []const WCHAR) ![:0]WCHAR {
     var result = try std.ArrayList(WCHAR).initCapacity(allocator, path.len + 64);
     defer result.deinit(allocator);
@@ -335,8 +397,7 @@ fn buildCmdLine(allocator: std.mem.Allocator, path: []const WCHAR, args: []const
     return owned[0 .. owned.len - 1 :0];
 }
 
-/// Parse a command line string into individual arguments using CommandLineToArgvW.
-/// Caller owns the returned slice and each element.
+/// CommandLineToArgvW parsing. Caller owns the result and each element.
 fn parseArgsFromCmdLine(allocator: std.mem.Allocator, cmdline: [:0]const WCHAR) ![][:0]WCHAR {
     if (cmdline.len == 0) return try allocator.alloc([:0]WCHAR, 0);
 
@@ -357,7 +418,7 @@ fn parseArgsFromCmdLine(allocator: std.mem.Allocator, cmdline: [:0]const WCHAR) 
     return result;
 }
 
-/// Detect GUI subsystem via PE header of the current module.
+// PE headers are read directly - std does not expose image helpers.
 fn isGuiSubsystem() bool {
     const hModule = GetModuleHandleW(null) orelse return false;
     const base = @as([*]u8, @ptrCast(hModule));
@@ -373,7 +434,6 @@ fn isGuiSubsystem() bool {
     return subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI;
 }
 
-/// Parse a boolean value from WCHAR (accepts true/1/yes, case-insensitive).
 fn parseBool(value: []const WCHAR) bool {
     if (value.len == 0) return false;
 
@@ -390,13 +450,13 @@ fn parseBool(value: []const WCHAR) bool {
         std.mem.eql(WCHAR, lv, w("yes"));
 }
 
-/// Expand `%VAR%` references via ExpandEnvironmentStringsW.
-/// Caller owns the returned slice.
+/// Caller owns the result.
 fn expandEnvVars(allocator: std.mem.Allocator, input: []const WCHAR) ![]WCHAR {
     const input_z = try allocator.alloc(WCHAR, input.len + 1);
     defer allocator.free(input_z);
     @memcpy(input_z[0..input.len], input);
     input_z[input.len] = 0;
+    // First call gets the required size, second expands.
     const required = ExpandEnvironmentStringsW(input_z[0..input.len :0].ptr, null, 0);
     if (required == 0) return try allocator.dupe(WCHAR, input);
     var buf = try allocator.alloc(WCHAR, required);
@@ -406,29 +466,26 @@ fn expandEnvVars(allocator: std.mem.Allocator, input: []const WCHAR) ![]WCHAR {
     return try allocator.dupe(WCHAR, buf[0 .. actual - 1]);
 }
 
-/// Expand environment variables in `input`, then strip surrounding double quotes.
-/// Returns a newly allocated slice (caller must free).
-fn expandEnvVarsAndUnquote(allocator: std.mem.Allocator, input: []const WCHAR) ![]WCHAR {
+// Shim quotes are structural markers, not content - strip them after expanding.
+fn expandEnvVarsAndUnquote(allocator: std.mem.Allocator, input: []const WCHAR) ![:0]WCHAR {
     const expanded = try expandEnvVars(allocator, input);
+    defer allocator.free(expanded);
     var unquoted = expanded;
     if (unquoted.len >= 2 and unquoted[0] == '"' and unquoted[unquoted.len - 1] == '"') {
         unquoted = unquoted[1 .. unquoted.len - 1];
     }
-    if (unquoted.ptr == expanded.ptr and unquoted.len == expanded.len) {
-        return expanded;
-    }
-    const result = try allocator.alloc(WCHAR, unquoted.len);
-    @memcpy(result, unquoted);
-    allocator.free(expanded);
-    return result;
+    const result = try allocator.alloc(WCHAR, unquoted.len + 1);
+    @memcpy(result[0..unquoted.len], unquoted);
+    result[unquoted.len] = 0;
+    return result[0..unquoted.len :0];
 }
 
 const ShimInfo = struct {
-    path: ?[]WCHAR = null,
+    path: ?[:0]WCHAR = null,
     args: std.ArrayListUnmanaged([]const WCHAR) = .empty,
-    cwd: ?[]WCHAR = null,
+    cwd: ?[:0]WCHAR = null,
     elevate: bool = false,
-    env_vars: std.ArrayListUnmanaged(struct { name: []WCHAR, value: []WCHAR }) = .empty,
+    env_vars: std.ArrayListUnmanaged(struct { name: []WCHAR, value: [:0]WCHAR }) = .empty,
     allocator: std.mem.Allocator = undefined,
 
     fn init(allocator: std.mem.Allocator) ShimInfo {
@@ -452,22 +509,18 @@ const ShimInfo = struct {
     }
 };
 
-/// Skip past line-ending characters (\n / \r) starting at `line_end`.
 fn skipLineEndings(buf: []const u8, line_end: usize) usize {
     var pos = line_end + 1;
     while (pos < buf.len and (buf[pos] == '\n' or buf[pos] == '\r')) : (pos += 1) {}
     return pos;
 }
 
-/// Trim leading whitespace from a WCHAR slice.
 fn trimLeadingWhitespace(sv: []const WCHAR) []const WCHAR {
     var start: usize = 0;
     while (start < sv.len and isWS(sv[start])) : (start += 1) {}
     return sv[start..];
 }
 
-/// Parse a single `key = value` line from a .shim file.
-/// Returns null for empty/comment lines.
 fn parseShimLine(line: []const WCHAR) ?struct { name: []const WCHAR, value: []const WCHAR } {
     var trimmed = trimLeadingWhitespace(trimTrailingWhitespace(line));
     if (trimmed.len == 0 or trimmed[0] == '#' or trimmed[0] == ';') return null;
@@ -484,9 +537,7 @@ fn parseShimLine(line: []const WCHAR) ?struct { name: []const WCHAR, value: []co
     return .{ .name = name, .value = value };
 }
 
-/// Resolve `path` against `baseDir`: if relative, join with `baseDir`; then normalize via GetFullPathNameW.
-/// Returns the **directory** portion of the resolved path (trailing backslash appended).
-/// Caller owns the returned slice.
+/// Returns the *directory* portion (trailing backslash), not the resolved path. Caller owns it.
 fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir: []const WCHAR) ![]WCHAR {
     const is_absolute = (path.len >= 2 and path[1] == ':') or (path.len > 0 and path[0] == '\\');
     var toResolve: []const WCHAR = undefined;
@@ -509,7 +560,6 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
         (@intFromPtr(fp) - @intFromPtr(&resolved_buf)) / @sizeOf(WCHAR)
     else
         len;
-    // Ensure trailing backslash
     if (dir_len > 0 and (resolved_buf[dir_len - 1] == '\\' or resolved_buf[dir_len - 1] == '/')) {
         return try allocator.dupe(WCHAR, resolved_buf[0..dir_len]);
     }
@@ -519,15 +569,21 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
     return result;
 }
 
-/// Read and parse the .shim file, returning all fields.
 fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
     var info = ShimInfo.init(allocator);
     errdefer info.deinit();
 
     var filename: [windows.MAX_PATH + 2:0]WCHAR = undefined;
     const filename_size = GetModuleFileNameW(null, &filename, windows.MAX_PATH);
-    if (filename_size >= windows.MAX_PATH) {
-        writeError("Shim: The filename of the program is too long to handle.\n");
+    if (filename_size == 0 or filename_size >= windows.MAX_PATH) {
+        if (filename_size == 0) {
+            writeError("Shim: The filename of the program could not be determined");
+            writeErrorSys(GetLastError());
+        } else {
+            writeError("Shim: The filename of the program is too long to handle: '");
+            writeErrorUtf8(filename[0..filename_size]);
+            writeError("'.\n");
+        }
         return error.PathTooLong;
     }
 
@@ -544,17 +600,25 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         null,
     );
     if (file_handle == INVALID_HANDLE_VALUE) {
-        writeError("Cannot open shim file for read.\n");
-        return error.FileNotFound;
+        const open_err = GetLastError();
+        writeError("Shim: Cannot open shim file for read: '");
+        writeErrorUtf8(filename[0 .. filename_size + 1]);
+        writeError("'");
+        writeErrorSys(open_err);
+        return info;
     }
     defer windows.CloseHandle(file_handle);
 
     const cur_dir = getDirectory(filename[0..filename_size]);
 
     const file_size = GetFileSize(file_handle, null);
-    if (file_size == INFINITE) {
-        writeError("Cannot get shim file size.\n");
-        return error.FileReadError;
+    if (file_size == INVALID_FILE_SIZE) {
+        const size_err = GetLastError();
+        writeError("Shim: Cannot open shim file for read: '");
+        writeErrorUtf8(filename[0 .. filename_size + 1]);
+        writeError("'");
+        writeErrorSys(size_err);
+        return info;
     }
 
     var file_buf = try allocator.alloc(u8, @intCast(file_size));
@@ -562,16 +626,21 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
 
     var bytes_read: DWORD = 0;
     if (!ReadFile(file_handle, file_buf.ptr, file_size, &bytes_read, null).toBool() or bytes_read != file_size) {
-        writeError("Cannot read shim file.\n");
-        return error.FileReadError;
+        const read_err = GetLastError();
+        writeError("Shim: Cannot open shim file for read: '");
+        writeErrorUtf8(filename[0 .. filename_size + 1]);
+        writeError("'");
+        writeErrorSys(read_err);
+        return info;
     }
 
-    // Pass 1: find `path` field → compute targetDir (for %~dp0 expansion)
+    // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
+    // path to absolute so pass 2 can expand %~dp0 against the right base.
     var targetDir: []const WCHAR = cur_dir;
     var targetDirAllocated = false;
     defer if (targetDirAllocated) allocator.free(@constCast(targetDir));
+    var lw: [1 << 14]WCHAR = undefined;
     {
-        var lw: [1 << 14]WCHAR = undefined;
         var first1 = true;
         var scan: usize = 0;
         while (scan < bytes_read) {
@@ -601,8 +670,7 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
             scan = skipLineEndings(file_buf, le);
         }
     }
-    // Pass 2: parse all fields
-    var lw2: [1 << 14]WCHAR = undefined;
+    // Second pass: expand all fields using targetDir for %~dp0.
     var first2 = true;
     var lpos: usize = 0;
     while (lpos < bytes_read) {
@@ -610,85 +678,70 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         while (le2 < bytes_read and file_buf[le2] != '\n' and file_buf[le2] != '\r') le2 += 1;
         if (le2 > lpos) {
             const chunk2 = file_buf[lpos..le2];
-            const wlen2 = std.unicode.utf8ToUtf16Le(&lw2, chunk2) catch {
-                lpos = skipLineEndings(file_buf, le2);
-                continue;
-            };
-            var pl2 = trimTrailingWhitespace(lw2[0..wlen2]);
+            const wlen2 = std.unicode.utf8ToUtf16Le(&lw, chunk2) catch 0;
+            var pl2 = trimTrailingWhitespace(lw[0..wlen2]);
             if (first2 and pl2.len > 0 and pl2[0] == 0xFEFF) pl2 = pl2[1..];
             first2 = false;
             const parsed = parseShimLine(pl2);
-            if (parsed == null) {
-                lpos = skipLineEndings(file_buf, le2);
-                continue;
-            }
-            const name = parsed.?.name;
-            const value = parsed.?.value;
+            if (parsed) |p| {
+                const name = p.name;
+                const value = p.value;
 
-            if (std.mem.eql(WCHAR, name, w("path"))) {
-                // Store path unquoted; buildCmdLine will quote as needed
-                const unquoted = try expandEnvVarsAndUnquote(allocator, value);
-                // Ensure null-terminated
-                const null_term = try allocator.alloc(WCHAR, unquoted.len + 1);
-                @memcpy(null_term[0..unquoted.len], unquoted);
-                null_term[unquoted.len] = 0;
-                allocator.free(unquoted);
-                info.path = null_term[0..unquoted.len];
-            } else if (std.mem.eql(WCHAR, name, w("args"))) {
-                // Normalize %~dp0, parse into individual args, then re-encode with proper quoting
-                const max_len = value.len + targetDir.len;
-                const args_copy = try allocator.alloc(WCHAR, max_len + 1);
-                @memcpy(args_copy[0..value.len], value);
-                args_copy[value.len] = 0;
-                const new_len = normalizeArgs(args_copy[0..value.len], targetDir);
-                args_copy[new_len] = 0;
+                if (std.mem.eql(WCHAR, name, w("path"))) {
+                    info.path = try expandEnvVarsAndUnquote(allocator, value);
+                } else if (std.mem.eql(WCHAR, name, w("args"))) {
+                    // %~dp0 is replaced in-place, so the copy is sized for the expansion.
+                    const max_len = value.len + targetDir.len;
+                    const args_copy = try allocator.alloc(WCHAR, max_len + 1);
+                    @memcpy(args_copy[0..value.len], value);
+                    args_copy[value.len] = 0;
+                    const new_len = normalizeArgs(args_copy[0..value.len], targetDir);
+                    args_copy[new_len] = 0;
 
-                const normalized: [:0]WCHAR = args_copy[0..new_len :0];
-                if (normalized.len > 0) {
-                    const shim_args = try parseArgsFromCmdLine(allocator, normalized);
-                    defer allocator.free(shim_args);
-                    for (shim_args) |arg| {
-                        try info.args.append(allocator, arg);
+                    const normalized: [:0]WCHAR = args_copy[0..new_len :0];
+                    if (normalized.len > 0) {
+                        const shim_args = try parseArgsFromCmdLine(allocator, normalized);
+                        defer allocator.free(shim_args);
+                        for (shim_args) |arg| {
+                            try info.args.append(allocator, arg);
+                        }
                     }
+                    allocator.free(args_copy);
+                } else if (std.mem.eql(WCHAR, name, w("cwd")) or
+                    std.mem.eql(WCHAR, name, w("workdir")))
+                {
+                    const max_len = value.len + targetDir.len;
+                    const cwd_copy = try allocator.alloc(WCHAR, max_len + 1);
+                    defer allocator.free(cwd_copy);
+                    @memcpy(cwd_copy[0..value.len], value);
+                    const new_len = normalizeArgs(cwd_copy[0..value.len], targetDir);
+                    info.cwd = try expandEnvVarsAndUnquote(allocator, cwd_copy[0..new_len]);
+                } else if (std.mem.eql(WCHAR, name, w("elevate")) or
+                    std.mem.eql(WCHAR, name, w("runas")))
+                {
+                    info.elevate = parseBool(value);
+                } else {
+                    // Environment variable
+                    const name_copy = try allocator.alloc(WCHAR, name.len);
+                    @memcpy(name_copy, name);
+                    const value_copy = try expandEnvVarsAndUnquote(allocator, value);
+                    try info.env_vars.append(allocator, .{ .name = name_copy, .value = value_copy });
                 }
-                allocator.free(args_copy);
-            } else if (std.mem.eql(WCHAR, name, w("cwd")) or
-                std.mem.eql(WCHAR, name, w("workdir")))
-            {
-                // Allocate enough space for %~dp0 replacement
-                const max_len = value.len + targetDir.len;
-                const cwd_copy = try allocator.alloc(WCHAR, max_len);
-                @memcpy(cwd_copy[0..value.len], value);
-                const new_len = normalizeArgs(cwd_copy[0..value.len], targetDir);
-                const unquoted = try expandEnvVarsAndUnquote(allocator, cwd_copy[0..new_len]);
-                allocator.free(cwd_copy);
-                // Ensure null-terminated
-                const null_term = try allocator.alloc(WCHAR, unquoted.len + 1);
-                @memcpy(null_term[0..unquoted.len], unquoted);
-                null_term[unquoted.len] = 0;
-                allocator.free(unquoted);
-                info.cwd = null_term[0..unquoted.len];
-            } else if (std.mem.eql(WCHAR, name, w("elevate")) or
-                std.mem.eql(WCHAR, name, w("runas")))
-            {
-                info.elevate = parseBool(value);
-            } else {
-                // Environment variable
-                const name_copy = try allocator.alloc(WCHAR, name.len);
-                @memcpy(name_copy, name);
-                const value_copy = try expandEnvVarsAndUnquote(allocator, value);
-                try info.env_vars.append(allocator, .{ .name = name_copy, .value = value_copy });
             }
-
-            // Move to next line
-            lpos = skipLineEndings(file_buf, le2);
         }
+        lpos = skipLineEndings(file_buf, le2);
+    }
+
+    if (info.path == null) {
+        writeError("Shim: 'path' not found in shim file '");
+        writeErrorUtf8(filename[0 .. filename_size + 1]);
+        writeError("'.\n");
     }
 
     return info;
 }
 
-/// Ctrl-C / Ctrl-Break handler — swallow the event so the child process handles it.
+/// Ctrl-C / Ctrl-Break handler - swallow the event so the child process handles it.
 fn ctrlHandler(ctrl_type: DWORD) callconv(.winapi) BOOL {
     switch (ctrl_type) {
         CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT => return .TRUE,
@@ -701,7 +754,44 @@ const ProcessResult = struct {
     thread: ?HANDLE = null,
 };
 
-/// Create the child process: set env vars, build command line, optionally elevate, assign to job object.
+// ShellExecuteExW "runas" - the only way to trigger a UAC prompt from this process.
+fn launchElevated(
+    path_z: [*:0]WCHAR,
+    args_z: [*:0]WCHAR,
+    has_args: bool,
+    cwd: ?[]const WCHAR,
+    job_handle: ?HANDLE,
+) ?HANDLE {
+    var sei: SHELLEXECUTEINFOW = std.mem.zeroes(SHELLEXECUTEINFOW);
+    sei.cbSize = @sizeOf(SHELLEXECUTEINFOW);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpFile = @ptrCast(path_z);
+    sei.lpParameters = if (has_args) @ptrCast(args_z) else null;
+    sei.lpDirectory = if (cwd) |c| @ptrCast(c.ptr) else null;
+    sei.lpVerb = w("runas");
+    sei.nShow = SW_SHOW;
+
+    if (!ShellExecuteExW(&sei).toBool()) {
+        // On failure hInstApp holds an SE_ERR_* value (<=32); otherwise use GetLastError.
+        var err: DWORD = 0;
+        if (sei.hInstApp) |hi| {
+            const v: u64 = @intFromPtr(hi);
+            if (v > 0 and v <= 32) err = @intCast(v);
+        }
+        if (err == 0) err = GetLastError();
+        if (err == 0) err = ERROR_INVALID_FUNCTION;
+        writeError("Shim: Unable to create elevated process");
+        writeErrorSys(err);
+        return null;
+    }
+    if (job_handle) |jh| {
+        if (sei.hProcess) |ph| {
+            _ = AssignProcessToJobObject(jh, ph);
+        }
+    }
+    return sei.hProcess;
+}
+
 fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: ?HANDLE) !ProcessResult {
     var result = ProcessResult{};
 
@@ -709,19 +799,18 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     const args = info.args.items;
     const cwd = if (info.cwd) |c| c else null;
 
+    // Child inherits the updated environment block, hence before CreateProcessW.
     for (info.env_vars.items) |ev| {
         const name_z = try allocator.alloc(WCHAR, ev.name.len + 1);
         defer allocator.free(name_z);
         @memcpy(name_z[0..ev.name.len], ev.name);
         name_z[ev.name.len] = 0;
 
-        const value_z = try allocator.alloc(WCHAR, ev.value.len + 1);
-        defer allocator.free(value_z);
-        @memcpy(value_z[0..ev.value.len], ev.value);
-        value_z[ev.value.len] = 0;
-
-        if (!SetEnvironmentVariableW(name_z[0..ev.name.len :0].ptr, value_z[0..ev.value.len :0].ptr).toBool()) {
-            writeError("Shim: Could not set environment variable.\n");
+        if (!SetEnvironmentVariableW(name_z[0..ev.name.len :0].ptr, ev.value.ptr).toBool()) {
+            writeError("Shim: Could not set environment variable '");
+            writeErrorUtf8(ev.name);
+            writeError("'");
+            writeErrorSys(GetLastError());
         }
     }
 
@@ -732,11 +821,6 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     si.cb = @sizeOf(windows.STARTUPINFOW);
     GetStartupInfoW(&si);
     ensureStandardHandles(&si);
-
-    const path_z = try allocator.alloc(WCHAR, path.len + 1);
-    defer allocator.free(path_z);
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
 
     const joined_args = if (args.len > 0) blk: {
         var list = try std.ArrayList(WCHAR).initCapacity(allocator, 64);
@@ -754,32 +838,15 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     defer allocator.free(args_z);
     if (joined_args.len > 0) @memcpy(args_z[0..joined_args.len], joined_args);
     args_z[joined_args.len] = 0;
+    const args_z_sentinel: [:0]WCHAR = args_z[0..joined_args.len :0];
 
     if (info.elevate) {
-        var sei: SHELLEXECUTEINFOW = std.mem.zeroes(SHELLEXECUTEINFOW);
-        sei.cbSize = @sizeOf(SHELLEXECUTEINFOW);
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-        sei.lpFile = @ptrCast(path_z.ptr);
-        sei.lpParameters = if (args.len > 0) @ptrCast(args_z.ptr) else null;
-        sei.lpDirectory = if (cwd) |c| @ptrCast(c.ptr) else null;
-        sei.lpVerb = w("runas");
-        sei.nShow = SW_SHOW;
-
-        if (!ShellExecuteExW(&sei).toBool()) {
-            writeError("Shim: Unable to create elevated process.\n");
-            return result;
-        }
-        result.process = sei.hProcess;
-        if (job_handle) |jh| {
-            if (result.process) |ph| {
-                _ = AssignProcessToJobObject(jh, ph);
-            }
-        }
-        _ = SetConsoleCtrlHandler(ctrlHandler, .TRUE);
+        result.process = launchElevated(path.ptr, args_z_sentinel.ptr, args.len > 0, cwd, job_handle);
         return result;
     }
 
     var pi: windows.PROCESS.INFORMATION = undefined;
+    // SUSPENDED: the child must join the job object before it can spawn its own children.
     if (CreateProcessW(null, @ptrCast(@constCast(cmd.ptr)), null, null, .TRUE, CREATE_SUSPENDED, null, if (cwd) |c| @ptrCast(c.ptr) else null, &si, &pi).toBool()) {
         result.thread = pi.hThread;
         result.process = pi.hProcess;
@@ -791,56 +858,35 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     } else {
         const err = GetLastError();
         if (err == ERROR_ELEVATION_REQUIRED) {
-            var sei: SHELLEXECUTEINFOW = std.mem.zeroes(SHELLEXECUTEINFOW);
-            sei.cbSize = @sizeOf(SHELLEXECUTEINFOW);
-            sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-            sei.lpFile = @ptrCast(path_z.ptr);
-            sei.lpParameters = if (args.len > 0) @ptrCast(args_z.ptr) else null;
-            sei.lpDirectory = if (cwd) |c| @ptrCast(c.ptr) else null;
-            sei.lpVerb = w("runas");
-            sei.nShow = SW_SHOW;
-
-            if (!ShellExecuteExW(&sei).toBool()) {
-                writeError("Shim: Unable to create elevated process.\n");
-                return result;
-            }
-            result.process = sei.hProcess;
-            if (job_handle) |jh| {
-                if (result.process) |ph| {
-                    _ = AssignProcessToJobObject(jh, ph);
-                }
-            }
+            result.process = launchElevated(path.ptr, args_z_sentinel.ptr, args.len > 0, cwd, job_handle);
         } else {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Shim: Could not create process (error {}).\n", .{err}) catch "Shim: Could not create process.\n";
-            writeError(msg);
+            writeError("Shim: Could not create process with command '");
+            writeErrorUtf8(cmd);
+            writeError("'");
+            writeErrorSys(err);
             return result;
         }
     }
 
-    _ = SetConsoleCtrlHandler(ctrlHandler, .TRUE);
     return result;
 }
 
-/// Custom CRT entry point — bypasses std.start runtime initialization
+// Bypass std.start - no main(), argv, or allocator init needed.
 pub export fn wWinMainCRTStartup() callconv(.winapi) void {
     const code = shimMain() catch 1;
     ExitProcess(code);
 }
 
-/// Main logic: parse .shim file, merge user args, create child process, relay exit code.
-fn shimMain() !u8 {
+fn shimMain() !u32 {
     const allocator = std.heap.page_allocator;
 
     var info = try getShimInfo(allocator);
     defer info.deinit();
 
     if (info.path == null) {
-        writeError("Could not read shim file.\n");
         return 1;
     }
 
-    // Parse user args from runtime command line, append after shim args
     {
         const cmd = GetCommandLineW();
         const cmd_len = std.mem.len(cmd);
@@ -863,7 +909,8 @@ fn shimMain() !u8 {
         }
     }
 
-    // GUI shim: if no user args, detach console; otherwise attach parent console for CLI output
+    // A GUI-subsystem shim would flash a console. With args it behaves as a CLI
+    // tool, so it re-attaches to the parent console for output.
     if (isGuiSubsystem()) {
         const has_args = info.args.items.len > 0;
         if (!has_args) {
@@ -873,7 +920,7 @@ fn shimMain() !u8 {
         }
     }
 
-    // Create job object
+    // KILL_ON_JOB_CLOSE ties child lifetime to the shim.
     const job_handle = CreateJobObjectW(null, null);
     if (job_handle) |jh| {
         var jeli: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
@@ -881,14 +928,17 @@ fn shimMain() !u8 {
         _ = SetInformationJobObject(jh, JobObjectExtendedLimitInformation, &jeli, @sizeOf(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
     }
 
+    // Before spawn: a Ctrl event in the gap would kill the shim and
+    // KILL_ON_JOB_CLOSE would take the child down with it.
+    _ = SetConsoleCtrlHandler(ctrlHandler, .TRUE);
+
     const proc_result = try makeProcess(allocator, &info, job_handle);
     const process_handle = proc_result.process orelse return 1;
 
-    // Wait for process
     _ = WaitForSingleObject(process_handle, INFINITE);
 
     var exit_code: DWORD = 1;
     _ = GetExitCodeProcess(process_handle, &exit_code);
 
-    return @intCast(exit_code);
+    return exit_code;
 }
