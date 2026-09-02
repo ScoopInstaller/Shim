@@ -9,7 +9,6 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace Scoop
 {
@@ -150,6 +149,10 @@ namespace Scoop
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         static extern uint GetFullPathNameW(string lpFileName, uint nBufferLength, StringBuilder lpBuffer, IntPtr lpFilePart);
 
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool SetEnvironmentVariableW(string lpName, string lpValue);
+
         // --- Constants ---
 
         const uint CREATE_SUSPENDED = 0x00000004;
@@ -200,11 +203,27 @@ namespace Scoop
 
         // --- Helpers ---
 
+        // Win32Exception.Message renders the system error text in the OS language.
+        static void ReportShimError(string context, uint error)
+        {
+            Console.Error.WriteLine($"Shim: {context} (error {error}: {new Win32Exception((int)error).Message}).");
+        }
+
         static string GetModulePath()
         {
             var sb = new StringBuilder(260);
             uint len = GetModuleFileNameW(IntPtr.Zero, sb, sb.Capacity);
-            if (len == 0) throw new Win32Exception();
+            if (len == 0)
+            {
+                ReportShimError("The filename of the program could not be determined", (uint)Marshal.GetLastWin32Error());
+                return null!;
+            }
+            if (len >= sb.Capacity)
+            {
+                var truncated = sb.ToString(0, Math.Min((int)len, sb.Length));
+                Console.Error.WriteLine($"Shim: The filename of the program is too long to handle: '{truncated}'.");
+                return null!;
+            }
             return sb.ToString(0, (int)len);
         }
 
@@ -361,7 +380,6 @@ namespace Scoop
             return result;
         }
 
-        /// Parse a raw .shim file line. Returns true if line has a valid key=value pair.
         static bool TryParseLine(string rawLine, out string? key, out string? value)
         {
             key = null; value = null;
@@ -404,27 +422,29 @@ namespace Scoop
 
         static ShimInfo ParseShimInfo()
         {
-            // Get filename of current executable
             var exePath = GetModulePath();
+            if (string.IsNullOrEmpty(exePath)) return new ShimInfo();
             var dir = "";
             int sep = Math.Max(exePath.LastIndexOf('\\'), exePath.LastIndexOf('/'));
             if (sep >= 0) dir = exePath.Substring(0, sep);
 
-            // Replace .exe with .shim
-            var configPath = exePath.Substring(0, exePath.Length - 4) + ".shim";
+            int dot = exePath.LastIndexOf('.');
+            var configPath = (dot >= 0 ? exePath.Substring(0, dot) : exePath) + ".shim";
 
-            if (!File.Exists(configPath))
+            string[] lines;
+            try
             {
-                var name = System.IO.Path.GetFileNameWithoutExtension(exePath);
-                Console.Error.WriteLine($"Couldn't find {name}.shim in {dir}");
+                lines = File.ReadAllLines(configPath);
+            }
+            catch (Exception ex)
+            {
+                uint err = (uint)(ex.HResult & 0xFFFF);
+                ReportShimError($"Cannot open shim file for read: '{configPath}'", err);
                 return new ShimInfo();
             }
 
-            var lines = File.ReadAllLines(configPath);
-
-            // First pass: find path, resolve to absolute, compute targetDir.
-            // %~dp0 expands to the directory containing the target executable,
-            // resolved relative to the shim's own directory.
+            // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
+            // path to absolute so pass 2 can expand %~dp0 against the right base.
             var targetDir = dir;
             foreach (var rawLine in lines)
             {
@@ -438,7 +458,7 @@ namespace Scoop
                     : dir + "\\" + expanded;
                 var sb = new StringBuilder(260);
                 uint len = GetFullPathNameW(combined, (uint)sb.Capacity, sb, IntPtr.Zero);
-                if (len == 0) { targetDir = dir; break; }
+                if (len == 0 || len >= sb.Capacity) { targetDir = dir; break; }
 
                 var fullPath = sb.ToString(0, (int)len);
                 var dirLen = fullPath.LastIndexOf('\\');
@@ -478,6 +498,9 @@ namespace Scoop
                 }
             }
 
+            if (info.Path == null)
+                Console.Error.WriteLine($"Shim: 'path' not found in shim file '{configPath}'.");
+
             return info;
         }
         static int LaunchProcess(ShimInfo info, IntPtr jobHandle)
@@ -486,19 +509,14 @@ namespace Scoop
 
             foreach (var kv in info.EnvVars)
             {
-                try
+                if (!SetEnvironmentVariableW(kv.Key, kv.Value))
                 {
-                    Environment.SetEnvironmentVariable(kv.Key, kv.Value);
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"Shim: Could not set environment variable '{kv.Key}': {ex.Message}");
+                    ReportShimError($"Could not set environment variable '{kv.Key}'", (uint)Marshal.GetLastWin32Error());
                 }
             }
 
             string path = info.Path!;
 
-            // Build properly quoted command line from individual arguments
             string cmd = BuildCommandLine(path, info.Args);
             string params_ = string.Join(" ", info.Args.Select(QuoteArg));
 
@@ -523,7 +541,6 @@ namespace Scoop
 
                 ResumeThread(pi.hThread);
 
-                SetConsoleCtrlHandler(s_ctrlHandler, true);
                 CloseHandle(pi.hThread);
 
                 return WaitAndGetExitCode(pi.hProcess);
@@ -535,7 +552,7 @@ namespace Scoop
                 return LaunchElevated(path, params_, info.Cwd, jobHandle);
             }
 
-            Console.Error.WriteLine($"Shim: Could not create process with command '{cmd}'.");
+            ReportShimError($"Could not create process with command '{cmd}'", (uint)error);
             return 1;
         }
 
@@ -557,23 +574,21 @@ namespace Scoop
                 var process = Process.Start(psi);
                 if (process is null)
                 {
-                    Console.Error.WriteLine("Shim: Unable to create elevated process.");
+                    ReportShimError("Unable to create elevated process", (uint)Marshal.GetLastWin32Error());
                     return 1;
                 }
 
                 if (jobHandle != IntPtr.Zero)
                     AssignProcessToJobObject(jobHandle, process.Handle);
 
-                SetConsoleCtrlHandler(s_ctrlHandler, true);
-
                 process.WaitForExit();
                 int exitCode = process.ExitCode;
                 process.Close();
                 return exitCode;
             }
-            catch (Win32Exception)
+            catch (Win32Exception ex)
             {
-                Console.Error.WriteLine("Shim: Unable to create elevated process.");
+                ReportShimError("Unable to create elevated process", (uint)ex.NativeErrorCode);
                 return 1;
             }
         }
@@ -596,11 +611,9 @@ namespace Scoop
 
             if (string.IsNullOrEmpty(info.Path))
             {
-                Console.Error.WriteLine("Could not read shim file.");
                 return 1;
             }
 
-            // Append user arguments from runtime argv (skip argv[0])
             string[] runtimeArgs = Environment.GetCommandLineArgs();
             for (int i = 1; i < runtimeArgs.Length; i++)
             {
@@ -628,6 +641,10 @@ namespace Scoop
                 SetInformationJobObject(jobHandle, JobObjectExtendedLimitInformation,
                     ref jeli, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)));
             }
+
+            // Before spawn: a Ctrl event in the gap would kill the shim and
+            // KILL_ON_JOB_CLOSE would take the child down with it.
+            SetConsoleCtrlHandler(s_ctrlHandler, true);
 
             int exitCode = LaunchProcess(info, jobHandle);
 
