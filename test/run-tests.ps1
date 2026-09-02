@@ -330,6 +330,57 @@ Invoke-ShimTest "UTF-8 BOM in shim file" -Setup {
     [System.IO.File]::WriteAllBytes("$d\test.shim", $bom + $bytes)
 } -Assert { param($r) $r.Output -match "BOM_OK" }
 
+# --- Blank line handling --------------------------------------------------------
+
+Invoke-ShimTest "Blank lines in shim file" -Setup {
+    param($d)
+    Write-Batch "$d\app.cmd" "echo BLANKLINE_OK"
+    Write-Shim $d "test" "path = $d\app.cmd`n`nargs =`n`n# comment`n"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "BLANKLINE_OK") -and ($r.ExitCode -eq 0)
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
+# --- Exit code width ------------------------------------------------------------
+
+Invoke-ShimTest "Exit code above 255" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $psExe`nargs = -NoProfile -Command exit 300"
+} -Assert {
+    param($r)
+    @{ Pass = $r.ExitCode -eq 300; Message = "Expected: 300, Got: $($r.ExitCode)" }
+}
+
+# --- Error messages ---------------------------------------------------------------
+
+Invoke-ShimTest "Missing shim file reports path and win32 error" -Setup {
+    param($d)
+    Copy-Item $ShimExe "$d\test.exe"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "Cannot open shim file for read:") -and ($r.Output -match "\(error \d+") -and ($r.ExitCode -eq 1)
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
+Invoke-ShimTest "Missing path key reports shim file" -Setup {
+    param($d)
+    Write-Shim $d "test" "elevate = false"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "'path' not found in shim file") -and ($r.ExitCode -eq 1)
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
+Invoke-ShimTest "Missing target exe reports command and win32 error" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $d\does-not-exist.exe"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "Could not create process with command '") -and ($r.Output -match "\(error \d+") -and ($r.ExitCode -eq 1)
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
 # --- cwd configuration --------------------------------------------------------
 
 Invoke-ShimTest "cwd configured" -Setup {
