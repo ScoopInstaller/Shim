@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Scoop shim — Rust implementation
+// Scoop shim - Rust implementation
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -11,10 +11,15 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, GENERIC_READ, GENERIC_WRITE, HANDLE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFullPathNameW, WriteFile, FILE_SHARE_MODE, OPEN_EXISTING,
+    CreateFileW, GetFileType, GetFullPathNameW, WriteFile, FILE_SHARE_MODE, FILE_TYPE_CHAR,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GetStdHandle, SetConsoleCtrlHandler, STD_ERROR_HANDLE,
+    AttachConsole, FreeConsole, GetStdHandle, SetConsoleCtrlHandler, WriteConsoleW,
+    STD_ERROR_HANDLE,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
 };
 use windows_sys::Win32::System::Environment::{ExpandEnvironmentStringsW, SetEnvironmentVariableW};
 use windows_sys::Win32::System::JobObjects::{
@@ -54,10 +59,6 @@ struct ShimInfo {
     elevate: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Error output (direct write, no buffering)
-// ---------------------------------------------------------------------------
-
 unsafe fn write_error_bytes(msg: &[u8]) {
     let h: HANDLE = GetStdHandle(STD_ERROR_HANDLE);
     if h != NULL_HANDLE && h != INVALID_HANDLE {
@@ -72,15 +73,67 @@ unsafe fn write_error_bytes(msg: &[u8]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// String helpers
-// ---------------------------------------------------------------------------
+// WriteConsoleW fails on redirected handles, so route by file type.
+unsafe fn write_error_wide(msg: &[u16]) {
+    if msg.is_empty() {
+        return;
+    }
+    let h: HANDLE = GetStdHandle(STD_ERROR_HANDLE);
+    if h == NULL_HANDLE || h == INVALID_HANDLE {
+        return;
+    }
+    if GetFileType(h) == FILE_TYPE_CHAR {
+        let mut written: u32 = 0;
+        WriteConsoleW(
+            h,
+            msg.as_ptr(),
+            msg.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        );
+        return;
+    }
+    write_error_bytes(&String::from_utf16_lossy(msg).into_bytes());
+}
+
+// System error text follows the OS language.
+unsafe fn write_error_sys(err: u32) {
+    write_error_bytes(format!(" (error {err}: ").as_bytes());
+    let mut buf = [0u16; 256];
+    let n = FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | 255,
+        std::ptr::null(),
+        err,
+        0,
+        buf.as_mut_ptr(),
+        buf.len() as u32,
+        std::ptr::null(),
+    );
+    if n > 0 {
+        let msg = &buf[..n as usize];
+        let end = msg
+            .iter()
+            .rposition(|c| !matches!(*c, 0x20 | 0x09 | 0x0D | 0x0A))
+            .map_or(0, |i| i + 1);
+        write_error_wide(&msg[..end]);
+    }
+    write_error_bytes(b").\n");
+}
+
+unsafe fn write_error_ctx(context: &str, err: u32) {
+    write_error_wide(&to_wide(&format!("Shim: {context}")));
+    write_error_sys(err);
+}
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     OsStr::new(s)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().collect()
 }
 
 fn get_shim_dir() -> String {
@@ -102,20 +155,33 @@ fn get_shim_path() -> Option<String> {
     unsafe {
         let mut buf = [0u16; 261];
         let len = GetModuleFileNameW(GetModuleHandleW(std::ptr::null()), buf.as_mut_ptr(), 260);
-        if len == 0 || len >= 260 {
-            write_error_bytes(b"Shim: The filename of the program is too long to handle.\n");
+        if len == 0 {
+            write_error_ctx(
+                "The filename of the program could not be determined",
+                GetLastError(),
+            );
+            return None;
+        }
+        if len >= 260 {
+            write_error_wide(&to_wide(&format!(
+                "Shim: The filename of the program is too long to handle: '{}'.\n",
+                String::from_utf16_lossy(&buf[..len as usize])
+            )));
             return None;
         }
         let mut path = String::from_utf16_lossy(&buf[..len as usize]);
-        if let Some(dot) = path.rfind('.') {
-            path.truncate(dot);
-            path.push_str(".shim");
+        match path.rfind('.') {
+            Some(dot) => {
+                path.truncate(dot);
+                path.push_str(".shim");
+            }
+            None => path.push_str(".shim"),
         }
         Some(path)
     }
 }
 
-/// Check if the current executable has GUI subsystem by reading PE headers directly
+// PE headers are read directly - no image-helper dependency in windows-sys.
 unsafe fn is_gui_subsystem() -> bool {
     let h = GetModuleHandleW(std::ptr::null());
     if h == NULL_HANDLE {
@@ -147,24 +213,19 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
-/// Expand %ENV_VAR% references using Windows native API (ExpandEnvironmentStringsW).
-///
-/// Matches Win32 behavior:
-/// - Known variables → replaced with their value
-/// - Unknown variables → preserved as-is in output
+// Unknown %VAR% is preserved as-is, matching Win32 semantics.
 fn expand_env_vars(input: &str) -> String {
     if input.is_empty() {
         return String::new();
     }
     let wide = to_wide_null(input);
     unsafe {
-        // First call: get required buffer size (includes null terminator)
+        // First call gets the required size, second expands.
         let required = ExpandEnvironmentStringsW(wide.as_ptr(), std::ptr::null_mut(), 0);
         if required == 0 {
             return input.to_string();
         }
 
-        // Second call: expand into buffer
         let mut buf = vec![0u16; required as usize];
         let actual = ExpandEnvironmentStringsW(wide.as_ptr(), buf.as_mut_ptr(), required);
         if actual == 0 || actual > required {
@@ -175,7 +236,6 @@ fn expand_env_vars(input: &str) -> String {
     }
 }
 
-/// Replace %~dp0 with the shim directory (with trailing backslash)
 fn normalize_args_str(args: &mut String, cur_dir: &str) {
     if let Some(pos) = args.find(DIR_PLACEHOLDER) {
         let mut replacement = cur_dir.to_string();
@@ -186,8 +246,7 @@ fn normalize_args_str(args: &mut String, cur_dir: &str) {
     }
 }
 
-/// Expand env vars and strip structural double-quotes from the result.
-/// Quotes in .shim file values are structural markers, not literal content.
+// Quotes in .shim values are structural markers, not literal content.
 fn expand_and_strip_quotes(value: &str) -> String {
     let mut result = expand_env_vars(value);
     if result.len() >= 2 && result.starts_with('"') && result.ends_with('"') {
@@ -196,9 +255,6 @@ fn expand_and_strip_quotes(value: &str) -> String {
     result
 }
 
-/// Parse a raw line from a .shim file into (key, value).
-/// Returns None for empty lines, comments, or lines without " = " separator.
-/// Trims surrounding quotes — they are structural markers, not content.
 fn parse_shim_line(line: &str) -> Option<(String, String)> {
     let line = line.trim_end();
 
@@ -220,7 +276,6 @@ fn parse_shim_line(line: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
-/// Parse a command line string into individual arguments using CommandLineToArgvW
 fn parse_args_from_cmdline(cmdline: &str) -> Vec<String> {
     if cmdline.is_empty() {
         return Vec::new();
@@ -249,8 +304,7 @@ fn parse_args_from_cmdline(cmdline: &str) -> Vec<String> {
     }
 }
 
-/// Resolve a path against a base directory, returning the **directory** portion
-/// of the absolute form (with trailing backslash).
+// Returns the directory portion (trailing backslash) of the absolute form of `path`.
 fn resolve_against_base(path: &str, base_dir: &str) -> String {
     let wide_path = to_wide_null(path);
     let wide_base = to_wide_null(base_dir);
@@ -290,7 +344,6 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
             len as usize
         };
 
-        // Ensure trailing backslash
         if dir_len > 0
             && (resolved[dir_len - 1] == b'\\' as u16 || resolved[dir_len - 1] == b'/' as u16)
         {
@@ -301,7 +354,8 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
         result
     }
 }
-/// Quote a single argument per Windows CreateProcessW quoting rules
+
+// Windows CreateProcessW argument quoting rules.
 fn quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();
@@ -325,15 +379,12 @@ fn quote_arg(arg: &str) -> String {
             }
             let count = i - bs_start;
             if i == arg.len() {
-                // Trailing backslashes: double them
                 result.extend(std::iter::repeat('\\').take(count * 2));
             } else if arg.as_bytes()[i] == b'"' {
-                // Backslashes before quote: double + 1
                 result.extend(std::iter::repeat('\\').take(count * 2 + 1));
                 result.push('"');
                 i += 1;
             } else {
-                // Backslashes not before quote: literal
                 result.extend(std::iter::repeat('\\').take(count));
             }
         } else if ch == '"' {
@@ -349,17 +400,7 @@ fn quote_arg(arg: &str) -> String {
     result
 }
 
-/// Build a properly quoted command line as UTF-16 (null-terminated)
-fn build_command_line(exe_path: &str, args: &[String]) -> Vec<u16> {
-    let mut cmd = quote_arg(exe_path);
-    for arg in args {
-        cmd.push(' ');
-        cmd.push_str(&quote_arg(arg));
-    }
-    to_wide_null(&cmd)
-}
-
-/// Ensure standard handles are valid; open CONIN$/CONOUT$ if needed
+// GUI/redirected launches can yield null or INVALID std handles.
 unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
     let conin = to_wide_null("CONIN$");
     let conout = to_wide_null("CONOUT$");
@@ -404,10 +445,6 @@ unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shim file parsing
-// ---------------------------------------------------------------------------
-
 fn parse_shim_info(cur_dir: &str) -> ShimInfo {
     let mut info = ShimInfo {
         path: None,
@@ -424,29 +461,31 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
 
     let file = match File::open(&shim_path) {
         Ok(f) => f,
-        Err(_) => {
-            unsafe { write_error_bytes(b"Cannot open shim file for read.\n") };
+        Err(e) => {
+            let err = e.raw_os_error().unwrap_or(0) as u32;
+            unsafe {
+                write_error_wide(&to_wide(&format!(
+                    "Shim: Cannot open shim file for read: '{}'",
+                    shim_path
+                )));
+                write_error_sys(err);
+            }
             return info;
         }
     };
 
     let reader = BufReader::new(file);
 
-    // Read all lines first (shim files are small, typically < 20 lines)
-    let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    let all_lines: Vec<String> = reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .map(|l| l.trim_start_matches('\u{feff}').to_string())
+        .collect();
 
-    // First pass: find path, resolve to absolute, compute target_dir.
-    // %~dp0 expands to the directory containing the target executable,
-    // resolved relative to the shim's own directory.
+    // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
+    // path to absolute so pass 2 can expand %~dp0 against the right base.
     let mut target_dir = cur_dir.to_string();
-    let mut first_line = true;
     for line in &all_lines {
-        let line = if first_line {
-            line.trim_start_matches('\u{feff}')
-        } else {
-            line
-        };
-        first_line = false;
         if let Some((key, value)) = parse_shim_line(line) {
             if key != "path" {
                 continue;
@@ -457,26 +496,16 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
         }
     }
 
-    // Second pass: parse all fields with target_dir for %~dp0
-    let mut first_line = true;
     for line in &all_lines {
-        let line = if first_line {
-            line.trim_start_matches('\u{feff}')
-        } else {
-            line
-        };
-        first_line = false;
         let Some((key, value)) = parse_shim_line(line) else {
             continue;
         };
 
         match key.as_str() {
             "path" => {
-                // Store path unquoted; build_command_line will quote as needed
                 info.path = Some(expand_and_strip_quotes(&value));
             }
             "args" => {
-                // Normalize %~dp0 (now expands to target exe dir), then parse into individual arguments
                 let mut args_str = value.to_string();
                 normalize_args_str(&mut args_str, &target_dir);
                 if !args_str.is_empty() {
@@ -498,12 +527,17 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
         }
     }
 
+    if info.path.is_none() {
+        unsafe {
+            write_error_wide(&to_wide(&format!(
+                "Shim: 'path' not found in shim file '{}'.\n",
+                shim_path
+            )));
+        }
+    }
+
     info
 }
-
-// ---------------------------------------------------------------------------
-// Elevated process launch helper
-// ---------------------------------------------------------------------------
 
 unsafe fn launch_elevated(
     path_w: &[u16],
@@ -526,7 +560,18 @@ unsafe fn launch_elevated(
     sei.nShow = SW_SHOW;
 
     if ShellExecuteExW(&mut sei) == 0 {
-        write_error_bytes(b"Shim: Unable to create elevated process.\n");
+        // On failure hInstApp holds an SE_ERR_* value (<=32); otherwise use GetLastError.
+        let mut err = match sei.hInstApp as isize {
+            0..=32 => sei.hInstApp as isize as u32,
+            _ => 0,
+        };
+        if err == 0 {
+            err = GetLastError();
+        }
+        if err == 0 {
+            err = 1;
+        }
+        write_error_ctx("Unable to create elevated process", err);
         return (NULL_HANDLE, NULL_HANDLE);
     }
 
@@ -538,28 +583,37 @@ unsafe fn launch_elevated(
     (proc_handle, NULL_HANDLE)
 }
 
-// ---------------------------------------------------------------------------
-// Process creation
-// ---------------------------------------------------------------------------
-
 unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     let path = match &info.path {
         Some(p) => p,
         None => return (NULL_HANDLE, NULL_HANDLE),
     };
 
-    // Set environment variables before creating process
+    // Child inherits the updated environment block, hence before CreateProcessW.
     for (key, value) in &info.env_vars {
         let key_w = to_wide_null(key);
         let value_w = to_wide_null(value);
         if SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) == 0 {
-            unsafe { write_error_bytes(b"Shim: Could not set environment variable.\n") };
+            let err = GetLastError();
+            unsafe {
+                write_error_wide(&to_wide(&format!(
+                    "Shim: Could not set environment variable '{key}'"
+                )));
+                write_error_sys(err);
+            }
         }
     }
 
-    // Build properly quoted command line from individual arguments
-    let mut cmd = build_command_line(path, &info.args);
-    // Params string (no exe prefix) for ShellExecuteExW
+    let cmd_str = {
+        let mut c = quote_arg(path);
+        for arg in &info.args {
+            c.push(' ');
+            c.push_str(&quote_arg(arg));
+        }
+        c
+    };
+    let mut cmd = to_wide_null(&cmd_str);
+    // No exe prefix - ShellExecuteExW takes parameters separately from the file.
     let params = {
         let mut p = String::new();
         for (i, arg) in info.args.iter().enumerate() {
@@ -583,12 +637,11 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
         None => std::ptr::null(),
     };
 
-    // Explicit elevation
     if info.elevate {
         return launch_elevated(path_w.as_slice(), params.as_slice(), cwd_ptr, job_handle);
     }
 
-    // Normal path: CreateProcessW with CREATE_SUSPENDED
+    // SUSPENDED: the child must join the job object before it can spawn its own children.
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
 
     if CreateProcessW(
@@ -611,38 +664,35 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
         return (pi.hProcess, pi.hThread);
     }
 
-    // Fallback: ERROR_ELEVATION_REQUIRED
+    // Target manifest requires elevation: retry through ShellExecuteExW.
     let err = GetLastError();
     if err == ERROR_ELEVATION_REQUIRED {
         return launch_elevated(path_w.as_slice(), params.as_slice(), cwd_ptr, job_handle);
     }
 
-    write_error_bytes(b"Shim: Could not create process.\n");
+    write_error_ctx(
+        &format!("Could not create process with command '{cmd_str}'"),
+        err,
+    );
     (NULL_HANDLE, NULL_HANDLE)
 }
 
-// ---------------------------------------------------------------------------
-// Ctrl handler — ignore all signals, let child handle them
-// ---------------------------------------------------------------------------
-
-unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
-    1 // TRUE
+// Swallow the known console control events so only the child handles them.
+unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
+    match ctrl_type {
+        0 | 1 | 2 | 5 | 6 => 1,
+        _ => 0,
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 fn main() {
     let cur_dir = get_shim_dir();
     let mut info = parse_shim_info(&cur_dir);
 
     if info.path.is_none() {
-        unsafe { write_error_bytes(b"Could not read shim file.\n") };
         std::process::exit(1);
     }
 
-    // Append user arguments from runtime argv (skip argv[0])
     let user_args: Vec<String> = std::env::args_os()
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
@@ -653,7 +703,8 @@ fn main() {
         info.args.push(arg_str);
     }
 
-    // GUI subsystem: console attach/detach based on user args
+    // A GUI-subsystem shim would flash a console; with args it behaves as a CLI
+    // tool, so it re-attaches to the parent console for output.
     let is_gui = unsafe { is_gui_subsystem() };
     if is_gui {
         if has_user_args || !info.args.is_empty() {
@@ -667,7 +718,7 @@ fn main() {
         }
     }
 
-    // Create job object: KILL_ON_JOB_CLOSE + SILENT_BREAKAWAY_OK
+    // KILL_ON_JOB_CLOSE ties child lifetime to the shim.
     let job_handle: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
 
     if job_handle != NULL_HANDLE {
@@ -684,19 +735,18 @@ fn main() {
         }
     }
 
-    // Register Ctrl+C handler before process creation
+    // Before spawn: a Ctrl event in the gap would kill the shim and
+    // KILL_ON_JOB_CLOSE would take the child down with it.
     unsafe {
         SetConsoleCtrlHandler(Some(ctrl_handler), 1);
     }
 
-    // Launch process
     let (process_handle, thread_handle) = unsafe { make_process(&info, job_handle) };
 
     if process_handle == NULL_HANDLE {
         std::process::exit(1);
     }
 
-    // Wait for child and propagate exit code
     unsafe {
         WaitForSingleObject(process_handle, INFINITE);
 
