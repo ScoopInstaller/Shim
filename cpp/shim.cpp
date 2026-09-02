@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Scoop shim - C++20 implementation
 
-#ifdef _MSC_VER
-#include <corecrt_wstdio.h>
-#endif
 #pragma comment(lib, "SHELL32.LIB")
 
 #include <windows.h>
@@ -12,7 +9,6 @@
 #include <array>
 #include <cstring>
 #include <cwchar>
-#include <cwctype>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,7 +21,7 @@
 
 using namespace std::string_view_literals;
 
-// Console control handler - must be a regular function with WINAPI calling convention
+// A plain function with WINAPI linkage is required by SetConsoleCtrlHandler.
 BOOL WINAPI CtrlHandler(DWORD ctrlType) noexcept
 {
     switch (ctrlType)
@@ -43,7 +39,6 @@ BOOL WINAPI CtrlHandler(DWORD ctrlType) noexcept
 
 namespace {
 
-// Compile-time constants
 constexpr std::wstring_view c_dirPlaceholder = L"%~dp0"sv;
 constexpr std::wstring_view c_pathPrefix = L"path"sv;
 constexpr std::wstring_view c_argsPrefix = L"args"sv;
@@ -53,10 +48,16 @@ constexpr std::wstring_view c_elevatePrefix = L"elevate"sv;
 constexpr std::wstring_view c_runasPrefix = L"runas"sv;
 constexpr std::wstring_view c_separator = L" = "sv;
 
-// Environment variable storage
+// iswspace() drags in the UCRT wide-ctype table (large under static CRT).
+// Match the Zig lane's explicit Unicode-whitespace set instead of calling the CRT.
+[[nodiscard]] constexpr bool IsWS(wchar_t c) noexcept
+{
+    return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r' || c == L'\v' || c == L'\f' || c == 0x00A0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
 using EnvVarList = std::vector<std::pair<std::wstring, std::wstring>>;
 
-// RAII handle wrapper with minimal overhead
 struct HandleDeleter
 {
     using pointer = HANDLE;
@@ -69,19 +70,6 @@ struct HandleDeleter
     }
 };
 using UniqueHandle = std::unique_ptr<HANDLE, HandleDeleter>;
-
-// RAII file wrapper
-struct FileDeleter
-{
-    void operator()(FILE* fp) const noexcept
-    {
-        if (fp)
-        {
-            fclose(fp);
-        }
-    }
-};
-using UniqueFile = std::unique_ptr<FILE, FileDeleter>;
 
 struct ShimInfo
 {
@@ -98,59 +86,84 @@ struct ProcessResult
     UniqueHandle thread;
 };
 
-// Fast error output - avoids stdio buffering overhead
-inline void WriteError(const char* msg) noexcept
-{
-    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-    if (hErr != INVALID_HANDLE_VALUE)
-    {
-        DWORD written;
-        WriteFile(hErr, msg, static_cast<DWORD>(strlen(msg)), &written, nullptr);
-    }
-}
-
+// Write to stderr, bypassing stdio buffering; WriteConsoleW only works on consoles,
+// so redirected pipes get UTF-8 via WriteFile.
 inline void WriteErrorW(const wchar_t* msg) noexcept
 {
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-    if (hErr != INVALID_HANDLE_VALUE)
+    if (hErr == nullptr || hErr == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    const size_t len = wcslen(msg);
+    if (GetFileType(hErr) == FILE_TYPE_CHAR)
     {
         DWORD written;
-        WriteConsoleW(hErr, msg, static_cast<DWORD>(wcslen(msg)), &written, nullptr);
+        WriteConsoleW(hErr, msg, static_cast<DWORD>(len), &written, nullptr);
+        return;
+    }
+
+    const int cb = WideCharToMultiByte(CP_UTF8, 0, msg, static_cast<int>(len), nullptr, 0, nullptr, nullptr);
+    if (cb > 0)
+    {
+        std::vector<char> buf(static_cast<size_t>(cb));
+        WideCharToMultiByte(CP_UTF8, 0, msg, static_cast<int>(len), buf.data(), cb, nullptr, nullptr);
+        DWORD written;
+        WriteFile(hErr, buf.data(), static_cast<DWORD>(cb), &written, nullptr);
     }
 }
 
-// Ensure standard handles are valid; open fallback console handles if needed
+// System error text follows the OS language.
+inline void WriteErrorSys(DWORD err)
+{
+    wchar_t num[11] {};
+    DWORD v = err;
+    int i = 10;
+    do
+    {
+        num[--i] = static_cast<wchar_t>(L'0' + v % 10);
+        v /= 10;
+    } while (v && i > 0);
+    WriteErrorW(L" (error ");
+    WriteErrorW(num + i);
+    WriteErrorW(L": ");
+
+    wchar_t buf[256];
+    DWORD n = FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_MAX_WIDTH_MASK,
+        nullptr,
+        err,
+        0,
+        buf,
+        static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])),
+        nullptr);
+    if (n != 0)
+    {
+        while (n > 0 && IsWS(buf[n - 1]))
+            --n;
+        buf[n] = L'\0';
+        WriteErrorW(buf);
+    }
+    WriteErrorW(L").\n");
+}
+
+// GUI/redirected launches can yield null or INVALID_HANDLE_VALUE std handles.
 inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
 {
-    // Check stdin
-    if (si.hStdInput == nullptr || si.hStdInput == INVALID_HANDLE_VALUE)
-    {
-        si.hStdInput = CreateFileW(L"CONIN$", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (si.hStdInput == INVALID_HANDLE_VALUE)
+    auto ensure = [](HANDLE& h, const wchar_t* name, DWORD access, DWORD share) noexcept {
+        if (h == nullptr || h == INVALID_HANDLE_VALUE)
         {
-            si.hStdInput = nullptr;
+            h = CreateFileW(name, access, share, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE)
+            {
+                h = nullptr;
+            }
         }
-    }
-
-    // Check stdout
-    if (si.hStdOutput == nullptr || si.hStdOutput == INVALID_HANDLE_VALUE)
-    {
-        si.hStdOutput = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (si.hStdOutput == INVALID_HANDLE_VALUE)
-        {
-            si.hStdOutput = nullptr;
-        }
-    }
-
-    // Check stderr
-    if (si.hStdError == nullptr || si.hStdError == INVALID_HANDLE_VALUE)
-    {
-        si.hStdError = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (si.hStdError == INVALID_HANDLE_VALUE)
-        {
-            si.hStdError = nullptr;
-        }
-    }
+    };
+    ensure(si.hStdInput, L"CONIN$", GENERIC_READ, FILE_SHARE_READ);
+    ensure(si.hStdOutput, L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE);
+    ensure(si.hStdError, L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE);
 }
 
 [[nodiscard]] constexpr std::wstring_view GetDirectory(std::wstring_view exe) noexcept
@@ -162,10 +175,9 @@ inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
     return exe;
 }
 
-// Trim trailing whitespace (spaces, tabs, CR, LF)
 [[nodiscard]] std::wstring_view TrimTrailingWhitespace(std::wstring_view sv) noexcept
 {
-    while (!sv.empty() && iswspace(sv.back()))
+    while (!sv.empty() && IsWS(sv.back()))
         sv.remove_suffix(1);
     return sv;
 }
@@ -184,10 +196,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     }
 }
 
-// Quote a single argument per Windows CreateProcessW quoting rules:
-// - Arguments containing spaces, tabs, quotes, or empty are wrapped in double quotes
-// - Backslashes before a quote character are doubled
-// - Trailing backslashes inside a quoted argument are doubled
+// Windows CreateProcessW argument quoting rules.
 [[nodiscard]] std::wstring QuoteArg(std::wstring_view arg)
 {
     if (arg.empty())
@@ -221,25 +230,21 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
             if (i == arg.size())
             {
-                // Trailing backslashes: double them (before closing quote)
                 result.append((i - bsStart) * 2, L'\\');
             }
             else if (arg[i] == L'"')
             {
-                // Backslashes before quote: double + 1 to escape the quote
                 result.append((i - bsStart) * 2 + 1, L'\\');
                 result += L'"';
                 ++i;
             }
             else
             {
-                // Backslashes not before quote: literal
                 result.append(i - bsStart, L'\\');
             }
         }
         else if (arg[i] == L'"')
         {
-            // Lone quote: escape with backslash
             result += L"\\\"";
             ++i;
         }
@@ -254,7 +259,6 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return result;
 }
 
-// Build a properly quoted command line from individual arguments
 [[nodiscard]] std::wstring BuildCommandLine(const std::wstring& exePath, const std::vector<std::wstring>& args)
 {
     std::wstring cmd = QuoteArg(exePath);
@@ -266,7 +270,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return cmd;
 }
 
-// Build a quoted parameter string from arguments (no exe prefix, for ShellExecuteExW)
+// No exe prefix - ShellExecuteExW takes parameters separately from the file.
 [[nodiscard]] std::wstring BuildParams(const std::vector<std::wstring>& args)
 {
     std::wstring params;
@@ -279,7 +283,6 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return params;
 }
 
-// Check if current executable is a GUI subsystem binary
 [[nodiscard]] bool IsGuiSubsystem() noexcept
 {
     HMODULE hModule = GetModuleHandleW(nullptr);
@@ -303,29 +306,26 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return ntHeaders->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI;
 }
 
-// Parse boolean-like value: "true", "1", "yes" -> true
 [[nodiscard]] bool ParseBool(std::wstring_view value) noexcept
 {
-    // _wcsnicmp compares exactly N chars — safe on non-null-terminated views
+    // _wcsnicmp compares exactly N chars - safe on non-null-terminated views
     return (value.size() == 4 && _wcsnicmp(value.data(), L"true", 4) == 0) || (value.size() == 1 && value[0] == L'1') ||
            (value.size() == 3 && _wcsnicmp(value.data(), L"yes", 3) == 0);
 }
 
-// Expand %ENV_VAR% references using Windows native API
+// ExpandEnvironmentStringsW requires null-terminated input; unknown %VAR% stays as-is.
 [[nodiscard]] std::wstring ExpandEnvVars(std::wstring_view input)
 {
     if (input.empty()) [[unlikely]]
         return {};
 
-    // ExpandEnvironmentStringsW requires null-terminated input
     std::wstring inputStr(input);
 
-    // First call: get required buffer size (includes null terminator)
+    // First call gets the required size, second expands.
     DWORD required = ExpandEnvironmentStringsW(inputStr.c_str(), nullptr, 0);
     if (required == 0) [[unlikely]]
         return inputStr;
 
-    // Second call: expand into buffer
     std::wstring result(required - 1, L'\0');
     DWORD actual = ExpandEnvironmentStringsW(inputStr.c_str(), result.data(), required);
     if (actual == 0 || actual > required) [[unlikely]]
@@ -335,9 +335,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return result;
 }
 
-// Combine ExpandEnvVars with quote stripping.
-// Shims use quotes around values as structural markers (not content),
-// so stripping them after expansion prevents double-quoting in BuildCommandLine.
+// Shim quotes are structural markers, not content - strip them to avoid double-quoting later.
 [[nodiscard]] std::wstring ExpandAndUnquote(std::wstring_view value)
 {
     std::wstring expanded = ExpandEnvVars(value);
@@ -348,8 +346,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return expanded;
 }
 
-// Resolve a path against a base directory, returning the **directory** portion
-// of the absolute form (with trailing backslash).
+// Returns the directory portion (trailing backslash) of the absolute form of `path`.
 [[nodiscard]] std::wstring ResolveAgainstBase(std::wstring_view path, std::wstring_view baseDir)
 {
     std::wstring toResolve;
@@ -376,31 +373,26 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
     size_t dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - resolved.data()) : len;
 
-    // Ensure trailing backslash
     if (dirLen > 0 && (resolved[dirLen - 1] == L'\\' || resolved[dirLen - 1] == L'/'))
         return std::wstring(resolved.data(), dirLen);
 
     return std::wstring(resolved.data(), dirLen) + L'\\';
 }
 
-// Parse a trimmed .shim line into (name, value) pair.
-// Returns nullopt for empty lines, comments, or lines without " = " separator.
 [[nodiscard]] std::optional<std::pair<std::wstring_view, std::wstring_view>> ParseShimLine(std::wstring_view line) noexcept
 {
-    // Skip leading whitespace (any Unicode whitespace, not just ASCII)
     auto skipWS = [](std::wstring_view s, size_t start = 0) -> size_t {
-        while (start < s.size() && iswspace(s[start]))
+        while (start < s.size() && IsWS(s[start]))
             ++start;
         return start;
     };
     auto rskipWS = [](std::wstring_view s) -> size_t {
         size_t i = s.size();
-        while (i > 0 && iswspace(s[i - 1]))
+        while (i > 0 && IsWS(s[i - 1]))
             --i;
         return i;
     };
 
-    // Skip comments
     auto first = skipWS(line);
     if (first >= line.size() || line[first] == L'#' || line[first] == L';')
         return std::nullopt;
@@ -430,41 +422,87 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
 [[nodiscard]] ShimInfo GetShimInfo()
 {
-    // Get filename of current executable
     std::array<wchar_t, MAX_PATH + 2> filename {};
     const auto filenameSize = GetModuleFileNameW(nullptr, filename.data(), MAX_PATH);
 
-    if (filenameSize >= MAX_PATH) [[unlikely]]
+    if (filenameSize == 0) [[unlikely]]
     {
-        WriteError("Shim: The filename of the program is too long to handle.\n");
+        WriteErrorW(L"Shim: The filename of the program could not be determined");
+        WriteErrorSys(GetLastError());
         return {};
     }
 
-    // Replace .exe with .shim
+    if (filenameSize >= MAX_PATH) [[unlikely]]
+    {
+        std::wstring msg = L"Shim: The filename of the program is too long to handle: '";
+        msg += std::wstring_view(filename.data(), filenameSize);
+        msg += L"'.\n";
+        WriteErrorW(msg.c_str());
+        return {};
+    }
+
+    // Overwrite the ".exe" suffix in place with "shim" (4 chars + null).
     std::wmemcpy(filename.data() + filenameSize - 3, L"shim", 4);
     filename[filenameSize + 1] = L'\0';
 
-    FILE* fp = nullptr;
-    if (_wfopen_s(&fp, filename.data(), L"r,ccs=UTF-8") != 0) [[unlikely]]
+    // Raw ReadFile instead of stdio: the CRT's FILE machinery and ccs=UTF-8 decoder
+    // are dead weight under a static CRT, and _wfopen_s reports errno instead of a
+    // usable Win32 error code.
+    UniqueHandle shimFile(CreateFileW(filename.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!shimFile || shimFile.get() == INVALID_HANDLE_VALUE) [[unlikely]]
     {
-        WriteError("Cannot open shim file for read.\n");
+        const DWORD openErr = GetLastError();
+        std::wstring msg = L"Shim: Cannot open shim file for read: '";
+        msg += filename.data();
+        msg += L"'";
+        WriteErrorW(msg.c_str());
+        WriteErrorSys(openErr);
         return {};
     }
-    UniqueFile shimFile(fp);
 
-    // Read all lines into memory (shim files are small, typically < 20 lines)
-    std::array<wchar_t, 1 << 14> linebuf {};
-    std::vector<std::wstring> allLines;
-    while (std::fgetws(linebuf.data(), static_cast<int>(linebuf.size()), shimFile.get()))
+    const DWORD fileSize = GetFileSize(shimFile.get(), nullptr);
+    std::vector<char> raw(fileSize == INVALID_FILE_SIZE ? 0 : fileSize);
+    DWORD bytesRead = 0;
+    if (fileSize == INVALID_FILE_SIZE || (fileSize > 0 && (!ReadFile(shimFile.get(), raw.data(), fileSize, &bytesRead, nullptr) || bytesRead != fileSize)))
+        [[unlikely]]
     {
-        allLines.emplace_back(linebuf.data());
+        const DWORD readErr = GetLastError();
+        std::wstring msg = L"Shim: Cannot open shim file for read: '";
+        msg += filename.data();
+        msg += L"'";
+        WriteErrorW(msg.c_str());
+        WriteErrorSys(readErr);
+        return {};
+    }
+
+    // UTF-8 -> UTF-16. Invalid bytes map to U+FFFD and reading continues; the CRT's
+    // ccs=UTF-8 stream would instead abort fgetws at the first bad sequence.
+    std::vector<wchar_t> text;
+    if (bytesRead > 0)
+    {
+        const int wideLen = MultiByteToWideChar(CP_UTF8, 0, raw.data(), static_cast<int>(bytesRead), nullptr, 0);
+        text.resize(static_cast<size_t>(wideLen));
+        MultiByteToWideChar(CP_UTF8, 0, raw.data(), static_cast<int>(bytesRead), text.data(), wideLen);
+        if (!text.empty() && text[0] == 0xFEFF) // ccs=UTF-8 consumed the BOM; do the same
+            text.erase(text.begin());
+    }
+
+    std::vector<std::wstring> allLines;
+    std::wstring_view tv(text.data(), text.size());
+    size_t pos = 0;
+    while (pos < tv.size())
+    {
+        auto nl = tv.find(L'\n', pos);
+        if (nl == std::wstring_view::npos)
+            nl = tv.size();
+        allLines.emplace_back(tv.substr(pos, nl - pos));
+        pos = nl + 1;
     }
 
     const std::wstring_view curDir = GetDirectory({filename.data(), filenameSize});
 
-    // First pass: find path, resolve to absolute, compute targetDir.
-    // %~dp0 expands to the directory containing the target executable,
-    // resolved relative to the shim's own directory.
+    // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
+    // path to absolute so pass 2 can expand %~dp0 against the right base.
     std::wstring targetDir {curDir};
     for (const auto& rawLine : allLines)
     {
@@ -478,7 +516,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         break;
     }
 
-    // Second pass: parse all fields with targetDir for %~dp0
+    // Second pass: expand all fields using targetDir for %~dp0.
     ShimInfo info;
     for (const auto& rawLine : allLines)
     {
@@ -528,6 +566,14 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         }
     }
 
+    if (!info.path)
+    {
+        std::wstring msg = L"Shim: 'path' not found in shim file '";
+        msg += filename.data();
+        msg += L"'.\n";
+        WriteErrorW(msg.c_str());
+    }
+
     return info;
 }
 
@@ -546,7 +592,14 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
     if (!ShellExecuteExW(&sei))
     {
-        WriteError("Shim: Unable to create elevated process.\n");
+        // On failure hInstApp holds an SE_ERR_* value (<=32); otherwise use GetLastError.
+        DWORD err = static_cast<DWORD>(reinterpret_cast<INT_PTR>(sei.hInstApp));
+        if (err > 32)
+            err = GetLastError();
+        if (err == 0)
+            err = ERROR_INVALID_FUNCTION;
+        WriteErrorW(L"Shim: Unable to create elevated process");
+        WriteErrorSys(err);
         return result;
     }
 
@@ -554,7 +607,6 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     if (jobHandle && result.process)
         AssignProcessToJobObject(jobHandle, result.process.get());
 
-    SetConsoleCtrlHandler(CtrlHandler, TRUE);
     return result;
 }
 
@@ -565,14 +617,16 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     if (!info.path) [[unlikely]]
         return result;
 
-    // Set environment variables before creating process
+    // Child inherits the updated environment block, hence before CreateProcessW.
     for (const auto& [name, value] : info.envVars)
     {
-        if (_wputenv_s(name.c_str(), value.c_str()) != 0) [[unlikely]]
+        if (!SetEnvironmentVariableW(name.c_str(), value.c_str())) [[unlikely]]
         {
-            WriteError("Shim: Could not set environment variable '");
-            WriteErrorW(name.c_str());
-            WriteError("'.\n");
+            std::wstring msg = L"Shim: Could not set environment variable '";
+            msg += name;
+            msg += L"'";
+            WriteErrorW(msg.c_str());
+            WriteErrorSys(GetLastError());
         }
     }
 
@@ -581,7 +635,6 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     std::wstring cmd = BuildCommandLine(path, info.args);
     std::wstring params = BuildParams(info.args);
 
-    // Explicit elevation
     if (info.elevate) [[unlikely]]
         return LaunchElevated(path, params, cwd, jobHandle);
 
@@ -592,6 +645,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
     PROCESS_INFORMATION pi {};
 
+    // SUSPENDED: the child must join the job object before it can spawn its own children.
     if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr, cwd, &si, &pi)) [[likely]]
     {
         result.thread.reset(pi.hThread);
@@ -605,16 +659,17 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     else
     {
         const DWORD err = GetLastError();
+        // Target manifest requires elevation: retry through ShellExecuteExW.
         if (err == ERROR_ELEVATION_REQUIRED)
             return LaunchElevated(path, params, cwd, jobHandle);
 
-        WriteError("Shim: Could not create process with command '");
-        WriteErrorW(cmd.c_str());
-        WriteError("'.\n");
+        std::wstring msg = L"Shim: Could not create process with command '";
+        msg += cmd;
+        msg += L"'";
+        WriteErrorW(msg.c_str());
+        WriteErrorSys(err);
         return result;
     }
-
-    SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
     return result;
 }
@@ -627,17 +682,15 @@ int wmain(int argc, wchar_t* argv[])
 
     if (!info.path) [[unlikely]]
     {
-        WriteError("Could not read shim file.\n");
         return 1;
     }
 
-    // Parse user arguments from runtime argv using CommandLineToArgvW
+    // CommandLineToArgvW splits the raw command line; argv[0] is the shim itself.
     {
         int userArgc = 0;
         LPWSTR* userArgv = CommandLineToArgvW(GetCommandLineW(), &userArgc);
         if (userArgv)
         {
-            // Skip argv[0] (the executable name)
             for (int i = 1; i < userArgc; ++i)
             {
                 info.args.emplace_back(userArgv[i]);
@@ -646,23 +699,21 @@ int wmain(int argc, wchar_t* argv[])
         }
     }
 
-    // GUI shim: handle console attach/detach based on user args
-    // Console shim: always use console path (no action needed)
+    // A GUI-subsystem shim would otherwise flash a console window. With args it
+    // behaves as a CLI tool, so it re-attaches to the parent console for output.
     if (IsGuiSubsystem())
     {
         if (argc <= 1 && info.args.empty())
         {
-            // No user args: GUI fast path, no console flash
             FreeConsole();
         }
         else
         {
-            // User args present: attach to parent console for CLI output
             AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
 
-    // Create job object to ensure child termination with parent
+    // KILL_ON_JOB_CLOSE ties child lifetime to the shim.
     UniqueHandle jobHandle(CreateJobObjectW(nullptr, nullptr));
     if (jobHandle) [[likely]]
     {
@@ -670,6 +721,10 @@ int wmain(int argc, wchar_t* argv[])
         jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         SetInformationJobObject(jobHandle.get(), JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
     }
+
+    // Before spawn: a Ctrl event in the gap would kill the shim and
+    // KILL_ON_JOB_CLOSE would take the child down with it.
+    SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
     auto [processHandle, threadHandle] = MakeProcess(info, jobHandle.get());
 

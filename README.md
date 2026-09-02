@@ -73,8 +73,8 @@ All implementations share the same `.shim` format.
 | Implementation | Build Tool |      x86 |      x64 |    arm64 |
 | -------------- | ---------- | -------: | -------: | -------: |
 | C#             | dotnet     |  15.0 KB |  14.5 KB |  14.5 KB |
-| C++            | Zig        | 130.5 KB | 158.0 KB | 151.5 KB |
-| C++            | MSBuild    | 129.5 KB | 155.0 KB | 140.5 KB |
+| C++            | Zig        | 117.0 KB | 141.5 KB | 133.0 KB |
+| C++            | MSBuild    | 116.0 KB | 140.5 KB | 122.5 KB |
 | Rust           | Cargo      | 113.0 KB | 130.5 KB | 126.0 KB |
 | Zig            | Zig        |  81.5 KB |  72.0 KB |  21.5 KB |
 

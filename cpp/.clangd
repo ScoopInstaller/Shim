@@ -1,0 +1,8 @@
+# Mirror cpp/build.zig compile flags; without this clangd falls back to a
+# pre-C++20 std and reports false errors (e.g. wstring_view::starts_with).
+# Kept out of .clang-format's scope: tool config, not source.
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -fno-exceptions
+    - -D_CRT_SECURE_NO_WARNINGS
