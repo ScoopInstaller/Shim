@@ -70,6 +70,26 @@ jobs:
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v7
+    - name: Check whitespace hygiene
+      shell: pwsh
+      run: |
+        $bad = @()
+        foreach ($f in git ls-files) {
+          $b = [System.IO.File]::ReadAllBytes((Join-Path $PWD $f))
+          if ($b.Length -eq 0) { continue }
+          if ($b[-1] -ne 0x0A) { $bad += "$f (no final newline)"; continue }
+          $i = 0
+          while ($i -lt $b.Length) {
+            if ($b[$i] -eq 0x0A) {
+              $j = $i - 1
+              if ($j -ge 0 -and $b[$j] -eq 0x0D) { $j-- }
+              if ($j -ge 0 -and ($b[$j] -eq 0x20 -or $b[$j] -eq 0x09)) { $bad += "$f (trailing whitespace)"; break }
+            }
+            $i++
+          }
+        }
+        if ($bad) { throw "Whitespace issues: $($bad -join '; ')" }
+        Write-Host "All tracked files pass whitespace checks."
     - name: Setup .NET
       if: matrix.setup == 'dotnet'
       uses: actions/setup-dotnet@v6

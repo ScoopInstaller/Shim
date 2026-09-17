@@ -2,7 +2,7 @@
 
 Target: `C:\Windows\System32\whoami.exe` (built-in Windows executable)
 Tool: [hyperfine](https://github.com/sharkdp/hyperfine)
-Architecture: auto-detected (x64/x86/arm64)  
+Architecture: auto-detected (x64/x86/arm64)
 20 warmup + 50 measured runs per implementation (randomized order)
 
 ## Usage
