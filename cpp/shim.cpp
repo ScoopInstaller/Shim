@@ -148,22 +148,57 @@ inline void WriteErrorSys(DWORD err)
     WriteErrorW(L").\n");
 }
 
+[[nodiscard]] bool IsGuiSubsystem() noexcept;
+
 // GUI/redirected launches can yield null or INVALID_HANDLE_VALUE std handles.
+// A GUI shim may have detached from (or never had) a console; reattach so CONIN$/CONOUT$ open.
 inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
 {
-    auto ensure = [](HANDLE& h, const wchar_t* name, DWORD access, DWORD share) noexcept {
+    if (IsGuiSubsystem())
+    {
+        AttachConsole(ATTACH_PARENT_PROCESS); // ignore failure - parent may have no console
+    }
+
+    // SECURITY_ATTRIBUTES.bInheritHandle=TRUE lets the child inherit (CreateProcessW bInheritHandles=TRUE).
+    SECURITY_ATTRIBUTES sa {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+
+    bool replaced = false;
+    auto ensure = [&](HANDLE& h, const wchar_t* name, DWORD access, DWORD share) noexcept {
         if (h == nullptr || h == INVALID_HANDLE_VALUE)
         {
-            h = CreateFileW(name, access, share, nullptr, OPEN_EXISTING, 0, nullptr);
-            if (h == INVALID_HANDLE_VALUE)
+            h = CreateFileW(name, access, share, &sa, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) [[unlikely]]
             {
                 h = nullptr;
+            }
+            else
+            {
+                replaced = true;
             }
         }
     };
     ensure(si.hStdInput, L"CONIN$", GENERIC_READ, FILE_SHARE_READ);
     ensure(si.hStdOutput, L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE);
     ensure(si.hStdError, L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE);
+
+    if (replaced)
+    {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+    }
+
+    // Handles are intentionally never closed: they live for the process lifetime.
+}
+
+// "Shim: <action>: '<file>'" plus the Win32 error text.
+inline void ReportShimFileError(const wchar_t* action, const wchar_t* file, DWORD err)
+{
+    std::wstring msg = L"Shim: ";
+    msg += action;
+    msg += L": '";
+    msg += file;
+    msg += L"'";
+    WriteErrorW(msg.c_str());
+    WriteErrorSys(err);
 }
 
 [[nodiscard]] constexpr std::wstring_view GetDirectory(std::wstring_view exe) noexcept
@@ -192,7 +227,18 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         {
             replacement += L'\\';
         }
-        args.replace(pos, c_dirPlaceholder.size(), replacement);
+
+        // Reserve for N expansions: value.size() + n * (targetDir.size() + 1) worst case.
+        size_t n = 0;
+        for (size_t p = pos; p != std::wstring::npos; p = args.find(c_dirPlaceholder, p + c_dirPlaceholder.size()))
+            ++n;
+        args.reserve(args.size() + n * (replacement.size() - c_dirPlaceholder.size()));
+
+        do
+        {
+            args.replace(pos, c_dirPlaceholder.size(), replacement);
+            pos = args.find(c_dirPlaceholder, pos + replacement.size());
+        } while (pos != std::wstring::npos);
     }
 }
 
@@ -365,18 +411,32 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     std::array<wchar_t, MAX_PATH + 2> resolved {};
     wchar_t* filePart = nullptr;
     DWORD len = GetFullPathNameW(toResolve.c_str(), MAX_PATH, resolved.data(), &filePart);
+
+    std::wstring resolvedStr;
+    size_t dirLen;
     if (len == 0 || len >= MAX_PATH) [[unlikely]]
     {
-        toResolve.push_back(L'\\');
-        return toResolve;
+        // Two-call sizing: len > MAX_PATH is the required buffer size (incl. null).
+        DWORD required = (len >= MAX_PATH) ? len : GetFullPathNameW(toResolve.c_str(), 0, nullptr, nullptr);
+        if (required == 0) [[unlikely]]
+            return toResolve + L'\\'; // retry failed too - best-effort fallback
+
+        std::vector<wchar_t> big(required);
+        DWORD len2 = GetFullPathNameW(toResolve.c_str(), required, big.data(), &filePart);
+        if (len2 == 0 || len2 >= required) [[unlikely]]
+            return toResolve + L'\\';
+        resolvedStr.assign(big.data());
+        dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - big.data()) : resolvedStr.size();
     }
+    else
+    {
+        resolvedStr.assign(resolved.data());
+        dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - resolved.data()) : resolvedStr.size();
+    }
+    if (dirLen > 0 && (resolvedStr[dirLen - 1] == L'\\' || resolvedStr[dirLen - 1] == L'/'))
+        return resolvedStr.substr(0, dirLen);
 
-    size_t dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - resolved.data()) : len;
-
-    if (dirLen > 0 && (resolved[dirLen - 1] == L'\\' || resolved[dirLen - 1] == L'/'))
-        return std::wstring(resolved.data(), dirLen);
-
-    return std::wstring(resolved.data(), dirLen) + L'\\';
+    return resolvedStr.substr(0, dirLen) + L'\\';
 }
 
 [[nodiscard]] std::optional<std::pair<std::wstring_view, std::wstring_view>> ParseShimLine(std::wstring_view line) noexcept
@@ -451,12 +511,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     UniqueHandle shimFile(CreateFileW(filename.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (!shimFile || shimFile.get() == INVALID_HANDLE_VALUE) [[unlikely]]
     {
-        const DWORD openErr = GetLastError();
-        std::wstring msg = L"Shim: Cannot open shim file for read: '";
-        msg += filename.data();
-        msg += L"'";
-        WriteErrorW(msg.c_str());
-        WriteErrorSys(openErr);
+        ReportShimFileError(L"Cannot open shim file for read", filename.data(), GetLastError());
         return {};
     }
 
@@ -466,12 +521,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     if (fileSize == INVALID_FILE_SIZE || (fileSize > 0 && (!ReadFile(shimFile.get(), raw.data(), fileSize, &bytesRead, nullptr) || bytesRead != fileSize)))
         [[unlikely]]
     {
-        const DWORD readErr = GetLastError();
-        std::wstring msg = L"Shim: Cannot open shim file for read: '";
-        msg += filename.data();
-        msg += L"'";
-        WriteErrorW(msg.c_str());
-        WriteErrorSys(readErr);
+        ReportShimFileError(L"Cannot read shim file", filename.data(), GetLastError());
         return {};
     }
 
@@ -487,7 +537,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
             text.erase(text.begin());
     }
 
-    std::vector<std::wstring> allLines;
+    std::vector<std::wstring_view> allLines;
     std::wstring_view tv(text.data(), text.size());
     size_t pos = 0;
     while (pos < tv.size())
@@ -502,7 +552,8 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     const std::wstring_view curDir = GetDirectory({filename.data(), filenameSize});
 
     // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
-    // path to absolute so pass 2 can expand %~dp0 against the right base.
+    // path to absolute so pass 2 can expand %~dp0 against the right base. A path
+    // value may itself use %~dp0, which there refers to the shim's own directory.
     std::wstring targetDir {curDir};
     for (const auto& rawLine : allLines)
     {
@@ -511,7 +562,9 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         if (!parsed || parsed->first != c_pathPrefix)
             continue;
 
-        std::wstring expanded = ExpandAndUnquote(parsed->second);
+        std::wstring pathVal(parsed->second);
+        NormalizeArgsInPlace(pathVal, curDir);
+        std::wstring expanded = ExpandAndUnquote(pathVal);
         targetDir = ResolveAgainstBase(expanded, curDir);
         break;
     }
@@ -529,7 +582,12 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
         if (name == c_pathPrefix)
         {
-            info.path = ExpandAndUnquote(value);
+            if (!info.path) // first path line wins
+            {
+                std::wstring pathVal(value);
+                NormalizeArgsInPlace(pathVal, curDir);
+                info.path = ExpandAndUnquote(pathVal);
+            }
         }
         else if (name == c_argsPrefix)
         {
@@ -562,11 +620,13 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         }
         else
         {
-            info.envVars.emplace_back(std::wstring(name), ExpandAndUnquote(value));
+            std::wstring envVal(value);
+            NormalizeArgsInPlace(envVal, targetDir);
+            info.envVars.emplace_back(std::wstring(name), ExpandAndUnquote(envVal));
         }
     }
 
-    if (!info.path)
+    if (!info.path || info.path->empty())
     {
         std::wstring msg = L"Shim: 'path' not found in shim file '";
         msg += filename.data();
@@ -614,7 +674,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 {
     ProcessResult result;
 
-    if (!info.path) [[unlikely]]
+    if (!info.path || info.path->empty()) [[unlikely]]
         return result;
 
     // Child inherits the updated environment block, hence before CreateProcessW.
@@ -633,10 +693,10 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     const auto& path = *info.path;
     const auto* cwd = info.cwd ? info.cwd->c_str() : nullptr;
     std::wstring cmd = BuildCommandLine(path, info.args);
-    std::wstring params = BuildParams(info.args);
 
+    // Params are only consumed by ShellExecuteExW; not built on the normal CreateProcessW path.
     if (info.elevate) [[unlikely]]
-        return LaunchElevated(path, params, cwd, jobHandle);
+        return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);
 
     STARTUPINFOW si {};
     si.cb = sizeof(si);
@@ -661,7 +721,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         const DWORD err = GetLastError();
         // Target manifest requires elevation: retry through ShellExecuteExW.
         if (err == ERROR_ELEVATION_REQUIRED)
-            return LaunchElevated(path, params, cwd, jobHandle);
+            return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);
 
         std::wstring msg = L"Shim: Could not create process with command '";
         msg += cmd;

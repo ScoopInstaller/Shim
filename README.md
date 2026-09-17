@@ -35,7 +35,7 @@ Values may be wrapped in double quotes (e.g. `path = "C:\Program Files\app.exe"`
 ### Variable Expansion
 
 - `%ENV%` — Expands environment variables in `path`, `args`, `cwd`, and environment override values. Unknown variables (e.g. `%NONEXISTENT_VAR%`) are preserved as-is.
-- `%~dp0` — Expands to the **directory containing the target executable** with a trailing backslash. Applies to `args` and `cwd` only (not `path`).
+- `%~dp0` — In `path`, expands against the **shim's own directory** (the target is unknown at that point). In `args`, `cwd`, and environment override values, expands to the **directory containing the target executable** with a trailing backslash. All occurrences in a value are replaced. Duplicate `path` keys: the first one wins.
 
 ### Argument Parsing
 
@@ -73,8 +73,8 @@ All implementations share the same `.shim` format.
 | Implementation | Build Tool |      x86 |      x64 |    arm64 |
 | -------------- | ---------- | -------: | -------: | -------: |
 | C#             | dotnet     |  16.0 KB |  15.0 KB |  15.0 KB |
-| C++            | Zig        | 117.0 KB | 141.5 KB | 133.0 KB |
-| C++            | MSBuild    | 116.0 KB | 140.5 KB | 122.5 KB |
+| C++            | Zig        | 117.5 KB | 141.5 KB | 133.0 KB |
+| C++            | MSBuild    | 117.0 KB | 142.5 KB | 124.0 KB |
 | Rust           | Cargo      | 113.0 KB | 130.5 KB | 126.0 KB |
 | Zig            | Zig        |  81.5 KB |  72.0 KB |  21.5 KB |
 

@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addCSourceFiles(.{
         .root = b.path("."),
         .files = &.{"shim.cpp"},
-        .flags = &.{"-std=c++20", "-fno-exceptions", "-flto"},
+        .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-flto", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables" },
     });
     exe.root_module.addCSourceFiles(.{
         .root = b.path("."),
