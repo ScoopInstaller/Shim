@@ -60,7 +60,6 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.linkSystemLibrary("shell32", .{});
-    exe.root_module.linkSystemLibrary("shlwapi", .{});
 
     // Install to prefix root (build.ps1 passes --prefix bin/{platform})
     const install = b.addInstallFile(exe.getEmittedBin(), "shim.exe");
