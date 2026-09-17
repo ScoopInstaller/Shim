@@ -8,8 +8,10 @@ use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE,
+    HANDLE,
 };
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetFileType, GetFullPathNameW, WriteFile, FILE_SHARE_MODE, FILE_TYPE_CHAR,
     OPEN_EXISTING,
@@ -23,14 +25,14 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 use windows_sys::Win32::System::Environment::{ExpandEnvironmentStringsW, SetEnvironmentVariableW};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, GetStartupInfoW, ResumeThread, WaitForSingleObject,
-    CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{
     CommandLineToArgvW, ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -42,9 +44,13 @@ const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D;
 const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550;
 const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
 const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
-const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
 const NULL_HANDLE: HANDLE = std::ptr::null_mut();
 const INVALID_HANDLE: HANDLE = -1isize as *mut _;
+
+// FORMAT_MESSAGE_MAX_WIDTH_MASK lives in Win32_System_WindowsProgramming; inlined
+// to avoid a feature dependency for one constant. Keeps the messages byte-identical
+// to the previous format!-based output.
+const FORMAT_MESSAGE_MAX_WIDTH_MASK: u32 = 255;
 
 const FILE_SHARE_READ: FILE_SHARE_MODE = 1;
 const FILE_SHARE_WRITE: FILE_SHARE_MODE = 2;
@@ -96,12 +102,29 @@ unsafe fn write_error_wide(msg: &[u16]) {
     write_error_bytes(&String::from_utf16_lossy(msg).into_bytes());
 }
 
+// Hand-rolled decimal render: avoids core::fmt (and its integer machinery) in the binary.
+unsafe fn write_error_num(mut v: u32) {
+    let mut buf = [0u16; 11];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' as u16 + (v % 10) as u16;
+        v /= 10;
+        if v == 0 || i == 0 {
+            break;
+        }
+    }
+    write_error_wide(&buf[i..]);
+}
+
 // System error text follows the OS language.
 unsafe fn write_error_sys(err: u32) {
-    write_error_bytes(format!(" (error {err}: ").as_bytes());
+    write_error_wide(&to_wide(" (error "));
+    write_error_num(err);
+    write_error_wide(&to_wide(": "));
     let mut buf = [0u16; 256];
     let n = FormatMessageW(
-        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | 255,
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_MAX_WIDTH_MASK,
         std::ptr::null(),
         err,
         0,
@@ -121,7 +144,8 @@ unsafe fn write_error_sys(err: u32) {
 }
 
 unsafe fn write_error_ctx(context: &str, err: u32) {
-    write_error_wide(&to_wide(&format!("Shim: {context}")));
+    write_error_wide(&to_wide("Shim: "));
+    write_error_wide(&to_wide(context));
     write_error_sys(err);
 }
 
@@ -136,22 +160,8 @@ fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().collect()
 }
 
-fn get_shim_dir() -> String {
-    unsafe {
-        let mut buf = [0u16; 261];
-        let len = GetModuleFileNameW(GetModuleHandleW(std::ptr::null()), buf.as_mut_ptr(), 260);
-        if len == 0 || len >= 260 {
-            return String::new();
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        match path.rfind(['\\', '/']) {
-            Some(pos) => path[..pos].to_string(),
-            None => path,
-        }
-    }
-}
-
-fn get_shim_path() -> Option<String> {
+// One GetModuleFileNameW call yields both the shim's directory and its paired .shim path.
+fn get_shim_paths() -> Option<(String, String)> {
     unsafe {
         let mut buf = [0u16; 261];
         let len = GetModuleFileNameW(GetModuleHandleW(std::ptr::null()), buf.as_mut_ptr(), 260);
@@ -162,22 +172,30 @@ fn get_shim_path() -> Option<String> {
             );
             return None;
         }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
         if len >= 260 {
-            write_error_wide(&to_wide(&format!(
-                "Shim: The filename of the program is too long to handle: '{}'.\n",
-                String::from_utf16_lossy(&buf[..len as usize])
-            )));
+            write_error_wide(&to_wide(
+                "Shim: The filename of the program is too long to handle: '",
+            ));
+            write_error_wide(&to_wide(&full));
+            write_error_bytes(b"'.\n");
             return None;
         }
-        let mut path = String::from_utf16_lossy(&buf[..len as usize]);
-        match path.rfind('.') {
+        let dir = match full.rfind(['\\', '/']) {
+            Some(pos) => full[..pos].to_string(),
+            None => full.clone(),
+        };
+        // Only replace the extension of the file name, not a dot in a parent directory.
+        let mut shim = full;
+        let name_start = shim.rfind(['\\', '/']).map_or(0, |p| p + 1);
+        match shim[name_start..].rfind('.') {
             Some(dot) => {
-                path.truncate(dot);
-                path.push_str(".shim");
+                shim.truncate(name_start + dot);
+                shim.push_str(".shim");
             }
-            None => path.push_str(".shim"),
+            None => shim.push_str(".shim"),
         }
-        Some(path)
+        Some((dir, shim))
     }
 }
 
@@ -220,7 +238,18 @@ fn expand_env_vars(input: &str) -> String {
     }
     let wide = to_wide_null(input);
     unsafe {
-        // First call gets the required size, second expands.
+        // Fast path: most values fit the stack buffer, so skip the sizing call + heap.
+        let mut stack = [0u16; 512];
+        let actual =
+            ExpandEnvironmentStringsW(wide.as_ptr(), stack.as_mut_ptr(), stack.len() as u32);
+        if actual > 0 && actual as usize <= stack.len() {
+            return String::from_utf16_lossy(&stack[..actual as usize - 1]);
+        }
+        if actual != 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER {
+            return input.to_string();
+        }
+
+        // Rare slow path: second call gets the required size, third expands.
         let required = ExpandEnvironmentStringsW(wide.as_ptr(), std::ptr::null_mut(), 0);
         if required == 0 {
             return input.to_string();
@@ -236,13 +265,33 @@ fn expand_env_vars(input: &str) -> String {
     }
 }
 
+fn dir_placeholder_count(s: &str) -> usize {
+    let mut n = 0;
+    let mut pos = 0;
+    while let Some(p) = s[pos..].find(DIR_PLACEHOLDER) {
+        n += 1;
+        pos += p + DIR_PLACEHOLDER.len();
+    }
+    n
+}
+
+// Replaces every %~dp0 occurrence (not just the first) with cur_dir plus a trailing
+// backslash, reserving up front so the string never reallocates.
 fn normalize_args_str(args: &mut String, cur_dir: &str) {
-    if let Some(pos) = args.find(DIR_PLACEHOLDER) {
-        let mut replacement = cur_dir.to_string();
-        if !replacement.ends_with('\\') && !replacement.ends_with('/') {
-            replacement.push('\\');
-        }
-        args.replace_range(pos..pos + DIR_PLACEHOLDER.len(), &replacement);
+    let n = dir_placeholder_count(args);
+    if n == 0 {
+        return;
+    }
+    let mut replacement = cur_dir.to_string();
+    if !replacement.ends_with('\\') && !replacement.ends_with('/') {
+        replacement.push('\\');
+    }
+    args.reserve(n * replacement.len().saturating_sub(DIR_PLACEHOLDER.len()));
+    let mut pos = 0;
+    while let Some(p) = args[pos..].find(DIR_PLACEHOLDER) {
+        let start = pos + p;
+        args.replace_range(start..start + DIR_PLACEHOLDER.len(), &replacement);
+        pos = start + replacement.len();
     }
 }
 
@@ -255,7 +304,8 @@ fn expand_and_strip_quotes(value: &str) -> String {
     result
 }
 
-fn parse_shim_line(line: &str) -> Option<(String, String)> {
+// Borrows key/value from the line; callers allocate only when storing.
+fn parse_shim_line(line: &str) -> Option<(&str, &str)> {
     let line = line.trim_end();
 
     let trimmed = line.trim_start();
@@ -273,7 +323,7 @@ fn parse_shim_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     let value = line[sep_pos + 3..].trim_start();
-    Some((key.to_string(), value.to_string()))
+    Some((key, value))
 }
 
 fn parse_args_from_cmdline(cmdline: &str) -> Vec<String> {
@@ -400,22 +450,40 @@ fn quote_arg(arg: &str) -> String {
     result
 }
 
-// GUI/redirected launches can yield null or INVALID std handles.
+// GUI/redirected launches can yield null or INVALID std handles. A GUI shim may
+// have detached from (or never had) a console; reattach so CONIN$/CONOUT$ open.
 unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
+    if is_gui_subsystem() {
+        AttachConsole(ATTACH_PARENT_PROCESS); // ignore failure - parent may have no console
+    }
+
+    // bInheritHandle=1 lets the child inherit (CreateProcessW bInheritHandles=1).
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+
     let conin = to_wide_null("CONIN$");
     let conout = to_wide_null("CONOUT$");
+    let mut replaced = false;
 
     if si.hStdInput == NULL_HANDLE || si.hStdInput == INVALID_HANDLE {
         let h: HANDLE = CreateFileW(
             conin.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ,
-            std::ptr::null(),
+            &sa,
             OPEN_EXISTING,
             0,
             NULL_HANDLE,
         );
-        si.hStdInput = if h == INVALID_HANDLE { NULL_HANDLE } else { h };
+        if h == INVALID_HANDLE {
+            si.hStdInput = NULL_HANDLE;
+        } else {
+            si.hStdInput = h;
+            replaced = true;
+        }
     }
 
     if si.hStdOutput == NULL_HANDLE || si.hStdOutput == INVALID_HANDLE {
@@ -423,12 +491,17 @@ unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
             conout.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_WRITE,
-            std::ptr::null(),
+            &sa,
             OPEN_EXISTING,
             0,
             NULL_HANDLE,
         );
-        si.hStdOutput = if h == INVALID_HANDLE { NULL_HANDLE } else { h };
+        if h == INVALID_HANDLE {
+            si.hStdOutput = NULL_HANDLE;
+        } else {
+            si.hStdOutput = h;
+            replaced = true;
+        }
     }
 
     if si.hStdError == NULL_HANDLE || si.hStdError == INVALID_HANDLE {
@@ -436,16 +509,26 @@ unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
             conout.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_WRITE,
-            std::ptr::null(),
+            &sa,
             OPEN_EXISTING,
             0,
             NULL_HANDLE,
         );
-        si.hStdError = if h == INVALID_HANDLE { NULL_HANDLE } else { h };
+        if h == INVALID_HANDLE {
+            si.hStdError = NULL_HANDLE;
+        } else {
+            si.hStdError = h;
+            replaced = true;
+        }
     }
+
+    if replaced {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+    }
+    // Handles live for the process lifetime - do not close.
 }
 
-fn parse_shim_info(cur_dir: &str) -> ShimInfo {
+fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
     let mut info = ShimInfo {
         path: None,
         args: Vec::new(),
@@ -454,20 +537,14 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
         elevate: false,
     };
 
-    let shim_path = match get_shim_path() {
-        Some(p) => p,
-        None => return info,
-    };
-
-    let file = match File::open(&shim_path) {
+    let file = match File::open(shim_path) {
         Ok(f) => f,
         Err(e) => {
             let err = e.raw_os_error().unwrap_or(0) as u32;
             unsafe {
-                write_error_wide(&to_wide(&format!(
-                    "Shim: Cannot open shim file for read: '{}'",
-                    shim_path
-                )));
+                write_error_wide(&to_wide("Shim: Cannot open shim file for read: '"));
+                write_error_wide(&to_wide(shim_path));
+                write_error_wide(&to_wide("'"));
                 write_error_sys(err);
             }
             return info;
@@ -476,21 +553,25 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
 
     let reader = BufReader::new(file);
 
-    let all_lines: Vec<String> = reader
-        .lines()
-        .filter_map(|l| l.ok())
-        .map(|l| l.trim_start_matches('\u{feff}').to_string())
-        .collect();
+    let mut all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    if let Some(first) = all_lines.first_mut() {
+        if first.starts_with('\u{feff}') {
+            first.remove(0);
+        }
+    }
 
     // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
-    // path to absolute so pass 2 can expand %~dp0 against the right base.
+    // path to absolute so pass 2 can expand %~dp0 against the right base. A path
+    // value may itself use %~dp0, which there refers to the shim's own directory.
     let mut target_dir = cur_dir.to_string();
     for line in &all_lines {
         if let Some((key, value)) = parse_shim_line(line) {
             if key != "path" {
                 continue;
             }
-            let expanded = expand_and_strip_quotes(&value);
+            let mut path_val = value.to_string();
+            normalize_args_str(&mut path_val, cur_dir);
+            let expanded = expand_and_strip_quotes(&path_val);
             target_dir = resolve_against_base(&expanded, cur_dir);
             break;
         }
@@ -501,9 +582,14 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
             continue;
         };
 
-        match key.as_str() {
+        match key {
             "path" => {
-                info.path = Some(expand_and_strip_quotes(&value));
+                if info.path.is_none() {
+                    // First path line wins; expand %~dp0 against the shim's own dir.
+                    let mut path_val = value.to_string();
+                    normalize_args_str(&mut path_val, cur_dir);
+                    info.path = Some(expand_and_strip_quotes(&path_val));
+                }
             }
             "args" => {
                 let mut args_str = value.to_string();
@@ -518,25 +604,42 @@ fn parse_shim_info(cur_dir: &str) -> ShimInfo {
                 info.cwd = Some(expand_and_strip_quotes(&cwd_str));
             }
             "elevate" | "runas" => {
-                info.elevate = parse_bool(&value);
+                info.elevate = parse_bool(value);
             }
             _ => {
+                let mut env_val = value.to_string();
+                normalize_args_str(&mut env_val, &target_dir);
                 info.env_vars
-                    .push((key.to_string(), expand_and_strip_quotes(&value)));
+                    .push((key.to_string(), expand_and_strip_quotes(&env_val)));
             }
         }
+    }
+
+    if info.path.as_deref() == Some("") {
+        info.path = None;
     }
 
     if info.path.is_none() {
         unsafe {
-            write_error_wide(&to_wide(&format!(
-                "Shim: 'path' not found in shim file '{}'.\n",
-                shim_path
-            )));
+            write_error_wide(&to_wide("Shim: 'path' not found in shim file '"));
+            write_error_wide(&to_wide(shim_path));
+            write_error_wide(&to_wide("'.\n"));
         }
     }
 
     info
+}
+
+// Quoted, space-joined argument string for ShellExecuteExW. Only elevation builds it.
+fn build_params(args: &[String]) -> Vec<u16> {
+    let mut p = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            p.push(' ');
+        }
+        p.push_str(&quote_arg(arg));
+    }
+    to_wide_null(&p)
 }
 
 unsafe fn launch_elevated(
@@ -596,9 +699,9 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
         if SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) == 0 {
             let err = GetLastError();
             unsafe {
-                write_error_wide(&to_wide(&format!(
-                    "Shim: Could not set environment variable '{key}'"
-                )));
+                write_error_wide(&to_wide("Shim: Could not set environment variable '"));
+                write_error_wide(&to_wide(key));
+                write_error_wide(&to_wide("'"));
                 write_error_sys(err);
             }
         }
@@ -613,17 +716,6 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
         c
     };
     let mut cmd = to_wide_null(&cmd_str);
-    // No exe prefix - ShellExecuteExW takes parameters separately from the file.
-    let params = {
-        let mut p = String::new();
-        for (i, arg) in info.args.iter().enumerate() {
-            if i > 0 {
-                p.push(' ');
-            }
-            p.push_str(&quote_arg(arg));
-        }
-        to_wide_null(&p)
-    };
     let path_w = to_wide_null(path);
 
     let mut si: STARTUPINFOW = std::mem::zeroed();
@@ -637,8 +729,11 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
         None => std::ptr::null(),
     };
 
+    // ShellExecuteExW takes parameters separately from the file; only the elevation
+    // paths need them, so the normal CreateProcessW path never builds the string.
     if info.elevate {
-        return launch_elevated(path_w.as_slice(), params.as_slice(), cwd_ptr, job_handle);
+        let params = build_params(&info.args);
+        return launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle);
     }
 
     // SUSPENDED: the child must join the job object before it can spawn its own children.
@@ -667,13 +762,16 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
     // Target manifest requires elevation: retry through ShellExecuteExW.
     let err = GetLastError();
     if err == ERROR_ELEVATION_REQUIRED {
-        return launch_elevated(path_w.as_slice(), params.as_slice(), cwd_ptr, job_handle);
+        let params = build_params(&info.args);
+        return launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle);
     }
 
-    write_error_ctx(
-        &format!("Could not create process with command '{cmd_str}'"),
-        err,
-    );
+    unsafe {
+        write_error_wide(&to_wide("Shim: Could not create process with command '"));
+        write_error_wide(&to_wide(&cmd_str));
+        write_error_wide(&to_wide("'"));
+        write_error_sys(err);
+    }
     (NULL_HANDLE, NULL_HANDLE)
 }
 
@@ -686,8 +784,11 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
 }
 
 fn main() {
-    let cur_dir = get_shim_dir();
-    let mut info = parse_shim_info(&cur_dir);
+    let (cur_dir, shim_path) = match get_shim_paths() {
+        Some(p) => p,
+        None => std::process::exit(1),
+    };
+    let mut info = parse_shim_info(&cur_dir, &shim_path);
 
     if info.path.is_none() {
         std::process::exit(1);
@@ -728,7 +829,7 @@ fn main() {
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
             SetInformationJobObject(
                 job_handle,
-                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                JobObjectExtendedLimitInformation,
                 &jeli as *const _ as *const _,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
