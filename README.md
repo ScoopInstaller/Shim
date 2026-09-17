@@ -47,7 +47,7 @@ Any line whose key is not `path`, `args`, `cwd`, `workdir`, `elevate`, or `runas
 
 ### Exit Codes
 
-The shim waits for the child process to finish and forwards its exit code. If the shim fails internally, it exits with code 1.
+The shim waits for the child process to finish and forwards its exit code, including large values (e.g. crash codes like `0xC0000005`) unmangled. If the shim fails internally, it exits with code 1.
 
 ## Usage
 
@@ -72,7 +72,7 @@ All implementations share the same `.shim` format.
 
 | Implementation | Build Tool |      x86 |      x64 |    arm64 |
 | -------------- | ---------- | -------: | -------: | -------: |
-| C#             | dotnet     |  16.0 KB |  15.0 KB |  15.0 KB |
+| C#             | dotnet     |  16.0 KB |  15.5 KB |  15.5 KB |
 | C++            | Zig        | 117.5 KB | 141.5 KB | 133.0 KB |
 | C++            | MSBuild    | 117.0 KB | 142.5 KB | 124.0 KB |
 | Rust           | Cargo      | 113.5 KB | 131.0 KB | 126.5 KB |

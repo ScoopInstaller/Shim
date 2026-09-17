@@ -6,7 +6,6 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -128,17 +127,25 @@ namespace Scoop
 
         // --- P/Invoke: Handles ---
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct SECURITY_ATTRIBUTES
+        {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            public int bInheritHandle;
+        }
+
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         static extern IntPtr CreateFileW(
             string lpFileName, uint dwDesiredAccess, uint dwShareMode,
-            IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+            ref SECURITY_ATTRIBUTES lpSecurityAttributes, uint dwCreationDisposition,
             uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         static extern IntPtr GetModuleHandleW(string? lpModuleName);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        static extern void GetStartupInfoW(out STARTUPINFO lpStartupInfo);
+        static extern void GetStartupInfoW(ref STARTUPINFO lpStartupInfo);
 
         [DllImport("shell32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         static extern IntPtr CommandLineToArgvW(string lpCmdLine, out int pNumArgs);
@@ -167,6 +174,7 @@ namespace Scoop
         const uint FILE_SHARE_READ = 0x00000001;
         const uint FILE_SHARE_WRITE = 0x00000002;
         const uint OPEN_EXISTING = 3;
+        const uint STARTF_USESTDHANDLES = 0x00000100;
 
         const ushort IMAGE_DOS_SIGNATURE = 0x5A4D;
         const uint IMAGE_NT_SIGNATURE = 0x00004550;
@@ -273,17 +281,53 @@ namespace Scoop
             return expanded;
         }
 
+        static string ResolveAgainstBase(string path, string baseDir)
+        {
+            // Rooted only when the drive is absolute ("C:\...") or a leading
+            // separator. Path.IsPathRooted would wrongly accept drive-relative
+            // forms like "C:app".
+            bool rooted = (path.Length >= 2 && path[1] == ':')
+                || (path.Length > 0 && (path[0] == '\\' || path[0] == '/'));
+
+            string toResolve = rooted ? path : baseDir + "\\" + path;
+
+            int cap = 260;
+            for (; ; )
+            {
+                var sb = new StringBuilder(cap);
+                uint len = GetFullPathNameW(toResolve, (uint)sb.Capacity, sb, IntPtr.Zero);
+                if (len == 0)
+                    return toResolve + "\\"; // target-based fallback on failure
+                if (len >= sb.Capacity)
+                {
+                    cap = (int)len + 1; // required size returned on overflow
+                    continue;
+                }
+
+                var fullPath = sb.ToString(0, (int)len);
+                int dirLen = fullPath.LastIndexOf('\\');
+                if (dirLen < 0) dirLen = fullPath.LastIndexOf('/');
+                if (dirLen < 0) return fullPath + "\\";
+                if (dirLen + 1 == fullPath.Length) return fullPath;
+                return fullPath.Substring(0, dirLen + 1);
+            }
+        }
+
         static string NormalizeArgs(string args, string curDir)
         {
             if (string.IsNullOrEmpty(args)) return args;
-            int pos = args.IndexOf("%~dp0", StringComparison.Ordinal);
-            if (pos < 0) return args;
 
             string replacement = curDir;
             if (replacement.Length > 0 && replacement[replacement.Length - 1] != '\\' && replacement[replacement.Length - 1] != '/')
                 replacement += "\\";
 
-            return args.Remove(pos, 5).Insert(pos, replacement);
+            int pos = 0;
+            while ((pos = args.IndexOf("%~dp0", pos, StringComparison.Ordinal)) >= 0)
+            {
+                args = args.Remove(pos, 5).Insert(pos, replacement);
+                pos += replacement.Length;
+            }
+            return args;
         }
 
         static string QuoteArg(string arg)
@@ -356,6 +400,18 @@ namespace Scoop
             return cmd.ToString();
         }
 
+        // No exe prefix - elevated launch takes parameters separately from the file.
+        static string BuildParams(List<string> args)
+        {
+            var sb = new StringBuilder();
+            for (int i = 0; i < args.Count; i++)
+            {
+                if (i > 0) sb.Append(' ');
+                sb.Append(QuoteArg(args[i]));
+            }
+            return sb.ToString();
+        }
+
         static List<string> ParseArgsFromCmdLine(string cmdLine)
         {
             var result = new List<string>();
@@ -401,21 +457,34 @@ namespace Scoop
 
         static void EnsureStandardHandles(ref STARTUPINFO si)
         {
+            // GUI launches have no console; attach to the parent console so the
+            // CON*$ opens below succeed. Failure is fine (no parent console).
+            if (IsGuiSubsystem())
+                AttachConsole(ATTACH_PARENT_PROCESS);
+
+            var sa = new SECURITY_ATTRIBUTES();
+            sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+            sa.lpSecurityDescriptor = IntPtr.Zero;
+            sa.bInheritHandle = 1;
+
             if (si.hStdInput == IntPtr.Zero || si.hStdInput == INVALID_HANDLE_VALUE)
             {
-                si.hStdInput = CreateFileW("CONIN$", GENERIC_READ, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                si.hStdInput = CreateFileW("CONIN$", GENERIC_READ, FILE_SHARE_READ, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
                 if (si.hStdInput == INVALID_HANDLE_VALUE) si.hStdInput = IntPtr.Zero;
             }
             if (si.hStdOutput == IntPtr.Zero || si.hStdOutput == INVALID_HANDLE_VALUE)
             {
-                si.hStdOutput = CreateFileW("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                si.hStdOutput = CreateFileW("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
                 if (si.hStdOutput == INVALID_HANDLE_VALUE) si.hStdOutput = IntPtr.Zero;
             }
             if (si.hStdError == IntPtr.Zero || si.hStdError == INVALID_HANDLE_VALUE)
             {
-                si.hStdError = CreateFileW("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                si.hStdError = CreateFileW("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
                 if (si.hStdError == INVALID_HANDLE_VALUE) si.hStdError = IntPtr.Zero;
             }
+
+            si.dwFlags |= (int)STARTF_USESTDHANDLES;
+            // Handles live for the process lifetime - do not close.
         }
 
         // --- Config parsing ---
@@ -451,20 +520,9 @@ namespace Scoop
                 if (!TryParseLine(rawLine, out var key, out var value) || key != "path")
                     continue;
 
-                var expanded = ExpandAndUnquote(value!);
-
-                var combined = System.IO.Path.IsPathRooted(expanded)
-                    ? expanded
-                    : dir + "\\" + expanded;
-                var sb = new StringBuilder(260);
-                uint len = GetFullPathNameW(combined, (uint)sb.Capacity, sb, IntPtr.Zero);
-                if (len == 0 || len >= sb.Capacity) { targetDir = dir; break; }
-
-                var fullPath = sb.ToString(0, (int)len);
-                var dirLen = fullPath.LastIndexOf('\\');
-                if (dirLen < 0) dirLen = fullPath.LastIndexOf('/');
-                if (dirLen < 0) dirLen = (int)len;
-                targetDir = fullPath.Substring(0, dirLen + 1);
+                // %~dp0 in the path field refers to the shim's own dir.
+                var expanded = ExpandAndUnquote(NormalizeArgs(value!, dir));
+                targetDir = ResolveAgainstBase(expanded, dir);
                 break;
             }
 
@@ -476,7 +534,13 @@ namespace Scoop
 
                 if (key == "path")
                 {
-                    info.Path = ExpandAndUnquote(value!);
+                    // First path wins; %~dp0 here means the shim's own dir.
+                    if (info.Path == null)
+                    {
+                        var pv = ExpandAndUnquote(NormalizeArgs(value!, dir));
+                        if (!string.IsNullOrEmpty(pv))
+                            info.Path = pv;
+                    }
                 }
                 else if (key == "args")
                 {
@@ -494,7 +558,7 @@ namespace Scoop
                 }
                 else
                 {
-                    info.EnvVars[key!] = ExpandAndUnquote(value!);
+                    info.EnvVars[key!] = ExpandAndUnquote(NormalizeArgs(value!, targetDir));
                 }
             }
 
@@ -518,17 +582,16 @@ namespace Scoop
             string path = info.Path!;
 
             string cmd = BuildCommandLine(path, info.Args);
-            string params_ = string.Join(" ", info.Args.Select(QuoteArg));
 
             var si = new STARTUPINFO();
             si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-            GetStartupInfoW(out si);
+            GetStartupInfoW(ref si);
 
             EnsureStandardHandles(ref si);
 
             if (info.Elevate)
             {
-                return LaunchElevated(path, params_, info.Cwd, jobHandle);
+                return LaunchElevated(path, BuildParams(info.Args), info.Cwd, jobHandle);
             }
 
             PROCESS_INFORMATION pi;
@@ -549,7 +612,7 @@ namespace Scoop
             int error = Marshal.GetLastWin32Error();
             if (error == ERROR_ELEVATION_REQUIRED)
             {
-                return LaunchElevated(path, params_, info.Cwd, jobHandle);
+                return LaunchElevated(path, BuildParams(info.Args), info.Cwd, jobHandle);
             }
 
             ReportShimError($"Could not create process with command '{cmd}'", (uint)error);
@@ -574,7 +637,9 @@ namespace Scoop
                 var process = Process.Start(psi);
                 if (process is null)
                 {
-                    ReportShimError("Unable to create elevated process", (uint)Marshal.GetLastWin32Error());
+                    // Process.Start returned null without a reliable last-error;
+                    // report a fixed code like cpp (ERROR_INVALID_FUNCTION = 1).
+                    ReportShimError("Unable to create elevated process", 1);
                     return 1;
                 }
 
@@ -597,7 +662,9 @@ namespace Scoop
         {
             WaitForSingleObject(hProcess, INFINITE);
 
-            GetExitCodeProcess(hProcess, out uint exitCode);
+            // Init to 1 so a failed query yields 1, not 0 (mirrors cpp).
+            uint exitCode = 1;
+            GetExitCodeProcess(hProcess, out exitCode);
             CloseHandle(hProcess);
 
             return (int)exitCode;
@@ -614,8 +681,9 @@ namespace Scoop
                 return 1;
             }
 
-            string[] runtimeArgs = Environment.GetCommandLineArgs();
-            for (int i = 1; i < runtimeArgs.Length; i++)
+            // CommandLineToArgvW splits the raw command line; argv[0] is the shim itself.
+            var runtimeArgs = ParseArgsFromCmdLine(Environment.CommandLine);
+            for (int i = 1; i < runtimeArgs.Count; i++)
             {
                 info.Args.Add(runtimeArgs[i]);
             }
@@ -648,9 +716,7 @@ namespace Scoop
 
             int exitCode = LaunchProcess(info, jobHandle);
 
-            if (exitCode < 0)
-                return 1;
-
+            // Return the raw exit code (>= 0x80000000 must survive the int round-trip).
             return exitCode;
         }
     }
