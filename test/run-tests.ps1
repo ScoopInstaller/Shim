@@ -215,6 +215,26 @@ Invoke-ShimTest "Env var value with quotes stripped" -Setup {
     @{ Pass = $r.Output -match "MY_VAR=hello world"; Message = "Output: $($r.Output)" }
 }
 
+Invoke-ShimTest "Env var value %~dp0 expansion" -Setup {
+    param($d)
+    Write-Batch "$d\checkenv2.cmd" "echo MY_DIR=%MY_DIR%"
+    Write-Shim $d "test" "path = $d\checkenv2.cmd`nMY_DIR = %~dp0sub"
+} -Assert {
+    param($r)
+    $expected = "$($r.TestDir)\sub"
+    @{ Pass = $r.Output -match [regex]::Escape("MY_DIR=$expected"); Message = "Expected: MY_DIR=$expected, Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "Env var value %~dp0 expansion (multiple occurrences)" -Setup {
+    param($d)
+    Write-Batch "$d\checkenv3.cmd" "echo MY_D=%MY_D%"
+    Write-Shim $d "test" "path = $d\checkenv3.cmd`nMY_D = %~dp0-%~dp0"
+} -Assert {
+    param($r)
+    $expected = "$($r.TestDir)\-$($r.TestDir)\"
+    @{ Pass = $r.Output -match [regex]::Escape("MY_D=$expected"); Message = "Expected: MY_D=$expected, Output: $($r.Output)" }
+}
+
 # --- %~dp0 placeholder --------------------------------------------------------
 
 Invoke-ShimTest "Args %~dp0 expansion (absolute path)" -Setup {
@@ -236,6 +256,23 @@ Invoke-ShimTest "Args %~dp0 expansion (relative path)" -Setup {
     # path resolves to $d\bin\app.cmd → target dir = $d\bin\
     $expected = "$($r.TestDir)\bin\"
     @{ Pass = $r.Output.StartsWith($expected, [StringComparison]::OrdinalIgnoreCase); Message = "Expected prefix: $expected, Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "Args %~dp0 expansion (multiple occurrences)" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = C:\Windows\System32\cmd.exe`nargs = /c echo %~dp0 %~dp0"
+} -Assert {
+    param($r)
+    $count = [regex]::Matches($r.Output, [regex]::Escape("C:\Windows\System32\")).Count
+    @{ Pass = $count -ge 2; Message = "Expected 2 expansions, got $count. Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "path = %~dp0 resolves against shim directory" -Setup {
+    param($d)
+    Write-Batch "$d\app.cmd" "echo PATHDP0_OK"
+    Write-Shim $d "test" "path = %~dp0app.cmd"
+} -Assert {
+    param($r) $r.Output -match "PATHDP0_OK"
 }
 
 # --- Pass-through arguments & quoting -------------------------------------------
@@ -352,6 +389,16 @@ Invoke-ShimTest "Exit code above 255" -Setup {
     @{ Pass = $r.ExitCode -eq 300; Message = "Expected: 300, Got: $($r.ExitCode)" }
 }
 
+Invoke-ShimTest "Exit code 0xFFFE0005 forwarded unmangled" -Setup {
+    param($d)
+    # -131071 == 0xFFFE0005 as DWORD: a negative (crash-style) exit code must pass
+    # through unmangled, not collapse to 1.
+    Write-Shim $d "test" "path = $psExe`nargs = -NoProfile -Command exit -131071"
+} -Assert {
+    param($r)
+    @{ Pass = $r.ExitCode -eq -131071; Message = "Expected: -131071 (0xFFFE0005), Got: $($r.ExitCode)" }
+}
+
 # --- Error messages ---------------------------------------------------------------
 
 Invoke-ShimTest "Missing shim file reports path and win32 error" -Setup {
@@ -366,6 +413,26 @@ Invoke-ShimTest "Missing shim file reports path and win32 error" -Setup {
 Invoke-ShimTest "Missing path key reports shim file" -Setup {
     param($d)
     Write-Shim $d "test" "elevate = false"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "'path' not found in shim file") -and ($r.ExitCode -eq 1)
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
+Invoke-ShimTest "First path line wins" -Setup {
+    param($d)
+    Write-Batch "$d\first.cmd" "echo FIRST_PATH"
+    Write-Batch "$d\second.cmd" "echo SECOND_PATH"
+    Write-Shim $d "test" "path = $d\first.cmd`npath = $d\second.cmd"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "FIRST_PATH") -and ($r.Output -notmatch "SECOND_PATH")
+    @{ Pass = $pass; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "Empty path value treated as missing" -Setup {
+    param($d)
+    Write-Shim $d "test" "path ="
 } -Assert {
     param($r)
     $pass = ($r.Output -match "'path' not found in shim file") -and ($r.ExitCode -eq 1)
