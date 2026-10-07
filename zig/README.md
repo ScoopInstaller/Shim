@@ -8,7 +8,7 @@ Pure Zig implementation of the Scoop shim, statically linked, zero runtime depen
 
 ## Prerequisites
 
-- **Zig 0.16.0+** — required for building
+- **Zig 0.17.0+** — required for building
 
 ## Build
 

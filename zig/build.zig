@@ -14,7 +14,7 @@ const CrossTarget = std.Target.Query;
 //   ReleaseFast
 //   ReleaseSmall
 
-const required_version = std.SemanticVersion.parse("0.16.0") catch unreachable;
+const required_version = std.SemanticVersion.parse("0.17.0") catch unreachable;
 const compatible = builtin.zig_version.order(required_version) != .lt;
 
 pub fn build(b: *std.Build) void {

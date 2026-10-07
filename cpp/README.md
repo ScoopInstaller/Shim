@@ -10,7 +10,7 @@ Native C++ shim, statically linked, zero runtime dependencies. Supports x86, x64
 
 | Tool | Local dev | CI (GHA) |
 |------|-----------|----------|
-| **Zig 0.16.0** | ✅ Required | — |
+| **Zig 0.17.0** | ✅ Required | — |
 | **MSBuild + VC++** | — | ✅ Pre-installed on `windows-latest` |
 
 `build.ps1` auto-detects (`-Tool Auto`): with VS → MSBuild; without → Zig.

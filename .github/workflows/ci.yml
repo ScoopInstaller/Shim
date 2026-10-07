@@ -118,7 +118,7 @@ jobs:
       if: matrix.setup == 'zig'
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0
+        version: 0.17.0
     - name: Setup Rust
       if: matrix.setup == 'rust'
       uses: dtolnay/rust-toolchain@stable
@@ -151,7 +151,7 @@ jobs:
       if: matrix.setup == 'zig'
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0
+        version: 0.17.0
     - name: Setup Rust
       if: matrix.setup == 'rust'
       uses: dtolnay/rust-toolchain@stable
