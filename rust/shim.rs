@@ -18,7 +18,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{
     AttachConsole, FreeConsole, GetStdHandle, SetConsoleCtrlHandler, WriteConsoleW,
-    STD_ERROR_HANDLE,
+    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -464,6 +464,21 @@ unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
     let conin = to_wide_null("CONIN$");
     let conout = to_wide_null("CONOUT$");
     let mut replaced = false;
+
+    // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
+    let seeds: [(&mut HANDLE, u32); 3] = [
+        (&mut si.hStdInput, STD_INPUT_HANDLE),
+        (&mut si.hStdOutput, STD_OUTPUT_HANDLE),
+        (&mut si.hStdError, STD_ERROR_HANDLE),
+    ];
+    for (slot, which) in seeds {
+        if *slot == NULL_HANDLE || *slot == INVALID_HANDLE {
+            let real: HANDLE = GetStdHandle(which);
+            if real != NULL_HANDLE && real != INVALID_HANDLE {
+                *slot = real;
+            }
+        }
+    }
 
     let slots: [(
         &mut HANDLE,

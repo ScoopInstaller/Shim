@@ -157,6 +157,21 @@ inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
     // SECURITY_ATTRIBUTES.bInheritHandle=TRUE lets the child inherit (CreateProcessW bInheritHandles=TRUE).
     SECURITY_ATTRIBUTES sa {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
 
+    // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
+    auto seed = [](HANDLE& h, DWORD which) noexcept {
+        if (h == nullptr || h == INVALID_HANDLE_VALUE)
+        {
+            HANDLE real = GetStdHandle(which);
+            if (real != nullptr && real != INVALID_HANDLE_VALUE)
+            {
+                h = real;
+            }
+        }
+    };
+    seed(si.hStdInput, STD_INPUT_HANDLE);
+    seed(si.hStdOutput, STD_OUTPUT_HANDLE);
+    seed(si.hStdError, STD_ERROR_HANDLE);
+
     bool replaced = false;
     auto ensure = [&](HANDLE& h, const wchar_t* name, DWORD access, DWORD share) noexcept {
         if (h == nullptr || h == INVALID_HANDLE_VALUE)

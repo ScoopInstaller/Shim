@@ -24,6 +24,8 @@ const INVALID_FILE_SIZE: windows.DWORD = std.math.maxInt(windows.DWORD);
 
 const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
 
+const STD_INPUT_HANDLE = @as(DWORD, @bitCast(@as(i32, -10)));
+const STD_OUTPUT_HANDLE = @as(DWORD, @bitCast(@as(i32, -11)));
 const STD_ERROR_HANDLE = @as(DWORD, @bitCast(@as(i32, -12)));
 
 const CREATE_SUSPENDED = 0x00000004;
@@ -267,18 +269,41 @@ fn writeErrorUtf8(s: []const WCHAR) void {
 
 // GUI/redirected launches can yield null or INVALID_HANDLE_VALUE std handles.
 fn ensureStandardHandles(si: *windows.STARTUPINFOW) void {
+    // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
+    if (si.hStdInput == null or si.hStdInput == INVALID_HANDLE_VALUE) {
+        if (GetStdHandle(STD_INPUT_HANDLE)) |h| {
+            if (h != INVALID_HANDLE_VALUE) si.hStdInput = h;
+        }
+    }
+    if (si.hStdOutput == null or si.hStdOutput == INVALID_HANDLE_VALUE) {
+        if (GetStdHandle(STD_OUTPUT_HANDLE)) |h| {
+            if (h != INVALID_HANDLE_VALUE) si.hStdOutput = h;
+        }
+    }
+    if (si.hStdError == null or si.hStdError == INVALID_HANDLE_VALUE) {
+        if (GetStdHandle(STD_ERROR_HANDLE)) |h| {
+            if (h != INVALID_HANDLE_VALUE) si.hStdError = h;
+        }
+    }
+
+    var replaced = false;
     if (si.hStdInput == null or si.hStdInput == INVALID_HANDLE_VALUE) {
         const h = CreateFileW(w("CONIN$"), .{ .GENERIC = .{ .READ = true } }, .{ .READ = true }, null, .OPEN_EXISTING, 0, null);
         si.hStdInput = if (h != INVALID_HANDLE_VALUE) h else null;
+        if (h != INVALID_HANDLE_VALUE) replaced = true;
     }
     if (si.hStdOutput == null or si.hStdOutput == INVALID_HANDLE_VALUE) {
         const h = CreateFileW(w("CONOUT$"), .{ .GENERIC = .{ .WRITE = true } }, .{ .WRITE = true }, null, .OPEN_EXISTING, 0, null);
         si.hStdOutput = if (h != INVALID_HANDLE_VALUE) h else null;
+        if (h != INVALID_HANDLE_VALUE) replaced = true;
     }
     if (si.hStdError == null or si.hStdError == INVALID_HANDLE_VALUE) {
         const h = CreateFileW(w("CONOUT$"), .{ .GENERIC = .{ .WRITE = true } }, .{ .WRITE = true }, null, .OPEN_EXISTING, 0, null);
         si.hStdError = if (h != INVALID_HANDLE_VALUE) h else null;
+        if (h != INVALID_HANDLE_VALUE) replaced = true;
     }
+
+    if (replaced) si.dwFlags |= windows.STARTF_USESTDHANDLES;
 }
 
 fn getDirectory(exe: []const WCHAR) []const WCHAR {

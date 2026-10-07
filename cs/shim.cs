@@ -252,6 +252,8 @@ namespace Scoop
 
         // --- Helpers ---
 
+        const uint STD_INPUT_HANDLE = 0xFFFFFFF6 - 0; // (DWORD)-10
+        const uint STD_OUTPUT_HANDLE = 0xFFFFFFF5 - 0; // (DWORD)-11
         const uint STD_ERROR_HANDLE = 0xFFFFFFF4 - 0; // (DWORD)-12
         const uint FILE_TYPE_CHAR = 2;
 
@@ -383,7 +385,7 @@ namespace Scoop
             }
         }
 
-        static bool IsKey(string key, string expected)
+        static bool IsKey(string? key, string expected)
         {
             return string.Equals(key, expected, StringComparison.OrdinalIgnoreCase);
         }
@@ -530,28 +532,37 @@ namespace Scoop
         static void EnsureStandardHandles(ref STARTUPINFO si)
         {
             // Console policy lives in Main; a detached GUI shim has no console, so the opens below fail.
+            // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
+            IntPtr seedIn = GetStdHandle(STD_INPUT_HANDLE);
+            if (seedIn != IntPtr.Zero && seedIn != INVALID_HANDLE_VALUE) si.hStdInput = seedIn;
+            IntPtr seedOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (seedOut != IntPtr.Zero && seedOut != INVALID_HANDLE_VALUE) si.hStdOutput = seedOut;
+            IntPtr seedErr = GetStdHandle(STD_ERROR_HANDLE);
+            if (seedErr != IntPtr.Zero && seedErr != INVALID_HANDLE_VALUE) si.hStdError = seedErr;
+
             var sa = new SECURITY_ATTRIBUTES();
             sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
             sa.lpSecurityDescriptor = IntPtr.Zero;
             sa.bInheritHandle = 1;
 
+            bool replaced = false;
             if (si.hStdInput == IntPtr.Zero || si.hStdInput == INVALID_HANDLE_VALUE)
             {
                 si.hStdInput = CreateFileW("CONIN$", GENERIC_READ, FILE_SHARE_READ, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
-                if (si.hStdInput == INVALID_HANDLE_VALUE) si.hStdInput = IntPtr.Zero;
+                if (si.hStdInput == INVALID_HANDLE_VALUE) si.hStdInput = IntPtr.Zero; else replaced = true;
             }
             if (si.hStdOutput == IntPtr.Zero || si.hStdOutput == INVALID_HANDLE_VALUE)
             {
                 si.hStdOutput = CreateFileW("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
-                if (si.hStdOutput == INVALID_HANDLE_VALUE) si.hStdOutput = IntPtr.Zero;
+                if (si.hStdOutput == INVALID_HANDLE_VALUE) si.hStdOutput = IntPtr.Zero; else replaced = true;
             }
             if (si.hStdError == IntPtr.Zero || si.hStdError == INVALID_HANDLE_VALUE)
             {
                 si.hStdError = CreateFileW("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
-                if (si.hStdError == INVALID_HANDLE_VALUE) si.hStdError = IntPtr.Zero;
+                if (si.hStdError == INVALID_HANDLE_VALUE) si.hStdError = IntPtr.Zero; else replaced = true;
             }
 
-            si.dwFlags |= (int)STARTF_USESTDHANDLES;
+            if (replaced) si.dwFlags |= (int)STARTF_USESTDHANDLES;
             // Handles live for the process lifetime - do not close.
         }
 
