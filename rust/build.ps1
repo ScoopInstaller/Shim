@@ -17,6 +17,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# The version file is the source of truth; Cargo.toml stores the package version separately.
+$ver = (Get-Content (Join-Path $PSScriptRoot 'version')).Trim()
+$toml = Get-Content (Join-Path $PSScriptRoot 'Cargo.toml') -Raw
+if ($toml -notmatch '(?m)^version\s*=\s*"' + [regex]::Escape($ver) + '"') {
+  throw "Cargo.toml version does not match version file ($ver). Update Cargo.toml."
+}
+
 $targetMap = @{
   'x86'   = 'i686-pc-windows-msvc'
   'x64'   = 'x86_64-pc-windows-msvc'
