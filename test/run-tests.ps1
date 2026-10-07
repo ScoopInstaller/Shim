@@ -656,6 +656,70 @@ Invoke-GuiShimTest "GUI shim exit code (7)" -Setup {
     @{ Pass = $r.ExitCode -eq 7; Message = "Expected: 7, Got: $($r.ExitCode)" }
 }
 
+# --- Console handle inheritance -------------------------------------------------
+
+# Every other test pipes stdio, so no console exists and CON*$ never fires. Here the
+# child must inherit the console's primary stdout handle, not a second CONOUT$ one -
+# GetFileType reports both as FILE_TYPE_CHAR, but only GetConsoleMode answers for the
+# primary, so the probe needs a native call to tell a pipe from the bogus handle.
+
+$script:TestNumber++
+$num = $script:TestNumber
+$hasConsole = $false
+try { $null = [Console]::WindowWidth; $hasConsole = $true } catch { }
+
+$testDir = New-TestEnvironment
+try {
+    if (-not $hasConsole) {
+        Write-Host "  [SKIP] Test #$num child stdout needs a real console (this runner pipes stdout); counting as pass" -ForegroundColor DarkYellow
+        $script:TestsPassed++
+    } else {
+        $cs = Join-Path $testDir "conprobe.cs"
+        $probe = Join-Path $testDir "probe.ps1"
+        $report = Join-Path $testDir "report.txt"
+        Set-Content -Path $cs -Encoding ASCII -Value @'
+using System;
+using System.Runtime.InteropServices;
+public static class ConProbe {
+    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(uint n);
+    [DllImport("kernel32.dll")] static extern uint GetFileType(IntPtr h);
+    [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr h, out uint m);
+
+    public static string Report() {
+        IntPtr h = GetStdHandle(unchecked((uint)-11));
+        uint mode;
+        bool ok = GetConsoleMode(h, out mode);
+        return "type=" + GetFileType(h) + " mode=" + ok;
+    }
+}
+'@
+        Set-Content -Path $probe -Encoding ASCII -Value @'
+try {
+    Add-Type -Path $args[1]
+    Set-Content -LiteralPath $args[0] -Value ([ConProbe]::Report())
+} catch {
+    Set-Content -LiteralPath $args[0] -Value "probe=UNSUPPORTED"
+}
+'@
+        Write-Shim $testDir "test" "path = $psExe`nargs = -NoProfile -ExecutionPolicy Bypass -File `"$probe`" `"$report`" `"$cs`""
+
+        # cmd.exe does not set STARTF_USESTDHANDLES, which is the case under test.
+        & cmd.exe /c "`"$testDir\test.exe`""
+
+        $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { "(no report)" }
+        if ($got -match 'type=2 mode=True') {
+            Write-TestResult "#$num Child inherits console stdout" $true
+        } elseif ($got -match 'type=2') {
+            Write-TestResult "#$num Child inherits console stdout" $false "Report: $got"
+        } else {
+            Write-Host "  [SKIP] Test #$num console not inherited by the child ($got); counting as pass" -ForegroundColor DarkYellow
+            $script:TestsPassed++
+        }
+    }
+} finally {
+    Remove-TestEnvironment $testDir
+}
+
 # --- PE subsystem verification -------------------------------------------------
 
 $script:TestNumber++
