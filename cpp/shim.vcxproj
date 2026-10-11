@@ -91,6 +91,13 @@
     <LinkIncremental>false</LinkIncremental>
   </PropertyGroup>
 
+  <!-- shim.rc already carries the manifest as resource type 24, written by
+       build.ps1. MSBuild generating its own would add a second type-24
+       resource and cvtres fails with CVT1100. -->
+  <PropertyGroup>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+
   <!-- Shared settings across all configurations -->
   <ItemDefinitionGroup>
     <ClCompile>

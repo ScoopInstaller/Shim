@@ -30,6 +30,8 @@ It is x86 on purpose: it runs on x86, x64 and arm64 Windows and can create an x6
 The suite is the only check that the four lanes agree, so its blind spots are worth naming:
 
 - **A failed `ResumeThread`.** Nothing can make the shim's resume fail on demand, so a lane that discards the return value still passes everything. All four lanes handle it, but by inspection rather than by test. A lane that does not will hang instead of exiting.
+- **Target paths beyond `MAX_PATH`.** All four shims resolve them and all four carry a `longPathAware` manifest, but launching an image that deep fails on some Windows installations regardless of the shim, so a test would assert the platform rather than the shim. Resolution alone is covered: the "path longer than MAX_PATH" test uses a deep nonexistent target and asserts the clean create error, which walks the `GetFullPathNameW` growth path in every lane.
+- **The shim's own path beyond `MAX_PATH`.** All four resolve it with a growing `GetModuleFileNameW` buffer, but the same launch limit applies, so this is verified by review rather than by test.
 - **A creator that passes a null stream in more than one position.** `probe create --null-out` covers stdout; a creator that nulls stderr as well is not exercised.
 - **The elevated launch path.** `elevate = true` is only exercised when the runner itself is elevated; otherwise the test prints a skip and counts as a pass. On any ordinary run `ShellExecuteExW` plumbing, the elevated exit-code forwarding and the UAC-cancel branch are entirely unexercised.
 

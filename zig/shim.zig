@@ -613,12 +613,26 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
         buf[combined_len] = 0;
         toResolve = buf[0..combined_len :0];
     }
-    var resolved_buf: [windows.MAX_PATH + 2:0]WCHAR = undefined;
+    var stack_buf: [windows.MAX_PATH + 2:0]WCHAR = undefined;
     var file_part: ?*WCHAR = null;
-    const len = GetFullPathNameW(@ptrCast(toResolve.ptr), resolved_buf.len, &resolved_buf, &file_part);
-    if (len == 0 or len >= resolved_buf.len) return try allocator.dupe(WCHAR, toResolve);
+    var len = GetFullPathNameW(@ptrCast(toResolve.ptr), stack_buf.len, &stack_buf, &file_part);
+    if (len == 0) return try fallbackDir(allocator, toResolve);
+
+    var big: []WCHAR = undefined;
+    const resolved_buf: []const WCHAR = if (len < stack_buf.len) stack_buf[0..len] else blk: {
+        // Overflow: len is the required size, including the null terminator.
+        const required = len + 1;
+        big = try allocator.alloc(WCHAR, required);
+        file_part = null;
+        // Plain pointer: big holds no sentinel at [required]; the null the API
+        // writes lands at [required - 1], so a [:0] slice here would be invalid.
+        len = GetFullPathNameW(@ptrCast(toResolve.ptr), required, @ptrCast(big.ptr), &file_part);
+        if (len == 0 or len >= required) return try fallbackDir(allocator, toResolve);
+        break :blk big[0..len];
+    };
+
     const dir_len = if (file_part) |fp|
-        (@intFromPtr(fp) - @intFromPtr(&resolved_buf)) / @sizeOf(WCHAR)
+        (@intFromPtr(fp) - @intFromPtr(resolved_buf.ptr)) / @sizeOf(WCHAR)
     else
         len;
     if (dir_len > 0 and (resolved_buf[dir_len - 1] == '\\' or resolved_buf[dir_len - 1] == '/')) {
@@ -630,22 +644,42 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
     return result;
 }
 
+/// Best-effort directory when resolution fails: the unresolved path plus a separator.
+fn fallbackDir(allocator: std.mem.Allocator, toResolve: []const WCHAR) ![]WCHAR {
+    const result = try allocator.alloc(WCHAR, toResolve.len + 1);
+    @memcpy(result[0..toResolve.len], toResolve);
+    result[toResolve.len] = '\\';
+    return result;
+}
+
 fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
     var info = ShimInfo.init(allocator);
 
-    var filename: [windows.MAX_PATH + 8:0]WCHAR = undefined;
-    const filename_size = GetModuleFileNameW(null, &filename, windows.MAX_PATH);
-    if (filename_size == 0 or filename_size >= windows.MAX_PATH) {
+    // Resolve the shim's own path with a growing buffer, capped at the path limit.
+    const max_module_path_chars = 32768;
+    var filename = try allocator.alloc(WCHAR, windows.MAX_PATH);
+    var filename_size: DWORD = undefined;
+    while (true) {
+        filename_size = GetModuleFileNameW(null, @ptrCast(filename.ptr), @intCast(filename.len));
         if (filename_size == 0) {
             writeError("Shim: The filename of the program could not be determined");
             writeErrorSys(GetLastError());
-        } else {
-            writeError("Shim: The filename of the program is too long to handle: '");
-            writeErrorUtf8(filename[0..filename_size]);
-            writeError("'.\n");
+            return error.PathTooLong;
         }
-        return error.PathTooLong;
+        if (filename_size < filename.len) break;
+
+        // Truncation returns the required size: grow and retry, capped at the path limit.
+        if (filename_size >= max_module_path_chars) {
+            writeError("Shim: The filename of the program is too long to handle: '");
+            writeErrorUtf8(filename[0..@min(filename_size, filename.len)]);
+            writeError("'.\n");
+            return error.PathTooLong;
+        }
+        filename = try allocator.realloc(filename, filename_size + 1);
     }
+
+    // Slack for the ".shim" suffix and its null terminator, written in place below.
+    filename = try allocator.realloc(filename, filename_size + 8);
 
     // Only a '.' in the final path component is an extension.
     const shim_name_len = blk: {

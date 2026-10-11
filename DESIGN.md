@@ -29,6 +29,8 @@ Step 2 happens before step 3 for two reasons: `CreateProcessW` with a null envir
 
 Arguments come from two places -- the `args` field and the shim's own command line -- so the command line has to be rebuilt rather than appended to, and the user's arguments re-quoted on the way. `QuoteArg` implements the `CreateProcessW` rules for exactly that reason: the child must see the arguments the user typed, not a re-parse of them.
 
+**Every shim carries a `longPathAware` manifest.** Windows only lets a process hand a path beyond `MAX_PATH` to `CreateProcessW` if that process opts in, and the opt-in is a manifest rather than anything in the code. The resource has to be written as type `24` by number: a cross-compiling `llvm-rc` does not resolve the `RT_MANIFEST` symbol and produces a *named* resource called `RT_MANIFEST` instead, which carries the manifest's bytes and is ignored by the loader. Nothing fails, and searching the binary for the manifest finds it.
+
 ## Process lifetime
 
 The shim is not supposed to outlive its job, and the child is not supposed to outlive the shim.

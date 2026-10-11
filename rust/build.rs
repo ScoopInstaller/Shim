@@ -20,6 +20,7 @@ fn main() {
             "Copyright (c) 2013-present Scoop contributors",
         );
         res.set("OriginalFilename", "shim.exe");
+        res.set_manifest_file("../shim.manifest");
         res.compile().expect("failed to compile Windows resource");
     }
 }

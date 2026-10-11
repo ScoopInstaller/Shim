@@ -635,6 +635,19 @@ Invoke-ShimTest "Missing target exe reports command and win32 error" -Setup {
     @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
+Invoke-ShimTest "path longer than MAX_PATH fails cleanly" -Setup {
+    param($d)
+    # A deep nonexistent target: resolving it walks the two-call GetFullPathNameW
+    # growth path in every lane, and the failed launch is asserted rather than
+    # the platform, so nothing depends on launching an image that deep.
+    $long = "C:\" + ("a" * 300) + "\x.exe"
+    Write-Shim $d "test" "path = $long"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "Could not create process with command '") -and ($r.Output -match "\(error \d+")
+    @{ Pass = $pass; Message = "Expected exit 1 and a create-process error, Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
 # --- cwd configuration --------------------------------------------------------
 
 Invoke-ShimTest "cwd configured" -Setup {

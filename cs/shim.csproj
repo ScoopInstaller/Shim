@@ -6,6 +6,7 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
     <AssemblyName>shim</AssemblyName>
+    <ApplicationManifest>..\shim.manifest</ApplicationManifest>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>10</LangVersion>
     <Nullable>enable</Nullable>

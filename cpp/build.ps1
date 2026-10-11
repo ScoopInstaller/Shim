@@ -64,6 +64,8 @@ BEGIN
     VALUE "Translation", 0x0409, 1200
   END
 END
+
+1 24 "..\shim.manifest"
 "@
 
   Set-Content -Path $rcFile -Value $rc -Encoding ASCII

@@ -375,7 +375,7 @@ namespace Scoop
                 var sb = new StringBuilder(cap);
                 uint len = GetFullPathNameW(toResolve, (uint)sb.Capacity, sb, IntPtr.Zero);
                 if (len == 0)
-                    return toResolve + "\\"; // target-based fallback on failure
+                    return toResolve + "\\"; // Best-effort fallback: hand back the unresolved path plus a separator.
                 if (len >= sb.Capacity)
                 {
                     cap = (int)len + 1; // required size returned on overflow

@@ -164,43 +164,53 @@ fn to_wide(s: &str) -> Vec<u16> {
 // One GetModuleFileNameW call yields both the shim's directory and its paired .shim path.
 fn get_shim_paths() -> Option<(String, String)> {
     unsafe {
-        let mut buf = [0u16; 2048];
-        let len = GetModuleFileNameW(
-            GetModuleHandleW(std::ptr::null()),
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-        );
-        if len == 0 {
-            write_error_ctx(
-                "The filename of the program could not be determined",
-                GetLastError(),
+        const MAX_MODULE_PATH_CHARS: usize = 32768;
+        let mut buf = vec![0u16; 260];
+        loop {
+            let len = GetModuleFileNameW(
+                GetModuleHandleW(std::ptr::null()),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
             );
-            return None;
-        }
-        if len as usize >= buf.len() {
-            write_error_wide(&to_wide(
-                "Shim: The filename of the program is too long to handle: '",
-            ));
-            write_error_wide(&to_wide(&String::from_utf16_lossy(&buf[..len as usize])));
-            write_error_bytes(b"'.\n");
-            return None;
-        }
-        let full = String::from_utf16_lossy(&buf[..len as usize]);
-        let dir = match full.rfind(['\\', '/']) {
-            Some(pos) => full[..pos].to_string(),
-            None => full.clone(),
-        };
-        // Only replace the extension of the file name, not a dot in a parent directory.
-        let mut shim = full;
-        let name_start = shim.rfind(['\\', '/']).map_or(0, |p| p + 1);
-        match shim[name_start..].rfind('.') {
-            Some(dot) => {
-                shim.truncate(name_start + dot);
-                shim.push_str(".shim");
+            if len == 0 {
+                write_error_ctx(
+                    "The filename of the program could not be determined",
+                    GetLastError(),
+                );
+                return None;
             }
-            None => shim.push_str(".shim"),
+            if (len as usize) < buf.len() {
+                let full = String::from_utf16_lossy(&buf[..len as usize]);
+                let dir = match full.rfind(['\\', '/']) {
+                    Some(pos) => full[..pos].to_string(),
+                    None => full.clone(),
+                };
+                // Only replace the extension of the file name, not a dot in a parent directory.
+                let mut shim = full;
+                let name_start = shim.rfind(['\\', '/']).map_or(0, |p| p + 1);
+                match shim[name_start..].rfind('.') {
+                    Some(dot) => {
+                        shim.truncate(name_start + dot);
+                        shim.push_str(".shim");
+                    }
+                    None => shim.push_str(".shim"),
+                }
+                return Some((dir, shim));
+            }
+
+            // Truncation returns the required size: grow and retry, capped at the path limit.
+            if len as usize >= MAX_MODULE_PATH_CHARS {
+                write_error_wide(&to_wide(
+                    "Shim: The filename of the program is too long to handle: '",
+                ));
+                write_error_wide(&to_wide(&String::from_utf16_lossy(
+                    &buf[..(len as usize).min(buf.len())],
+                )));
+                write_error_bytes(b"'.\n");
+                return None;
+            }
+            buf.resize(len as usize + 1, 0);
         }
-        Some((dir, shim))
     }
 }
 
@@ -373,19 +383,42 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
             combined
         };
 
-        let mut resolved = [0u16; 261];
+        let mut stack = [0u16; 261];
         let mut file_part: *mut u16 = std::ptr::null_mut();
-        let len = GetFullPathNameW(
+        let mut len = GetFullPathNameW(
             to_resolve.as_ptr(),
-            resolved.len() as u32,
-            resolved.as_mut_ptr(),
+            stack.len() as u32,
+            stack.as_mut_ptr(),
             &mut file_part,
         );
-        if len == 0 || len as usize >= resolved.len() {
-            let mut fallback = String::from_utf16_lossy(&to_resolve[..to_resolve.len() - 1]);
-            fallback.push('\\');
-            return fallback;
-        }
+
+        let fallback = || {
+            let mut s = String::from_utf16_lossy(&to_resolve[..to_resolve.len() - 1]);
+            s.push('\\');
+            s
+        };
+
+        let mut big: Vec<u16>;
+        let resolved: &[u16] = if len == 0 {
+            return fallback();
+        } else if len as usize >= stack.len() {
+            // Overflow: len is the required size, including the null terminator.
+            let required = len as usize + 1;
+            big = vec![0u16; required];
+            file_part = std::ptr::null_mut();
+            len = GetFullPathNameW(
+                to_resolve.as_ptr(),
+                required as u32,
+                big.as_mut_ptr(),
+                &mut file_part,
+            );
+            if len == 0 || len as usize >= required {
+                return fallback();
+            }
+            &big[..len as usize]
+        } else {
+            &stack[..len as usize]
+        };
 
         let dir_len = if !file_part.is_null() {
             (file_part as usize - resolved.as_ptr() as usize) / 2
