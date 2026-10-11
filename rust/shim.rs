@@ -452,14 +452,9 @@ fn quote_arg(arg: &OsStr) -> Vec<u16> {
     result
 }
 
-// GUI/redirected launches can yield null or INVALID std handles. A GUI shim may
-// have detached from (or never had) a console; reattach so CONIN$/CONOUT$ open.
+// Console policy lives in main; a detached GUI shim has no console, so the opens below fail.
 unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
-    if is_gui_subsystem() {
-        AttachConsole(ATTACH_PARENT_PROCESS); // ignore failure - parent may have no console
-    }
-
-    // bInheritHandle=1 lets the child inherit (CreateProcessW bInheritHandles=1).
+    // Handles must be inheritable or the child never receives them.
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),

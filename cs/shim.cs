@@ -573,12 +573,16 @@ namespace Scoop
             // Console policy lives in Main; a detached GUI shim has no console, so the opens below fail.
             // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
             IntPtr seedIn = GetStdHandle(STD_INPUT_HANDLE);
-            if (seedIn != IntPtr.Zero && seedIn != INVALID_HANDLE_VALUE) si.hStdInput = seedIn;
+            if ((si.hStdInput == IntPtr.Zero || si.hStdInput == INVALID_HANDLE_VALUE)
+                && seedIn != IntPtr.Zero && seedIn != INVALID_HANDLE_VALUE) si.hStdInput = seedIn;
             IntPtr seedOut = GetStdHandle(STD_OUTPUT_HANDLE);
-            if (seedOut != IntPtr.Zero && seedOut != INVALID_HANDLE_VALUE) si.hStdOutput = seedOut;
+            if ((si.hStdOutput == IntPtr.Zero || si.hStdOutput == INVALID_HANDLE_VALUE)
+                && seedOut != IntPtr.Zero && seedOut != INVALID_HANDLE_VALUE) si.hStdOutput = seedOut;
             IntPtr seedErr = GetStdHandle(STD_ERROR_HANDLE);
-            if (seedErr != IntPtr.Zero && seedErr != INVALID_HANDLE_VALUE) si.hStdError = seedErr;
+            if ((si.hStdError == IntPtr.Zero || si.hStdError == INVALID_HANDLE_VALUE)
+                && seedErr != IntPtr.Zero && seedErr != INVALID_HANDLE_VALUE) si.hStdError = seedErr;
 
+            // Handles must be inheritable or the child never receives them.
             var sa = new SECURITY_ATTRIBUTES();
             sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
             sa.lpSecurityDescriptor = IntPtr.Zero;

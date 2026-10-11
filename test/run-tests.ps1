@@ -790,6 +790,40 @@ Invoke-GuiShimTest "GUI shim exit code (7)" -Setup {
     @{ Pass = $r.ExitCode -eq 7; Message = "Expected: 7, Got: $($r.ExitCode)" }
 }
 
+# --- Null-stream creator ---------------------------------------------------------
+
+# The CONIN$/CONOUT$ fallback only runs when a creator sets STARTF_USESTDHANDLES with a
+# null stream -- the shape Go's os/exec produces when only some streams are set, and
+# nothing else here reaches it (cmd.exe omits the flag, PowerShell hands over pipes).
+# probe is the only way to express that shape, and the only child that reports its
+# handles unaltered: a managed host repairs an invalid stdout at startup, which is how
+# a lane shipped non-inheritable fallback handles without a test noticing.
+
+$script:TestNumber++
+$num = $script:TestNumber
+
+$testDir = New-TestEnvironment
+try {
+    $report = Join-Path $testDir 'report.txt'
+    Write-Shim $testDir 'probe-shim' "path = $probeExe`nargs = report $report"
+
+    & $probeExe create (Join-Path $testDir 'probe-shim.exe') --null-out | Out-Null
+    $shimExit = $LASTEXITCODE
+
+    $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
+    # type 2 is FILE_TYPE_CHAR, a real handle. A lane that opened CONOUT$ with no
+    # inheritable SECURITY_ATTRIBUTES hands the child a dead one instead, and that
+    # shows up as type 0, FILE_TYPE_UNKNOWN. mode is deliberately not asserted: the
+    # shim opens CONOUT$ write-only and GetConsoleMode needs read access, so it is
+    # false by construction and asserting it would only encode the accident.
+    $pass = ($got -match 'stdout_type=2') -and ($shimExit -eq 0)
+    Write-TestResult "#$num Child gets a usable stdout from a null-stream creator" $pass `
+        "Report: $got ; shim exit: $shimExit"
+}
+finally {
+    Remove-TestEnvironment $testDir
+}
+
 # --- PE subsystem verification -------------------------------------------------
 
 $script:TestNumber++

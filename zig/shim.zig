@@ -289,18 +289,24 @@ fn ensureStandardHandles(si: *windows.STARTUPINFOW) void {
     }
 
     var replaced = false;
+    // Handles must be inheritable or the child never receives them.
+    var sa = windows.SECURITY_ATTRIBUTES{
+        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = null,
+        .bInheritHandle = .TRUE,
+    };
     if (si.hStdInput == null or si.hStdInput == INVALID_HANDLE_VALUE) {
-        const h = CreateFileW(w("CONIN$"), .{ .GENERIC = .{ .READ = true } }, .{ .READ = true }, null, .OPEN_EXISTING, 0, null);
+        const h = CreateFileW(w("CONIN$"), .{ .GENERIC = .{ .READ = true } }, .{ .READ = true }, &sa, .OPEN_EXISTING, 0, null);
         si.hStdInput = if (h != INVALID_HANDLE_VALUE) h else null;
         if (h != INVALID_HANDLE_VALUE) replaced = true;
     }
     if (si.hStdOutput == null or si.hStdOutput == INVALID_HANDLE_VALUE) {
-        const h = CreateFileW(w("CONOUT$"), .{ .GENERIC = .{ .WRITE = true } }, .{ .WRITE = true }, null, .OPEN_EXISTING, 0, null);
+        const h = CreateFileW(w("CONOUT$"), .{ .GENERIC = .{ .WRITE = true } }, .{ .WRITE = true }, &sa, .OPEN_EXISTING, 0, null);
         si.hStdOutput = if (h != INVALID_HANDLE_VALUE) h else null;
         if (h != INVALID_HANDLE_VALUE) replaced = true;
     }
     if (si.hStdError == null or si.hStdError == INVALID_HANDLE_VALUE) {
-        const h = CreateFileW(w("CONOUT$"), .{ .GENERIC = .{ .WRITE = true } }, .{ .WRITE = true }, null, .OPEN_EXISTING, 0, null);
+        const h = CreateFileW(w("CONOUT$"), .{ .GENERIC = .{ .WRITE = true } }, .{ .WRITE = true }, &sa, .OPEN_EXISTING, 0, null);
         si.hStdError = if (h != INVALID_HANDLE_VALUE) h else null;
         if (h != INVALID_HANDLE_VALUE) replaced = true;
     }

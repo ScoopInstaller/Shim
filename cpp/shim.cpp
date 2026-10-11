@@ -155,7 +155,7 @@ inline void WriteErrorSys(DWORD err)
 // Console policy lives in wmain; a detached GUI shim has no console, so the opens below fail.
 inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
 {
-    // SECURITY_ATTRIBUTES.bInheritHandle=TRUE lets the child inherit (CreateProcessW bInheritHandles=TRUE).
+    // Handles must be inheritable or the child never receives them.
     SECURITY_ATTRIBUTES sa {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
 
     // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
