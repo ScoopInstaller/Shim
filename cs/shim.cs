@@ -693,12 +693,10 @@ namespace Scoop
 
                 if (IsKey(key, "path"))
                 {
-                    // First path wins; %~dp0 here means the shim's own dir.
+                    // First path line wins; an empty value still consumes the slot.
                     if (info.Path == null)
                     {
-                        var pv = ExpandAndUnquote(NormalizeArgs(value!, dir));
-                        if (!string.IsNullOrEmpty(pv))
-                            info.Path = pv;
+                        info.Path = ExpandAndUnquote(NormalizeArgs(value!, dir));
                     }
                 }
                 else if (IsKey(key, "args"))
@@ -727,7 +725,7 @@ namespace Scoop
                 }
             }
 
-            if (info.Path == null)
+            if (string.IsNullOrEmpty(info.Path))
                 WriteErrorW("Shim: 'path' not found in shim file '" + configPath + "'.\n");
 
             return info;

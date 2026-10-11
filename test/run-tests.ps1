@@ -639,6 +639,17 @@ Invoke-ShimTest "Empty path value treated as missing" -Setup {
     @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
+Invoke-ShimTest "Empty path value consumes the first-wins slot" -Setup {
+    param($d)
+    # The empty path comes first, so it wins the slot and the later line cannot
+    # resurrect the field; EMPTY_PATH_OK must never print.
+    Write-Shim $d "test" "path =`npath = $probeExe`nargs = echo EMPTY_PATH_OK"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "'path' not found in shim file") -and ($r.Output -notmatch "EMPTY_PATH_OK")
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
 Invoke-ShimTest "Missing target exe reports command and win32 error" -Setup {
     param($d)
     Write-Shim $d "test" "path = $d\does-not-exist.exe"
