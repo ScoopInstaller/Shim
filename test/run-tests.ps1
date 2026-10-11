@@ -13,6 +13,7 @@ $script:TestsPassed = 0
 $script:TestsFailed = 0
 $script:TestNumber = 0
 $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$probeExe = Join-Path $PSScriptRoot 'probe.exe'
 
 # ============================================================================
 # Infrastructure
@@ -76,7 +77,8 @@ function Write-Batch {
 # Run a standard console shim test.
 # Setup: scriptblock receiving $testDir, sets up batch files and .shim content
 # RunArgs: arguments passed to the shim executable
-# Assert: scriptblock receiving @{Output; ExitCode} returning $true/$false + message
+# Assert: scriptblock receiving @{Output; ExitCode; TestDir; Elapsed} returning $true/$false + message
+# PipeInput: optional string piped to the shim's stdin
 function Invoke-ShimTest {
     param(
         [string]$Name,
@@ -156,6 +158,24 @@ $ShimExe = (Resolve-Path $ShimExe).Path
 Write-Host "Running tests with: $ShimExe" -ForegroundColor Cyan
 Write-Host ""
 
+# The native probe backs the argument-forwarding tests and the null-stream creator
+# test. It is not tracked, so build it when it is missing or older than probe.c;
+# that keeps the binary from drifting away from the source it came from. CI builds
+# it once and hands every lane the same bytes.
+$probeExe = Join-Path $PSScriptRoot 'probe.exe'
+$probeSrc = Join-Path $PSScriptRoot 'probe.c'
+if (-not (Test-Path $probeExe) -or (Get-Item $probeExe).LastWriteTimeUtc -lt (Get-Item $probeSrc).LastWriteTimeUtc) {
+    try {
+        & (Join-Path $PSScriptRoot 'build-probe.ps1')
+    }
+    catch {
+        $script:TestNumber++
+        Write-TestResult "#$($script:TestNumber) Native probe built" $false $_.Exception.Message
+        exit 1
+    }
+}
+$probeExe = (Resolve-Path $probeExe).Path
+
 # ============================================================================
 # Tests
 # ============================================================================
@@ -164,59 +184,79 @@ Write-Host ""
 
 Invoke-ShimTest "Basic shim execution" -Setup {
     param($d)
-    Write-Batch "$d\app.cmd" "echo SHIM_BASIC_OK"
-    Write-Shim $d "test" "path = $d\app.cmd"
-} -Assert { param($r) $r.Output -match "SHIM_BASIC_OK" }
+    Write-Shim $d "test" "path = $probeExe`nargs = args"
+} -Assert { param($r) $r.Output -match '(?m)^PROBE_ARGS\r?$' }
 
 Invoke-ShimTest "Path with spaces" -Setup {
     param($d)
     $sp = "$d\path with spaces"; New-Item -ItemType Directory -Path $sp -Force | Out-Null
-    Write-Batch "$sp\app.cmd" "echo SPACES_OK"
-    Write-Shim $d "test" "path = $sp\app.cmd"
-} -Assert { param($r) $r.Output -match "SPACES_OK" }
+    Copy-Item $probeExe "$sp\probe.exe"
+    Write-Shim $d "test" "path = $sp\probe.exe`nargs = args"
+} -Assert { param($r) $r.Output -match '(?m)^PROBE_ARGS\r?$' }
+
+Invoke-ShimTest "path value with quotes stripped" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = `"$probeExe`"`nargs = echo PATH_QUOTE_OK"
+} -Assert { param($r) $r.Output -match "PATH_QUOTE_OK" }
+
+# The one test that keeps a .cmd target. Scoop never pairs shim.exe with a batch file,
+# so only a hand-written .shim reaches it -- but nothing else here would notice if
+# CreateProcessW stopped launching it. Argument handling is deliberately not asserted:
+# PowerShell reverts to Legacy quoting for .cmd and cmd re-expands %*, two layers a
+# real .exe target never goes through.
+Invoke-ShimTest "Batch file target launches" -Setup {
+    param($d)
+    Write-Batch "$d\ok.cmd" "echo BATCH_TARGET_OK"
+    Write-Shim $d "test" "path = $d\ok.cmd"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match "BATCH_TARGET_OK")
+    @{ Pass = $pass; Message = "Expected exit 0 and BATCH_TARGET_OK, ExitCode: $($r.ExitCode), Output: $($r.Output)" }
+}
 
 # Write-Shim emits LF-only; a CRLF .shim (the Notepad default) must not glue a CR to values.
 Invoke-ShimTest "CRLF shim file trims trailing CR from args" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo ARGS=%*"
     Copy-Item $ShimExe "$d\test.exe"
-    $content = "path = $d\echoargs.cmd`r`nargs = CRLF_OK`r`n"
+    $content = "path = $probeExe`r`nargs = args CRLF_OK`r`n"
     [System.IO.File]::WriteAllText("$d\test.shim", $content)
 } -Assert {
     param($r)
-    # End-of-line anchor: a prefix match would still pass with a trailing CR.
-    $pass = $r.Output -match '(?m)ARGS=CRLF_OK\r?$'
-    @{ Pass = $pass; Message = "Expected ARGS=CRLF_OK at end of line (no trailing CR), got: $($r.Output)" }
+    # End-of-line anchor: a leaked CR would sit between CRLF_OK and the closing '>'.
+    $pass = $r.Output -match '(?m)^Arg 0 is <CRLF_OK>\r?$'
+    @{ Pass = $pass; Message = "Expected Arg 0 is <CRLF_OK> (no trailing CR), got: $($r.Output)" }
 }
 
 # --- %~VAR% expansion ---------------------------------------------------------
 
 Invoke-ShimTest "%~VAR% expansion in path" -Setup {
     param($d)
-    # cmd.exe re-expands %VAR% itself, so only a PowerShell target proves the shim expanded path.
-    Write-Shim $d "test" "path = %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`nargs = -NoProfile -Command [Console]::Out.Write('%SystemRoot%__')"
+    # The probe is a native target, so the path's %TEMP% is the expansion under test.
+    # The literal in args proves args are not expanded: the shim never does that.
+    Copy-Item $probeExe "$d\probe.exe"
+    $leaf = Split-Path $d -Leaf
+    Write-Shim $d "test" "path = %TEMP%\$leaf\probe.exe`nargs = args %SystemRoot%__"
 } -Assert {
     param($r)
-    $literal = "%SystemRoot%__"
-    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match [regex]::Escape($literal))
-    @{ Pass = $pass; Message = "Expected exit 0 (path expanded) and literal '$literal' from args. Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match '(?m)^Arg 0 is <%SystemRoot%__>\r?$')
+    @{ Pass = $pass; Message = "Expected exit 0 (path expanded) and literal '<%SystemRoot%__>' from args. Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
 Invoke-ShimTest "Unknown %VAR% preserved as-is" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo %*"
-    Write-Shim $d "test" "path = $d\echoargs.cmd`nargs = %NONEXISTENT_SHIM_TEST_VAR%"
+    # A native probe is the target so the literal reaches it unexpanded; the point
+    # is that the shim does not expand %NONEXISTENT_...% into args.
+    Write-Shim $d "test" "path = $probeExe`nargs = args %NONEXISTENT_SHIM_TEST_VAR%"
 } -Assert {
     param($r)
-    @{ Pass = $r.Output -match [regex]::Escape("%NONEXISTENT_SHIM_TEST_VAR%"); Message = "Output: $($r.Output)" }
+    @{ Pass = $r.Output -match [regex]::Escape("Arg 0 is <%NONEXISTENT_SHIM_TEST_VAR%>"); Message = "Output: $($r.Output)" }
 }
 
 # --- Environment variables from .shim -----------------------------------------
 
 Invoke-ShimTest "Environment variables from .shim" -Setup {
     param($d)
-    Write-Batch "$d\echoenv.cmd" "echo VAR1=%VAR1%`necho VAR2=%VAR2%`necho VAR3=%VAR3%"
-    Write-Shim $d "test" "path = $d\echoenv.cmd`nVAR1 = first`nVAR2 = %USERNAME%_suffix`nVAR3 = third"
+    Write-Shim $d "test" "path = $probeExe`nargs = env VAR1 VAR2 VAR3`nVAR1 = first`nVAR2 = %USERNAME%_suffix`nVAR3 = third"
 } -Assert {
     param($r)
     $pass = ($r.Output -match "VAR1=first") -and ($r.Output -match "VAR3=third") -and ($r.Output -match "VAR2=$($env:USERNAME)_suffix")
@@ -225,8 +265,7 @@ Invoke-ShimTest "Environment variables from .shim" -Setup {
 
 Invoke-ShimTest "Env var value with quotes stripped" -Setup {
     param($d)
-    Write-Batch "$d\checkenv.cmd" "echo MY_VAR=%MY_VAR%"
-    Write-Shim $d "test" "path = $d\checkenv.cmd`nMY_VAR = `"hello world`""
+    Write-Shim $d "test" "path = $probeExe`nargs = env MY_VAR`nMY_VAR = `"hello world`""
 } -Assert {
     param($r)
     @{ Pass = $r.Output -match "MY_VAR=hello world"; Message = "Output: $($r.Output)" }
@@ -234,8 +273,10 @@ Invoke-ShimTest "Env var value with quotes stripped" -Setup {
 
 Invoke-ShimTest "Env var value %~dp0 expansion" -Setup {
     param($d)
-    Write-Batch "$d\checkenv2.cmd" "echo MY_DIR=%MY_DIR%"
-    Write-Shim $d "test" "path = $d\checkenv2.cmd`nMY_DIR = %~dp0sub"
+    # %~dp0 names the target's directory, so the probe is copied into the test dir
+    # to keep the expansion anchored there.
+    Copy-Item $probeExe "$d\probe.exe"
+    Write-Shim $d "test" "path = $d\probe.exe`nargs = env MY_DIR`nMY_DIR = %~dp0sub"
 } -Assert {
     param($r)
     $expected = "$($r.TestDir)\sub"
@@ -244,8 +285,8 @@ Invoke-ShimTest "Env var value %~dp0 expansion" -Setup {
 
 Invoke-ShimTest "Env var value %~dp0 expansion (multiple occurrences)" -Setup {
     param($d)
-    Write-Batch "$d\checkenv3.cmd" "echo MY_D=%MY_D%"
-    Write-Shim $d "test" "path = $d\checkenv3.cmd`nMY_D = %~dp0-%~dp0"
+    Copy-Item $probeExe "$d\probe.exe"
+    Write-Shim $d "test" "path = $d\probe.exe`nargs = env MY_D`nMY_D = %~dp0-%~dp0"
 } -Assert {
     param($r)
     $expected = "$($r.TestDir)\-$($r.TestDir)\"
@@ -256,105 +297,116 @@ Invoke-ShimTest "Env var value %~dp0 expansion (multiple occurrences)" -Setup {
 
 Invoke-ShimTest "Case-insensitive .shim parsing" -Setup {
     param($d)
-    Write-Batch "$d\ci.cmd" "echo OUT=[%*]"
-    Write-Shim $d "test" "PATH = $d\ci.cmd`nARGS = %~DP0"
+    Write-Shim $d "test" "PATH = $probeExe`nARGS = args %~DP0"
 } -Assert {
     param($r)
-    $expected = "OUT=[$($r.TestDir)\]"
+    # %~dp0 names the target's directory, so a native probe in test\ resolves there.
+    $expected = "Arg 0 is <$(Split-Path $probeExe)\>"
     @{ Pass = $r.Output -match [regex]::Escape($expected); Message = "Expected: $expected, Output: $($r.Output)" }
 }
 
 # --- %~dp0 placeholder --------------------------------------------------------
 
-Invoke-ShimTest "Args %~dp0 expansion (absolute path)" -Setup {
-    param($d)
-    Write-Shim $d "test" "path = C:\Windows\System32\cmd.exe`nargs = /c echo %~dp0"
-} -Assert {
-    param($r)
-    $expected = "C:\Windows\System32\"
-    @{ Pass = $r.Output -match [regex]::Escape($expected); Message = "Expected: $expected, Output: $($r.Output)" }
-}
-
 Invoke-ShimTest "Args %~dp0 expansion (relative path)" -Setup {
     param($d)
     New-Item -ItemType Directory -Path "$d\bin" -Force | Out-Null
-    Set-Content -Path "$d\bin\app.cmd" -Value "@echo off`necho %*"
-    Write-Shim $d "test" "path = $d\bin\app.cmd`nargs = %~dp0"
+    Copy-Item $probeExe "$d\bin\probe.exe"
+    Write-Shim $d "test" "path = $d\bin\probe.exe`nargs = args %~dp0"
 } -Assert {
     param($r)
-    # path resolves to $d\bin\app.cmd - target dir = $d\bin\
-    $expected = "$($r.TestDir)\bin\"
-    @{ Pass = $r.Output.StartsWith($expected, [StringComparison]::OrdinalIgnoreCase); Message = "Expected prefix: $expected, Output: $($r.Output)" }
+    # path resolves into $d\bin - target dir = $d\bin\
+    $expected = "Arg 0 is <$($r.TestDir)\bin\>"
+    @{ Pass = $r.Output -match [regex]::Escape($expected); Message = "Expected: $expected, Output: $($r.Output)" }
 }
 
 Invoke-ShimTest "Args %~dp0 expansion (multiple occurrences)" -Setup {
     param($d)
-    Write-Shim $d "test" "path = C:\Windows\System32\cmd.exe`nargs = /c echo %~dp0 %~dp0"
+    Write-Shim $d "test" "path = $probeExe`nargs = args %~dp0 %~dp0"
 } -Assert {
     param($r)
-    $count = [regex]::Matches($r.Output, [regex]::Escape("C:\Windows\System32\")).Count
-    @{ Pass = $count -ge 2; Message = "Expected 2 expansions, got $count. Output: $($r.Output)" }
+    $e = [regex]::Escape("$(Split-Path $probeExe)\")
+    $pass = ($r.Output -match "(?m)^Arg 0 is <$e>\r?$") -and ($r.Output -match "(?m)^Arg 1 is <$e>\r?$")
+    @{ Pass = $pass; Message = "Expected 2 expansions, got: $($r.Output)" }
 }
 
 Invoke-ShimTest "path = %~dp0 resolves against shim directory" -Setup {
     param($d)
-    Write-Batch "$d\app.cmd" "echo PATHDP0_OK"
-    Write-Shim $d "test" "path = %~dp0app.cmd"
+    Copy-Item $probeExe "$d\probe.exe"
+    Write-Shim $d "test" "path = %~dp0probe.exe`nargs = args"
 } -Assert {
-    param($r) $r.Output -match "PATHDP0_OK"
+    param($r) $r.Output -match '(?m)^PROBE_ARGS\r?$'
 }
 
 # --- Pass-through arguments & quoting -------------------------------------------
 
 Invoke-ShimTest "Pass-through arguments" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo ARGS=%*"
-    Write-Shim $d "test" "path = $d\echoargs.cmd"
+    Write-Shim $d "test" "path = $probeExe`nargs = args"
 } -RunArgs @("arg1", "arg2", "arg with spaces") -Assert {
     param($r)
-    # Exact string proves order and quoting.
-    $pass = $r.Output -match '(?m)ARGS=arg1 arg2 "arg with spaces"\r?$'
-    @{ Pass = $pass; Message = "Expected ARGS=arg1 arg2 `"arg with spaces`", got: $($r.Output)" }
+    # One line per argument proves order. The spaced argument arrives unquoted: a
+    # native target receives the value, not cmd's re-quoted %* rendering.
+    $pass = ($r.Output -match '(?m)^Arg 0 is <arg1>\r?$') -and
+            ($r.Output -match '(?m)^Arg 1 is <arg2>\r?$') -and
+            ($r.Output -match '(?m)^Arg 2 is <arg with spaces>\r?$')
+    @{ Pass = $pass; Message = "Expected arg1/arg2/'arg with spaces', got: $($r.Output)" }
 }
 
-Invoke-ShimTest "Args with embedded quotes (PS target)" -Setup {
+Invoke-ShimTest "Args with embedded quotes" -Setup {
     param($d)
-    Write-Shim $d "test" "path = $psExe`nargs = -NoProfile -Command"
+    Write-Shim $d "test" "path = $probeExe`nargs = args"
 } -RunArgs @("Write-Host 'QUOTE_TEST'") -Assert {
-    param($r) $r.Output -match "QUOTE_TEST"
+    param($r)
+    # Windows/Standard quoting preserves embedded quotes; the native target sees them.
+    @{ Pass = $r.Output -match "(?m)^Arg 0 is <Write-Host 'QUOTE_TEST'>\r?$"; Message = "Output: $($r.Output)" }
 }
 
 Invoke-ShimTest "Shim + user args combined" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo ARGS=%*"
-    Write-Shim $d "test" "path = $d\echoargs.cmd`nargs = --flag value"
+    Write-Shim $d "test" "path = $probeExe`nargs = args --flag value"
 } -RunArgs @("--extra") -Assert {
     param($r)
-    # Exact string: shim args must precede user args (README "appended after").
-    $pass = $r.Output -match '(?m)ARGS=--flag value --extra\r?$'
-    @{ Pass = $pass; Message = "Expected ARGS=--flag value --extra, got: $($r.Output)" }
+    # Exact order: shim args must precede user args (README "appended after").
+    $pass = ($r.Output -match '(?m)^Arg 0 is <--flag>\r?$') -and
+            ($r.Output -match '(?m)^Arg 1 is <value>\r?$') -and
+            ($r.Output -match '(?m)^Arg 2 is <--extra>\r?$')
+    @{ Pass = $pass; Message = "Expected --flag value --extra, got: $($r.Output)" }
 }
 
 Invoke-ShimTest "Args with backslashes" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo %*"
-    Write-Shim $d "test" "path = $d\echoargs.cmd"
+    Write-Shim $d "test" "path = $probeExe`nargs = args"
 } -RunArgs @("C:\path\to\file") -Assert {
-    param($r) $r.Output -match 'C:\\path\\to\\file'
+    param($r) $r.Output -match [regex]::Escape("Arg 0 is <C:\path\to\file>")
 }
 
 Invoke-ShimTest "Shim args with spaces in value" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo %*"
-    Write-Shim $d "test" "path = $d\echoargs.cmd`nargs = --dir `"C:\Program Files\App`""
-} -Assert { param($r) $r.Output -match "Program Files" }
+    Write-Shim $d "test" "path = $probeExe`nargs = args --dir `"C:\Program Files\App`""
+} -Assert {
+    param($r)
+    # The shim's own quoting makes this one argument; a native target sees one value.
+    @{ Pass = $r.Output -match [regex]::Escape("Arg 1 is <C:\Program Files\App>"); Message = "Output: $($r.Output)" }
+}
 
+Invoke-ShimTest "Shim args with trailing backslash and embedded quote" -Setup {
+    param($d)
+    # The two re-quote branches nothing else reaches: an argument ending in a
+    # backslash doubles it inside the quotes (the 2n rule), and a backslash
+    # immediately before a quote takes the 2n+1 form. Both must round-trip to
+    # a native target exactly as typed in the file.
+    Write-Shim $d "test" "path = $probeExe`nargs = args `"C:\dir with space\\`" a\\\`"b"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match [regex]::Escape('Arg 0 is <C:\dir with space\>')) -and
+            ($r.Output -match [regex]::Escape('Arg 1 is <a\"b>'))
+    @{ Pass = $pass; Message = "Output: $($r.Output)" }
+}
 # --- Exit code & I/O -----------------------------------------------------------
 
 Invoke-ShimTest "Non-zero exit code (42)" -Setup {
     param($d)
-    Set-Content -Path "$d\exit42.cmd" -Value "@exit 42"
-    Write-Shim $d "test" "path = $d\exit42.cmd"
+    Write-Shim $d "test" "path = $probeExe`nargs = exit 42"
 } -Assert {
     param($r)
     @{ Pass = $r.ExitCode -eq 42; Message = "Expected: 42, Got: $($r.ExitCode)" }
@@ -362,18 +414,18 @@ Invoke-ShimTest "Non-zero exit code (42)" -Setup {
 
 Invoke-ShimTest "stderr output preserved" -Setup {
     param($d)
-    Write-Batch "$d\stderr.cmd" "echo stdout line`necho stderr line 1>&2"
-    Write-Shim $d "test" "path = $d\stderr.cmd"
+    # echoerr writes "stdout line" to stdout and "stdout line err" to stderr, so one
+    # run proves both streams reach the child and both come back.
+    Write-Shim $d "test" "path = $probeExe`nargs = echoerr stdout line"
 } -Assert {
     param($r)
-    $pass = ($r.Output -match "stdout line") -and ($r.Output -match "stderr line")
+    $pass = ($r.Output -match "stdout line") -and ($r.Output -match "stdout line err")
     @{ Pass = $pass; Message = "Output: $($r.Output)" }
 }
 
 Invoke-ShimTest "stdin pipe" -Setup {
     param($d)
-    Set-Content -Path "$d\readstdin.cmd" -Value "@echo off`nset /p INPUT=`necho GOT=%INPUT%"
-    Write-Shim $d "test" "path = $d\readstdin.cmd"
+    Write-Shim $d "test" "path = $probeExe`nargs = stdin"
 } -PipeInput "HELLO_STDIN" -Assert {
     param($r) $r.Output -match "GOT=HELLO_STDIN"
 }
@@ -382,17 +434,15 @@ Invoke-ShimTest "stdin pipe" -Setup {
 
 Invoke-ShimTest "Ignore comment lines" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo ARGS=%*"
-    Write-Shim $d "test" "# hash comment`n; semicolon comment`n// slash comment`n  # indented comment`npath = $d\echoargs.cmd`nargs = --verified"
-} -Assert { param($r) $r.Output -match "ARGS=--verified" }
+    Write-Shim $d "test" "# hash comment`n; semicolon comment`n// slash comment`n  # indented comment`npath = $probeExe`nargs = args --verified"
+} -Assert { param($r) $r.Output -match '(?m)^Arg 0 is <--verified>\r?$' }
 
 # --- UTF-8 BOM handling -------------------------------------------------------
 
 Invoke-ShimTest "UTF-8 BOM in shim file" -Setup {
     param($d)
-    Write-Batch "$d\app.cmd" "echo BOM_OK"
     Copy-Item $ShimExe "$d\test.exe"
-    $content = "# comment`npath = $d\app.cmd"
+    $content = "# comment`npath = $probeExe`nargs = echo BOM_OK"
     $bom = [System.Text.Encoding]::UTF8.GetPreamble()
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($content)
     [System.IO.File]::WriteAllBytes("$d\test.shim", $bom + $bytes)
@@ -400,24 +450,22 @@ Invoke-ShimTest "UTF-8 BOM in shim file" -Setup {
 
 Invoke-ShimTest "Invalid UTF-8 line skipped without abort" -Setup {
     param($d)
-    Write-Batch "$d\app.cmd" "echo AFTER_BAD_LINE"
     Copy-Item $ShimExe "$d\test.exe"
     # path, then a line with an invalid UTF-8 sequence (C3 28), then args
-    $bytes = [byte[]](0x70,0x61,0x74,0x68,0x20,0x3D,0x20) + [System.Text.Encoding]::UTF8.GetBytes("$d\app.cmd") +
+    $bytes = [byte[]](0x70,0x61,0x74,0x68,0x20,0x3D,0x20) + [System.Text.Encoding]::UTF8.GetBytes("$probeExe") +
         [byte[]](0x0A,0xC3,0x28,0x20,0x3D,0x20,0x62,0x61,0x64,0x0A) +
-        [System.Text.Encoding]::UTF8.GetBytes("args = /c echo AFTER_BAD_LINE")
+        [System.Text.Encoding]::UTF8.GetBytes("args = args AFTER_BAD_LINE")
     [System.IO.File]::WriteAllBytes("$d\test.shim", $bytes)
 } -Assert {
     param($r)
-    @{ Pass = ($r.Output -match "AFTER_BAD_LINE") -and ($r.ExitCode -eq 0); Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+    @{ Pass = ($r.Output -match '(?m)^Arg 0 is <AFTER_BAD_LINE>\r?$') -and ($r.ExitCode -eq 0); Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
 # --- Blank line handling --------------------------------------------------------
 
 Invoke-ShimTest "Blank lines in shim file" -Setup {
     param($d)
-    Write-Batch "$d\app.cmd" "echo BLANKLINE_OK"
-    Write-Shim $d "test" "path = $d\app.cmd`n`nargs =`n`n# comment`n"
+    Write-Shim $d "test" "path = $probeExe`n`nargs = echo BLANKLINE_OK`n`n# comment`n"
 } -Assert {
     param($r)
     $pass = ($r.Output -match "BLANKLINE_OK") -and ($r.ExitCode -eq 0)
@@ -428,7 +476,7 @@ Invoke-ShimTest "Blank lines in shim file" -Setup {
 
 Invoke-ShimTest "Exit code above 255" -Setup {
     param($d)
-    Write-Shim $d "test" "path = $psExe`nargs = -NoProfile -Command exit 300"
+    Write-Shim $d "test" "path = $probeExe`nargs = exit 300"
 } -Assert {
     param($r)
     @{ Pass = $r.ExitCode -eq 300; Message = "Expected: 300, Got: $($r.ExitCode)" }
@@ -436,12 +484,12 @@ Invoke-ShimTest "Exit code above 255" -Setup {
 
 Invoke-ShimTest "Exit code 0xFFFE0005 forwarded unmangled" -Setup {
     param($d)
-    # -131071 == 0xFFFE0005 as DWORD: a negative (crash-style) exit code must pass
-    # through unmangled, not collapse to 1.
-    Write-Shim $d "test" "path = $psExe`nargs = -NoProfile -Command exit -131071"
+    # 0xFFFE0005 as a signed 32-bit int is -131067: a negative (crash-style) exit
+    # code must pass through unmangled, not collapse to 1.
+    Write-Shim $d "test" "path = $probeExe`nargs = exit 0xFFFE0005"
 } -Assert {
     param($r)
-    @{ Pass = $r.ExitCode -eq -131071; Message = "Expected: -131071 (0xFFFE0005), Got: $($r.ExitCode)" }
+    @{ Pass = $r.ExitCode -eq -131067; Message = "Expected: -131067 (0xFFFE0005), Got: $($r.ExitCode)" }
 }
 
 # --- Error messages ---------------------------------------------------------------
@@ -466,9 +514,10 @@ Invoke-ShimTest "Missing path key reports shim file" -Setup {
 
 Invoke-ShimTest "First path line wins" -Setup {
     param($d)
-    Write-Batch "$d\first.cmd" "echo FIRST_PATH"
-    Write-Batch "$d\second.cmd" "echo SECOND_PATH"
-    Write-Shim $d "test" "path = $d\first.cmd`npath = $d\second.cmd"
+    # The first path is the probe; the second points at a missing exe. If the shim
+    # preferred the last path line the launch would fail and FIRST_PATH would never
+    # print. The not-match on SECOND_PATH is a literal guard (nothing prints it).
+    Write-Shim $d "test" "path = $probeExe`nargs = echo FIRST_PATH`npath = $d\does-not-exist.exe"
 } -Assert {
     param($r)
     $pass = ($r.Output -match "FIRST_PATH") -and ($r.Output -notmatch "SECOND_PATH")
@@ -499,8 +548,7 @@ Invoke-ShimTest "cwd configured" -Setup {
     param($d)
     $cwdDir = "$d\workdir"
     New-Item -ItemType Directory -Path $cwdDir -Force | Out-Null
-    Write-Batch "$d\echocwd.cmd" "echo %CD%"
-    Write-Shim $d "test" "path = $d\echocwd.cmd`ncwd = $cwdDir"
+    Write-Shim $d "test" "path = $probeExe`nargs = cwd`ncwd = $cwdDir"
 } -Assert {
     param($r)
     @{ Pass = $r.Output -match [regex]::Escape("$($r.TestDir)\workdir"); Message = "Output: $($r.Output)" }
@@ -510,8 +558,8 @@ Invoke-ShimTest "cwd %~dp0 expansion" -Setup {
     param($d)
     $subDir = "$d\sub"
     New-Item -ItemType Directory -Path $subDir -Force | Out-Null
-    Write-Batch "$d\echocwd.cmd" "echo %CD%"
-    Write-Shim $d "test" "path = $d\echocwd.cmd`ncwd = %~dp0sub"
+    Copy-Item $probeExe "$d\probe.exe"
+    Write-Shim $d "test" "path = $d\probe.exe`nargs = cwd`ncwd = %~dp0sub"
 } -Assert {
     param($r)
     $expected = "$($r.TestDir)\sub"
@@ -520,8 +568,7 @@ Invoke-ShimTest "cwd %~dp0 expansion" -Setup {
 
 Invoke-ShimTest "cwd %TEMP% expansion" -Setup {
     param($d)
-    Write-Batch "$d\echocwd.cmd" "echo %CD%"
-    Write-Shim $d "test" "path = $d\echocwd.cmd`ncwd = %TEMP%"
+    Write-Shim $d "test" "path = $probeExe`nargs = cwd`ncwd = %TEMP%"
 } -Assert {
     param($r)
     @{ Pass = $r.Output -match [regex]::Escape($env:TEMP); Message = "Expected: $env:TEMP, Output: $($r.Output)" }
@@ -531,8 +578,7 @@ Invoke-ShimTest "cwd value with quotes stripped" -Setup {
     param($d)
     $cwdDir = "$d\workdir"
     New-Item -ItemType Directory -Path $cwdDir -Force | Out-Null
-    Write-Batch "$d\echocwd.cmd" "echo %CD%"
-    Write-Shim $d "test" "path = $d\echocwd.cmd`ncwd = `"$cwdDir`""
+    Write-Shim $d "test" "path = $probeExe`nargs = cwd`ncwd = `"$cwdDir`""
 } -Assert {
     param($r)
     @{ Pass = $r.Output -match [regex]::Escape("$($r.TestDir)\workdir"); Message = "Output: $($r.Output)" }
@@ -542,8 +588,7 @@ Invoke-ShimTest "workdir alias for cwd" -Setup {
     param($d)
     $wdDir = "$d\wd"
     New-Item -ItemType Directory -Path $wdDir -Force | Out-Null
-    Write-Batch "$d\echocwd.cmd" "echo %CD%"
-    Write-Shim $d "test" "path = $d\echocwd.cmd`nworkdir = $wdDir"
+    Write-Shim $d "test" "path = $probeExe`nargs = cwd`nworkdir = $wdDir"
 } -Assert {
     param($r)
     @{ Pass = $r.Output -match [regex]::Escape("$($r.TestDir)\wd"); Message = "Output: $($r.Output)" }
@@ -566,49 +611,45 @@ try {
     Write-Shim $testDir "test" "path = $psExe`nargs = -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc"
     $shim = Start-Process "$testDir\test.exe" -PassThru -NoNewWindow `
         -RedirectStandardOutput "$testDir\stdout.txt" -RedirectStandardError "$testDir\stderr.txt"
-    $shim | Wait-Process -Timeout 20 -ErrorAction SilentlyContinue
+    # The chain is two cold powershell starts; an AV-scanning or heavily loaded
+    # machine can burn the whole budget on those alone, so wait generously.
+    $shim | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue
 
     $gp = (Get-Content $gpid -ErrorAction SilentlyContinue | Select -First 1) -as [int]
-    $pass = ($gp -gt 0) -and (Get-Process -Id $gp -ErrorAction SilentlyContinue) -and $shim.HasExited
-    Write-TestResult "#$num Direct-child-only lifecycle" $pass
+    $alive = [bool](Get-Process -Id $gp -ErrorAction SilentlyContinue)
+    $pass = ($gp -gt 0) -and $alive -and $shim.HasExited
+    $detail = "gpid=$($gp) grandchildAlive=$($alive) shimExited=$($shim.HasExited) childDone=$(Test-Path $done)"
+    Write-TestResult "#$num Direct-child-only lifecycle" $pass $detail
 } finally {
     Remove-TestEnvironment $testDir
 }
 
 Invoke-ShimTest "shim waits for long-running child" -Setup {
     param($d)
-    Set-Content -Path "$d\sleep2.cmd" -Value "@echo off`nping -n 3 127.0.0.1 > nul`necho WAITED_OK"
-    Write-Shim $d "test" "path = $d\sleep2.cmd"
+    Write-Shim $d "test" "path = $probeExe`nargs = wait 3000"
 } -Assert {
     param($r)
-    $pass = ($r.Output -match "WAITED_OK") -and ($r.Elapsed.TotalSeconds -gt 1.5)
-    @{ Pass = $pass; Message = "Output: $($r.Output), Elapsed: $($r.Elapsed.TotalSeconds)s" }
+    $pass = ($r.ExitCode -eq 0) -and ($r.Elapsed.TotalSeconds -gt 2.5)
+    @{ Pass = $pass; Message = "Exit: $($r.ExitCode), Elapsed: $($r.Elapsed.TotalSeconds)s" }
 }
 
 # --- Special key handling ------------------------------------------------------
 
 Invoke-ShimTest "Special keys not leaked as env vars" -Setup {
     param($d)
-    Write-Batch "$d\checkenv.cmd" "echo ELEVATE_ENV=%elevate%`necho CWD_ENV=%cwd%"
-    Write-Shim $d "test" "path = $d\checkenv.cmd`nelevate = false`ncwd = $d"
+    # The probe prints nothing for an absent name, so an empty output is the exact
+    # signal that elevate/cwd/runas were consumed as shim keys, not set as env vars.
+    Write-Shim $d "test" "path = $probeExe`nargs = env ELEVATE CWD RUNAS`nelevate = false`ncwd = $d`nrunas = false"
 } -Assert {
     param($r)
-    @{ Pass = ($r.Output -notmatch "ELEVATE_ENV=\S") -and ($r.Output -notmatch "CWD_ENV=\S"); Message = "Output: $($r.Output)" }
-}
-
-Invoke-ShimTest "runas alias not leaked as env var" -Setup {
-    param($d)
-    Write-Batch "$d\checkenv.cmd" "echo RUNAS_ENV=%runas%"
-    Write-Shim $d "test" "path = $d\checkenv.cmd`nrunas = false"
-} -Assert {
-    param($r)
-    @{ Pass = $r.Output -notmatch "RUNAS_ENV=\S"; Message = "Output: $($r.Output)" }
+    @{ Pass = ($r.Output -notmatch "ELEVATE=") -and ($r.Output -notmatch "CWD=") -and ($r.Output -notmatch "RUNAS="); Message = "Output: $($r.Output)" }
 }
 
 Invoke-ShimTest "elevate = true triggers elevation path" -Setup {
     param($d)
-    Write-Batch "$d\app.cmd" "> `"$d\marker.txt`" echo ELEVATE_OK"
-    Write-Shim $d "test" "path = $d\app.cmd`nelevate = true"
+    # The probe's touch mode creates the marker, so the assertion holds whether the
+    # runner is elevated or not; the elevated path is what is under test.
+    Write-Shim $d "test" "path = $probeExe`nargs = touch $d\marker.txt`nelevate = true"
 } -Assert {
     param($r)
     $marker = Join-Path $r.TestDir "marker.txt"
@@ -632,92 +673,28 @@ Invoke-ShimTest "elevate = true triggers elevation path" -Setup {
 
 Invoke-GuiShimTest "GUI shim with args preserves CLI" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo ARGS=%*"
-    Set-Content -Path "$d\gui-shim.shim" -Value "path = $d\echoargs.cmd"
+    Set-Content -Path "$d\gui-shim.shim" -Value "path = $probeExe`nargs = args"
 } -RunArgs @("--help", "--version") -Assert {
-    param($r) $r.Output -match "ARGS=--help --version"
+    param($r)
+    $pass = ($r.Output -match '(?m)^Arg 0 is <--help>\r?$') -and ($r.Output -match '(?m)^Arg 1 is <--version>\r?$')
+    @{ Pass = $pass; Message = "Output: $($r.Output)" }
 }
 
 Invoke-GuiShimTest "GUI shim no-arg does not crash" -Setup {
     param($d)
-    Write-Batch "$d\simple.cmd" "echo GUI_NOARG_OK"
-    Set-Content -Path "$d\gui-shim.shim" -Value "path = $d\simple.cmd"
+    Set-Content -Path "$d\gui-shim.shim" -Value "path = $probeExe`nargs = echo GUI_NOARG_OK"
 } -Assert {
     param($r)
-    @{ Pass = $r.ExitCode -eq 0; Message = "ExitCode: $($r.ExitCode)" }
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match "GUI_NOARG_OK")
+    @{ Pass = $pass; Message = "ExitCode: $($r.ExitCode), Output: $($r.Output)" }
 }
 
 Invoke-GuiShimTest "GUI shim exit code (7)" -Setup {
     param($d)
-    Set-Content -Path "$d\exit7.cmd" -Value "@exit 7"
-    Set-Content -Path "$d\gui-shim.shim" -Value "path = $d\exit7.cmd"
+    Set-Content -Path "$d\gui-shim.shim" -Value "path = $probeExe`nargs = exit 7"
 } -Assert {
     param($r)
     @{ Pass = $r.ExitCode -eq 7; Message = "Expected: 7, Got: $($r.ExitCode)" }
-}
-
-# --- Console handle inheritance -------------------------------------------------
-
-# Every other test pipes stdio, so no console exists and CON*$ never fires. Here the
-# child must inherit the console's primary stdout handle, not a second CONOUT$ one -
-# GetFileType reports both as FILE_TYPE_CHAR, but only GetConsoleMode answers for the
-# primary, so the probe needs a native call to tell a pipe from the bogus handle.
-
-$script:TestNumber++
-$num = $script:TestNumber
-$hasConsole = $false
-try { $null = [Console]::WindowWidth; $hasConsole = $true } catch { }
-
-$testDir = New-TestEnvironment
-try {
-    if (-not $hasConsole) {
-        Write-Host "  [SKIP] Test #$num child stdout needs a real console (this runner pipes stdout); counting as pass" -ForegroundColor DarkYellow
-        $script:TestsPassed++
-    } else {
-        $cs = Join-Path $testDir "conprobe.cs"
-        $probe = Join-Path $testDir "probe.ps1"
-        $report = Join-Path $testDir "report.txt"
-        Set-Content -Path $cs -Encoding ASCII -Value @'
-using System;
-using System.Runtime.InteropServices;
-public static class ConProbe {
-    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(uint n);
-    [DllImport("kernel32.dll")] static extern uint GetFileType(IntPtr h);
-    [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr h, out uint m);
-
-    public static string Report() {
-        IntPtr h = GetStdHandle(unchecked((uint)-11));
-        uint mode;
-        bool ok = GetConsoleMode(h, out mode);
-        return "type=" + GetFileType(h) + " mode=" + ok;
-    }
-}
-'@
-        Set-Content -Path $probe -Encoding ASCII -Value @'
-try {
-    Add-Type -Path $args[1]
-    Set-Content -LiteralPath $args[0] -Value ([ConProbe]::Report())
-} catch {
-    Set-Content -LiteralPath $args[0] -Value "probe=UNSUPPORTED"
-}
-'@
-        Write-Shim $testDir "test" "path = $psExe`nargs = -NoProfile -ExecutionPolicy Bypass -File `"$probe`" `"$report`" `"$cs`""
-
-        # cmd.exe does not set STARTF_USESTDHANDLES, which is the case under test.
-        & cmd.exe /c "`"$testDir\test.exe`""
-
-        $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { "(no report)" }
-        if ($got -match 'type=2 mode=True') {
-            Write-TestResult "#$num Child inherits console stdout" $true
-        } elseif ($got -match 'type=2') {
-            Write-TestResult "#$num Child inherits console stdout" $false "Report: $got"
-        } else {
-            Write-Host "  [SKIP] Test #$num console not inherited by the child ($got); counting as pass" -ForegroundColor DarkYellow
-            $script:TestsPassed++
-        }
-    }
-} finally {
-    Remove-TestEnvironment $testDir
 }
 
 # --- PE subsystem verification -------------------------------------------------

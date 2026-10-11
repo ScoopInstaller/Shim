@@ -85,6 +85,7 @@ All implementations share the same `.shim` format.
 - Design rationale: [`DESIGN.md`](DESIGN.md)
 - Agent conventions: [`AGENTS.md`](AGENTS.md)
 - Test suite: [`test/run-tests.ps1`](test/run-tests.ps1)
+- Test guide: [`test/README.md`](test/README.md)
 - Startup cost: [`benchmark/README.md`](benchmark/README.md)
 - Tag-based release routing:
   - `cs/v<version>` → C# release lane

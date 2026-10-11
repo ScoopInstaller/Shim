@@ -101,6 +101,27 @@ jobs:
         if ($bad) { throw "Encoding issues: $($bad -join '; ')" }
         Write-Host "All tracked files pass encoding checks."
 
+  # Only Zig builds the probe, and the cs and rust jobs install no Zig, so it is built
+  # once here and handed to every lane. detect is a dependency only so the condition below can read it.
+  probe:
+    needs: [detect, hygiene]
+    if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.0
+    - name: Build the test probe
+      shell: pwsh
+      run: .\test\build-probe.ps1
+    - name: Upload the probe
+      uses: actions/upload-artifact@v7
+      with:
+        name: probe
+        path: test/probe.exe
+        if-no-files-found: error
   format:
     needs: detect
     if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
@@ -133,7 +154,7 @@ jobs:
         }
 
   build:
-    needs: detect
+    needs: [detect, hygiene, probe]
     if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
     strategy:
       fail-fast: false
@@ -157,6 +178,11 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: aarch64-pc-windows-msvc
+    - name: Fetch the shared probe
+      uses: actions/download-artifact@v8
+      with:
+        name: probe
+        path: test
     - name: Build ${{ matrix.component }}
       shell: pwsh
       run: .\${{ matrix.component }}\build.ps1
