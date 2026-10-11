@@ -368,9 +368,11 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
     let wide_path = to_wide_null(path);
     let wide_base = to_wide_null(base_dir);
     unsafe {
-        let path_bytes = path.as_bytes();
-        let is_absolute = (path_bytes.len() >= 2 && path_bytes[1] == b':')
-            || (!path_bytes.is_empty() && path_bytes[0] == b'\\');
+        // Rooted per README: the second UTF-16 unit is ':' -- the wchar check the
+        // other lanes use; a byte-wise test would misread "é:x" as relative --
+        // or the first unit is a separator.
+        let is_absolute = (wide_path.len() >= 2 && wide_path[1] == b':' as u16)
+            || (wide_path[0] == b'\\' as u16 || wide_path[0] == b'/' as u16);
 
         let to_resolve = if is_absolute {
             wide_path

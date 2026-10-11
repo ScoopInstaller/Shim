@@ -361,9 +361,7 @@ namespace Scoop
 
         static string ResolveAgainstBase(string path, string baseDir)
         {
-            // Rooted only when the drive is absolute ("C:\...") or a leading
-            // separator. Path.IsPathRooted would wrongly accept drive-relative
-            // forms like "C:app".
+            // Rooted per README: a drive letter and a colon (drive-relative "C:app" counts), or a leading separator.
             bool rooted = (path.Length >= 2 && path[1] == ':')
                 || (path.Length > 0 && (path[0] == '\\' || path[0] == '/'));
 

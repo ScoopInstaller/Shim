@@ -36,6 +36,8 @@ Lines whose first non-whitespace characters are `#`, `;`, or `//`, as well as bl
 | `elevate` (`runas`) | Request UAC elevation. Truthy values: `true`, `1`, `yes` |
 | Any other name      | Environment variable set for the target process         |
 
+A `path` value is rooted when it starts with a drive letter and a colon, or with either separator, `\` or `/`; otherwise it is resolved against the shim's own directory.
+
 ### Value Quoting
 
 Values may be wrapped in double quotes (e.g. `path = "C:\Program Files\app.exe"`) or left unquoted. In `path`, `cwd` and environment overrides the wrapping quotes are stripped after expansion; in `args` there is no unquoting, because the value is parsed with command-line rules, so quotes group arguments and the backslash-before-quote rules apply.

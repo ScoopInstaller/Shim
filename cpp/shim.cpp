@@ -414,7 +414,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 [[nodiscard]] std::wstring ResolveAgainstBase(std::wstring_view path, std::wstring_view baseDir)
 {
     std::wstring toResolve;
-    if ((path.size() >= 2 && path[1] == L':') || (!path.empty() && path[0] == L'\\'))
+    if ((path.size() >= 2 && path[1] == L':') || (!path.empty() && (path[0] == L'\\' || path[0] == L'/')))
     {
         toResolve = path;
     }

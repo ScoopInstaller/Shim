@@ -600,7 +600,7 @@ fn parseShimLine(line: []const WCHAR, out: *ShimLine) LineKind {
 
 /// Returns the *directory* portion (trailing backslash), not the resolved path. Caller owns it.
 fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir: []const WCHAR) ![]WCHAR {
-    const is_absolute = (path.len >= 2 and path[1] == ':') or (path.len > 0 and path[0] == '\\');
+    const is_absolute = (path.len >= 2 and path[1] == ':') or (path.len > 0 and (path[0] == '\\' or path[0] == '/'));
     var toResolve: []const WCHAR = undefined;
     if (is_absolute) {
         toResolve = path;
