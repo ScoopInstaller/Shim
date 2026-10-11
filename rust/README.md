@@ -1,6 +1,6 @@
-# Rust Shim — Development Guide
+# Rust Shim Development Guide
 
-For shim file format and usage, see [../README.md](../README.md).
+Shim file format and usage: [../README.md](../README.md). Design rationale: [../DESIGN.md](../DESIGN.md).
 
 ## Overview
 
@@ -10,8 +10,8 @@ Native Rust shim using `windows-sys` raw FFI bindings, statically linked, zero r
 
 | Tool | Required |
 |------|----------|
-| **Rust** (stable, MSVC toolchain) | ✅ |
-| **cargo** | ✅ |
+| **Rust** (stable, MSVC toolchain) | yes |
+| **cargo** | yes |
 
 Additional targets: `rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc aarch64-pc-windows-msvc`
 
@@ -45,4 +45,10 @@ cd rust
 | `panic` | `"abort"` | No unwinding overhead |
 | `strip` | `true` | Remove debug symbols |
 
-Uses `windows-sys` (raw FFI bindings) instead of `windows` crate — smaller binary, faster compilation, no COM/WinRT overhead.
+Uses `windows-sys` (raw FFI bindings) instead of `windows` crate -- smaller binary, faster compilation, no COM/WinRT overhead.
+
+## Conventions
+
+- `windows-sys`, not the `windows` crate
+- Raw FFI bindings, no safe wrappers
+- `unsafe` confined to the FFI call itself

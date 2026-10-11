@@ -1,6 +1,6 @@
-# C# Shim — Development Guide
+# C# Shim Development Guide
 
-For shim file format and usage, see [../README.md](../README.md).
+Shim file format and usage: [../README.md](../README.md). Design rationale: [../DESIGN.md](../DESIGN.md).
 
 ## Overview
 
@@ -29,3 +29,9 @@ cd cs
 ```pwsh
 ..\test\run-tests.ps1 -ShimExe bin\x64\shim.exe
 ```
+
+## Conventions
+
+- .NET Framework 4.5 target
+- P/Invoke for all Win32 calls
+- `GenerateAssemblyInfo=false` in the csproj, with a hand-written `AssemblyInfo.cs` generated at build time. It omits `AssemblyTitle` so `FileDescription` stays empty, matching the other lanes

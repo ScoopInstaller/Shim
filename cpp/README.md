@@ -1,6 +1,6 @@
-# C++ Shim — Development Guide
+# C++ Shim Development Guide
 
-For shim file format and usage, see [../README.md](../README.md).
+Shim file format and usage: [../README.md](../README.md). Design rationale: [../DESIGN.md](../DESIGN.md).
 
 ## Overview
 
@@ -10,10 +10,10 @@ Native C++ shim, statically linked, zero runtime dependencies. Supports x86, x64
 
 | Tool | Local dev | CI (GHA) |
 |------|-----------|----------|
-| **Zig 0.17.0** | ✅ Required | — |
-| **MSBuild + VC++** | — | ✅ Pre-installed on `windows-latest` |
+| **Zig 0.17.0** | Required | |
+| **MSBuild + VC++** | | Pre-installed on `windows-latest` |
 
-`build.ps1` auto-detects (`-Tool Auto`): with VS → MSBuild; without → Zig.
+`build.ps1` auto-detects (`-Tool Auto`): with VS -> MSBuild; without -> Zig.
 
 ## Build
 
@@ -37,3 +37,10 @@ cd cpp
 ```pwsh
 ..\test\run-tests.ps1 -ShimExe bin\x64\shim.exe
 ```
+
+## Conventions
+
+- C++20, built through Zig's C++ frontend rather than MSBuild in the default workflow
+- `wstring_view` for parsing; never pass `.data()` to a C string function (`_wcsicmp`, `wcscmp`, ...), because a view is not null-terminated
+- `[[nodiscard]]` on every function that returns a value
+- `[[likely]]` / `[[unlikely]]` on branches whose outcome is known

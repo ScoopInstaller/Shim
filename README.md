@@ -16,7 +16,7 @@ NAME = <environment variable override>
 
 ### Comments
 
-Lines starting with `#`, `;`, or `//`, as well as blank lines, are ignored.
+Lines whose first non-whitespace characters are `#`, `;`, or `//`, as well as blank lines, are ignored.
 
 ### Fields
 
@@ -25,16 +25,16 @@ Lines starting with `#`, `;`, or `//`, as well as blank lines, are ignored.
 | `path`              | **(Required)** Path to the target executable            |
 | `args`              | Arguments passed to the target                          |
 | `cwd` (`workdir`)   | Working directory for the target process                |
-| `elevate` (`runas`) | Request UAC elevation. Valid values: `true`, `1`, `yes` |
+| `elevate` (`runas`) | Request UAC elevation. Truthy values: `true`, `1`, `yes` |
 | Any other name      | Environment variable set for the target process         |
 
 ### Value Quoting
 
-Values may be wrapped in double quotes (e.g. `path = "C:\Program Files\app.exe"`) or left unquoted.
+Values may be wrapped in double quotes (e.g. `path = "C:\Program Files\app.exe"`) or left unquoted. In `path`, `cwd` and environment overrides the wrapping quotes are stripped after expansion; in `args` there is no unquoting, because the value is parsed with command-line rules, so quotes group arguments and the backslash-before-quote rules apply.
 
 ### Variable Expansion
 
-- `%ENV%` — Expands environment variables in `path`, `cwd`, and environment override values; in `args` the value is passed through unchanged so the child process can expand `%VAR%` itself. Unknown variables (e.g. `%NONEXISTENT_VAR%`) are preserved as-is.
+- `%ENV%` -- Expands environment variables in `path`, `cwd`, and environment override values; in `args` the value is passed through unchanged so the child process can expand `%VAR%` itself. Unknown variables (e.g. `%NONEXISTENT_VAR%`) are preserved as-is. Values are expanded when the shim file is read, so a value cannot reference a variable the shim itself defines.
 - `%~dp0` — In `path`, expands against the **shim's own directory** (the target is unknown at that point). In `args`, `cwd`, and environment override values, expands to the **directory containing the target executable** with a trailing backslash. All occurrences in a value are replaced. Duplicate `path` keys: the first one wins.
 
 ### Argument Parsing
@@ -50,8 +50,6 @@ Any line whose key is not `path`, `args`, `cwd`, `workdir`, `elevate`, or `runas
 The shim waits for the child process to finish and forwards its exit code, including large values (e.g. crash codes like `0xC0000005`) unmangled. If the shim fails internally, it exits with code 1.
 
 ## Usage
-
-The `.shim` file must share the same base name as the `shim.exe`.
 
 ```pwsh
 New-Item -Path test.shim -Value 'path = C:\Windows\System32\calc.exe'
@@ -78,28 +76,16 @@ All implementations share the same `.shim` format.
 | Rust           | Cargo      | 113.0 KB | 130.5 KB | 126.5 KB |
 | Zig            | Zig        |  85.5 KB |  68.5 KB |  21.0 KB |
 
-## Startup Latency
-
-[hyperfine](https://github.com/sharkdp/hyperfine) against `C:\Windows\System32\whoami.exe`, x64: 10 interleaved rounds x 15 runs, no shell. Values are medians over all samples; CPU time (user+system) is reported because wall clock is unreliable on a busy machine.
-
-| Implementation | Wall [ms] | CPU [ms] | Overhead [ms] |
-| -------------- | --------: | -------: | ------------: |
-| direct         |      40.2 |     31.2 |             - |
-| C++            |      77.0 |     64.6 |         +33.4 |
-| Zig            |      75.5 |     65.6 |         +34.4 |
-| Rust           |      74.8 |     67.7 |         +36.5 |
-| C#             |     119.2 |    117.7 |         +86.5 |
-
-The native shims are statistically indistinguishable (their inter-quartile ranges overlap). C# pays .NET Framework runtime startup on every launch.
-
 ## Development
 
 - C# developer guide: [`cs/README.md`](cs/README.md)
 - C++ developer guide: [`cpp/README.md`](cpp/README.md)
 - Rust developer guide: [`rust/README.md`](rust/README.md)
 - Zig developer guide: [`zig/README.md`](zig/README.md)
+- Design rationale: [`DESIGN.md`](DESIGN.md)
+- Agent conventions: [`AGENTS.md`](AGENTS.md)
 - Test suite: [`test/run-tests.ps1`](test/run-tests.ps1)
-- Startup benchmark: [`benchmark/README.md`](benchmark/README.md)
+- Startup cost: [`benchmark/README.md`](benchmark/README.md)
 - Tag-based release routing:
   - `cs/v<version>` → C# release lane
   - `cpp/v<version>` → C++ release lane
@@ -110,15 +96,15 @@ All `build.ps1` scripts accept `-Target x86|x64|arm64` and `-Configuration Debug
 
 ## Special Thanks
 
-This repository builds upon the work of several independent projects that pioneered faster, more reliable Scoop shims:
+This repository builds on these earlier implementations:
 
-- **[71/scoop-better-shimexe](https://github.com/71/scoop-better-shimexe)** — The groundbreaking C implementation that solved Ctrl+C passthrough and eliminated .NET startup overhead.
+- **[71/scoop-better-shimexe](https://github.com/71/scoop-better-shimexe)** -- C implementation that solved Ctrl+C passthrough and dropped the .NET startup cost.
 
-- **[kiennq/scoop-better-shimexe](https://github.com/kiennq/scoop-better-shimexe)** — C++ fork of 71's work, adding MSBuild support and the `cwd` field to the shim format.
+- **[kiennq/scoop-better-shimexe](https://github.com/kiennq/scoop-better-shimexe)** -- C++ fork of 71's, adding MSBuild support and the `cwd` field to the shim format.
 
-- **[zoritle/rshim](https://github.com/zoritle/rshim)** — Rust implementation focused on memory safety and proper UTF-8 BOM handling.
+- **[zoritle/rshim](https://github.com/zoritle/rshim)** -- Rust implementation, memory safety and UTF-8 BOM handling.
 
-- **[svercl/zshim](https://github.com/svercl/zshim)** — Pure Zig port that proved a shim can be built with zero runtime dependencies.
+- **[svercl/zshim](https://github.com/svercl/zshim)** -- Zig port, showed a shim can be built with no runtime dependency.
 
 ## License
 

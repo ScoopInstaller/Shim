@@ -1,6 +1,6 @@
-# Zig Shim — Development Guide
+# Zig Shim Development Guide
 
-For shim file format and usage, see [../README.md](../README.md).
+Shim file format and usage: [../README.md](../README.md). Design rationale: [../DESIGN.md](../DESIGN.md).
 
 ## Overview
 
@@ -8,7 +8,7 @@ Pure Zig implementation of the Scoop shim, statically linked, zero runtime depen
 
 ## Prerequisites
 
-- **Zig 0.17.0+** — required for building
+- **Zig 0.17.0+** -- required for building
 
 ## Build
 
@@ -32,3 +32,11 @@ cd zig
 ```pwsh
 ..\test\run-tests.ps1 -ShimExe bin\x64\shim.exe
 ```
+
+## Conventions
+
+- A custom `wWinMainCRTStartup` entry point, not `std.start` or `pub fn main()`
+- `.toBool()` on `windows.BOOL` return values, never `@intFromEnum(...) != 0`
+- Split sentinel constants by what they mean even when the values are identical (`INVALID_FILE_SIZE` vs `INFINITE`, both `maxInt(DWORD)`)
+- `pub` only on a type another module actually imports
+- An OR-able bitmask parameter is declared as `DWORD` and passed named `u32` constants such as `GENERIC_READ`; mutually exclusive parameters may use `enum(u32)`
