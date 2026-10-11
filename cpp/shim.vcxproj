@@ -82,7 +82,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
 
-  <!-- Map MSBuild platform names to canonical output dirs (Win32→x86) -->
+  <!-- Map MSBuild platform names to canonical output dirs (Win32->x86) -->
   <PropertyGroup>
     <ShimPlatformDir Condition="'$(Platform)'=='Win32'">x86</ShimPlatformDir>
     <ShimPlatformDir Condition="'$(Platform)'!='Win32'">$(Platform)</ShimPlatformDir>

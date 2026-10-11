@@ -3,7 +3,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::core::BOOL;
@@ -57,6 +57,7 @@ const FILE_SHARE_WRITE: FILE_SHARE_MODE = 2;
 
 const DIR_PLACEHOLDER: &str = "%~dp0";
 
+#[derive(Default)]
 struct ShimInfo {
     path: Option<String>,
     args: Vec<OsString>,
@@ -298,8 +299,12 @@ fn expand_and_strip_quotes(value: &str) -> String {
     result
 }
 
-// Borrows key/value from the line; callers allocate only when storing.
-fn parse_shim_line(line: &str) -> Option<(&str, &str)> {
+const BOM_UTF8: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+struct MalformedLine;
+
+/// Borrows key/value from the line; callers allocate only when storing.
+fn parse_shim_line(line: &str) -> Result<Option<(&str, &str)>, MalformedLine> {
     let line = line.trim_end();
 
     let trimmed = line.trim_start();
@@ -308,16 +313,16 @@ fn parse_shim_line(line: &str) -> Option<(&str, &str)> {
         || trimmed.starts_with(';')
         || trimmed.starts_with("//")
     {
-        return None;
+        return Ok(None);
     }
 
-    let sep_pos = line.find(" = ")?;
+    let sep_pos = line.find('=').ok_or(MalformedLine)?;
     let key = line[..sep_pos].trim();
     if key.is_empty() {
-        return None;
+        return Err(MalformedLine); // "= value" has no key
     }
-    let value = line[sep_pos + 3..].trim_start();
-    Some((key, value))
+    let value = line[sep_pos + 1..].trim_start();
+    Ok(Some((key, value)))
 }
 
 fn parse_args_from_cmdline(cmdline: &str) -> Vec<OsString> {
@@ -523,15 +528,10 @@ unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
 }
 
 fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
-    let mut info = ShimInfo {
-        path: None,
-        args: Vec::new(),
-        cwd: None,
-        env_vars: Vec::new(),
-        elevate: false,
-    };
+    let mut info = ShimInfo::default();
 
-    let file = match File::open(shim_path) {
+    let mut raw = Vec::new();
+    let mut shim_file = match File::open(shim_path) {
         Ok(f) => f,
         Err(e) => {
             let err = e.raw_os_error().unwrap_or(0) as u32;
@@ -544,24 +544,37 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
             return info;
         }
     };
-
-    let reader = BufReader::new(file);
-
-    let mut all_lines: Vec<String> = reader
-        .lines()
-        .filter_map(|l| match l {
-            Ok(line) => Some(line),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                unsafe { write_error_bytes(b"Shim: invalid UTF-8 line in shim file\n") };
-                None
-            }
-            Err(_) => None,
-        })
-        .collect();
-    if let Some(first) = all_lines.first_mut() {
-        if first.starts_with('\u{feff}') {
-            first.remove(0);
+    if let Err(e) = shim_file.read_to_end(&mut raw) {
+        let err = e.raw_os_error().unwrap_or(0) as u32;
+        unsafe {
+            write_error_wide(&to_wide("Shim: Cannot read shim file: '"));
+            write_error_wide(&to_wide(shim_path));
+            write_error_wide(&to_wide("'"));
+            write_error_sys(err);
         }
+        return info;
+    }
+
+    let body: &[u8] = raw.strip_prefix(BOM_UTF8).unwrap_or(&raw);
+
+    let mut all_lines: Vec<&str> = Vec::with_capacity(body.len() / 16 + 1);
+    for chunk in body.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(chunk) else {
+            unsafe { write_error_bytes(b"Shim: invalid UTF-8 line in shim file\n") };
+            continue;
+        };
+        // Classified here, not in a pass: only this loop sees every line.
+        if parse_shim_line(line).is_err() {
+            unsafe {
+                write_error_wide(&to_wide("Shim: malformed line '"));
+                write_error_wide(&to_wide(line.trim_end()));
+                write_error_wide(&to_wide("' in shim file '"));
+                write_error_wide(&to_wide(shim_path));
+                write_error_wide(&to_wide("': expected 'key = value'.\n"));
+            }
+            return ShimInfo::default();
+        }
+        all_lines.push(line);
     }
 
     // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
@@ -569,20 +582,21 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
     // value may itself use %~dp0, which there refers to the shim's own directory.
     let mut target_dir = cur_dir.to_string();
     for line in &all_lines {
-        if let Some((key, value)) = parse_shim_line(line) {
-            if !key.eq_ignore_ascii_case("path") {
-                continue;
-            }
-            let mut path_val = value.to_string();
-            normalize_args_str(&mut path_val, cur_dir);
-            let expanded = expand_and_strip_quotes(&path_val);
-            target_dir = resolve_against_base(&expanded, cur_dir);
-            break;
+        let Ok(Some((key, value))) = parse_shim_line(line) else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("path") {
+            continue;
         }
+        let mut path_val = value.to_string();
+        normalize_args_str(&mut path_val, cur_dir);
+        let expanded = expand_and_strip_quotes(&path_val);
+        target_dir = resolve_against_base(&expanded, cur_dir);
+        break;
     }
 
     for line in &all_lines {
-        let Some((key, value)) = parse_shim_line(line) else {
+        let Ok(Some((key, value))) = parse_shim_line(line) else {
             continue;
         };
 
@@ -606,10 +620,24 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
         } else if key.eq_ignore_ascii_case("elevate") || key.eq_ignore_ascii_case("runas") {
             info.elevate = parse_bool(value);
         } else {
+            const ENV_PREFIX: &str = "env:";
+            let name = key
+                .get(..ENV_PREFIX.len())
+                .filter(|head| head.eq_ignore_ascii_case(ENV_PREFIX))
+                .and_then(|_| key.get(ENV_PREFIX.len()..))
+                .unwrap_or(key);
+            if name.is_empty() {
+                unsafe {
+                    write_error_wide(&to_wide(
+                        "Shim: empty variable name after 'env:' in shim file\n",
+                    ))
+                };
+                continue;
+            }
             let mut env_val = value.to_string();
             normalize_args_str(&mut env_val, &target_dir);
             info.env_vars
-                .push((key.to_string(), expand_and_strip_quotes(&env_val)));
+                .push((name.to_string(), expand_and_strip_quotes(&env_val)));
         }
     }
 

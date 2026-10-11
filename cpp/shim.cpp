@@ -46,14 +46,15 @@ constexpr std::wstring_view c_cwdPrefix = L"cwd"sv;
 constexpr std::wstring_view c_workdirPrefix = L"workdir"sv;
 constexpr std::wstring_view c_elevatePrefix = L"elevate"sv;
 constexpr std::wstring_view c_runasPrefix = L"runas"sv;
-constexpr std::wstring_view c_separator = L" = "sv;
+constexpr std::wstring_view c_envPrefix = L"env:"sv;
+constexpr wchar_t c_keyValueSeparator = L'=';
 
 // iswspace() drags in the UCRT wide-ctype table (large under static CRT).
-// Match the Zig lane's explicit Unicode-whitespace set instead of calling the CRT.
+
 [[nodiscard]] constexpr bool IsWS(wchar_t c) noexcept
 {
-    return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r' || c == L'\v' || c == L'\f' || c == 0x00A0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
-           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+    return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r' || c == L'\v' || c == L'\f' || c == 0x0085 || c == 0x00A0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 }
 
 using EnvVarList = std::vector<std::pair<std::wstring, std::wstring>>;
@@ -230,6 +231,16 @@ inline void ReportShimFileError(const wchar_t* action, const wchar_t* file, DWOR
 [[nodiscard]] bool IEquals(std::wstring_view a, std::wstring_view b) noexcept
 {
     return a.size() == b.size() && CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
+}
+
+void StripPrefixIgnoreCase(std::wstring_view& name, std::wstring_view prefix) noexcept
+{
+    if (name.size() < prefix.size())
+        return;
+
+    const int n = static_cast<int>(prefix.size());
+    if (CompareStringOrdinal(name.data(), n, prefix.data(), n, TRUE) == CSTR_EQUAL)
+        name.remove_prefix(prefix.size());
 }
 
 [[nodiscard]] size_t IFind(std::wstring_view hay, std::wstring_view needle, size_t from) noexcept
@@ -446,7 +457,14 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return resolvedStr.substr(0, dirLen) + L'\\';
 }
 
-[[nodiscard]] std::optional<std::pair<std::wstring_view, std::wstring_view>> ParseShimLine(std::wstring_view line) noexcept
+enum class LineKind
+{
+    Blank,
+    Field,
+    Malformed
+};
+
+[[nodiscard]] LineKind ClassifyShimLine(std::wstring_view line, std::pair<std::wstring_view, std::wstring_view>& out) noexcept
 {
     auto skipWS = [](std::wstring_view s, size_t start = 0) -> size_t {
         while (start < s.size() && IsWS(s[start]))
@@ -460,31 +478,30 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         return i;
     };
 
+    out = {};
     auto first = skipWS(line);
     if (first >= line.size() || line[first] == L'#' || line[first] == L';')
-        return std::nullopt;
+        return LineKind::Blank;
     if (line.substr(first).starts_with(L"//"))
-        return std::nullopt;
+        return LineKind::Blank;
 
-    auto sepPos = line.find(c_separator);
+    auto sepPos = line.find(c_keyValueSeparator);
     if (sepPos == std::wstring_view::npos)
-        return std::nullopt;
+        return LineKind::Malformed;
 
     const auto nameRaw = line.substr(0, sepPos);
-    const auto valueRaw = line.substr(sepPos + c_separator.size());
+    const auto valueRaw = line.substr(sepPos + 1);
 
     auto nameStart = skipWS(nameRaw);
     auto nameEnd = rskipWS(nameRaw);
     if (nameStart >= nameEnd)
-        return std::nullopt;
+        return LineKind::Malformed; // "= value" has no key
     auto name = nameRaw.substr(nameStart, nameEnd - nameStart);
-    if (name.empty())
-        return std::nullopt;
 
     auto valueStart = skipWS(valueRaw);
-    auto value = (valueStart >= valueRaw.size()) ? L""sv : valueRaw.substr(valueStart);
+    out = {name, (valueStart >= valueRaw.size()) ? L""sv : valueRaw.substr(valueStart)};
 
-    return std::pair {name, value};
+    return LineKind::Field;
 }
 
 [[nodiscard]] ShimInfo GetShimInfo()
@@ -561,28 +578,47 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         return {};
     }
 
-    // UTF-8 -> UTF-16. Invalid bytes map to U+FFFD and reading continues; the CRT's
-    // ccs=UTF-8 stream would instead abort fgetws at the first bad sequence.
-    std::vector<wchar_t> text;
-    if (bytesRead > 0)
-    {
-        const int wideLen = MultiByteToWideChar(CP_UTF8, 0, raw.data(), static_cast<int>(bytesRead), nullptr, 0);
-        text.resize(static_cast<size_t>(wideLen));
-        MultiByteToWideChar(CP_UTF8, 0, raw.data(), static_cast<int>(bytesRead), text.data(), wideLen);
-        if (!text.empty() && text[0] == 0xFEFF) // ccs=UTF-8 consumed the BOM; do the same
-            text.erase(text.begin());
-    }
+    // Strict: a line that is not valid UTF-8 is dropped, not decoded into U+FFFD.
+    constexpr std::string_view c_bomUtf8 = "\xEF\xBB\xBF"sv;
+    size_t bytePos = (raw.size() >= c_bomUtf8.size() && std::string_view {raw.data(), c_bomUtf8.size()} == c_bomUtf8) ? c_bomUtf8.size() : 0;
 
-    std::vector<std::wstring_view> allLines;
-    std::wstring_view tv(text.data(), text.size());
-    size_t pos = 0;
-    while (pos < tv.size())
+    std::vector<std::wstring> decoded;
+    decoded.reserve(8);
+    while (bytePos < raw.size())
     {
-        auto nl = tv.find(L'\n', pos);
-        if (nl == std::wstring_view::npos)
-            nl = tv.size();
-        allLines.emplace_back(tv.substr(pos, nl - pos));
-        pos = nl + 1;
+        size_t lineEnd = bytePos;
+        while (lineEnd < raw.size() && raw[lineEnd] != '\n')
+            ++lineEnd;
+        const char* lineData = raw.data() + bytePos;
+        const int lineBytes = static_cast<int>(lineEnd - bytePos);
+        bytePos = lineEnd + 1;
+
+        if (lineBytes == 0)
+            continue;
+
+        const int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, lineData, lineBytes, nullptr, 0);
+        if (wideLen == 0)
+        {
+            WriteErrorW(L"Shim: invalid UTF-8 line in shim file\n");
+            continue;
+        }
+        std::wstring line(static_cast<size_t>(wideLen), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, lineData, lineBytes, line.data(), wideLen);
+
+        // Classified here, not in a pass: only this loop sees every line.
+        std::pair<std::wstring_view, std::wstring_view> field;
+        if (ClassifyShimLine(TrimTrailingWhitespace(line), field) == LineKind::Malformed)
+        {
+            std::wstring msg = L"Shim: malformed line '";
+            msg += TrimTrailingWhitespace(line);
+            msg += L"' in shim file '";
+            msg += filename.data();
+            msg += L"': expected 'key = value'.\n";
+            WriteErrorW(msg.c_str());
+            return {};
+        }
+
+        decoded.push_back(std::move(line));
     }
 
     const std::wstring_view curDir = GetDirectory({filename.data(), filenameSize});
@@ -591,14 +627,13 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     // path to absolute so pass 2 can expand %~dp0 against the right base. A path
     // value may itself use %~dp0, which there refers to the shim's own directory.
     std::wstring targetDir {curDir};
-    for (const auto& rawLine : allLines)
+    for (const auto& rawLine : decoded)
     {
-        auto line = TrimTrailingWhitespace(rawLine);
-        auto parsed = ParseShimLine(line);
-        if (!parsed || !IEquals(parsed->first, c_pathPrefix))
+        std::pair<std::wstring_view, std::wstring_view> field;
+        if (ClassifyShimLine(TrimTrailingWhitespace(rawLine), field) != LineKind::Field || !IEquals(field.first, c_pathPrefix))
             continue;
 
-        std::wstring pathVal(parsed->second);
+        std::wstring pathVal(field.second);
         NormalizeArgsInPlace(pathVal, curDir);
         std::wstring expanded = ExpandAndUnquote(pathVal);
         targetDir = ResolveAgainstBase(expanded, curDir);
@@ -607,14 +642,13 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
     // Second pass: expand all fields using targetDir for %~dp0.
     ShimInfo info;
-    for (const auto& rawLine : allLines)
+    for (const auto& rawLine : decoded)
     {
-        auto line = TrimTrailingWhitespace(rawLine);
-        auto parsed = ParseShimLine(line);
-        if (!parsed)
+        std::pair<std::wstring_view, std::wstring_view> field;
+        if (ClassifyShimLine(TrimTrailingWhitespace(rawLine), field) != LineKind::Field)
             continue;
 
-        const auto& [name, value] = *parsed;
+        const auto& [name, value] = field;
 
         if (IEquals(name, c_pathPrefix))
         {
@@ -656,9 +690,18 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         }
         else
         {
+
+            std::wstring_view envName = name;
+            StripPrefixIgnoreCase(envName, c_envPrefix);
+            if (envName.empty())
+            {
+                WriteErrorW(L"Shim: empty variable name after 'env:' in shim file\n");
+                continue;
+            }
+
             std::wstring envVal(value);
             NormalizeArgsInPlace(envVal, targetDir);
-            info.envVars.emplace_back(std::wstring(name), ExpandAndUnquote(envVal));
+            info.envVars.emplace_back(std::wstring(envName), ExpandAndUnquote(envVal));
         }
     }
 

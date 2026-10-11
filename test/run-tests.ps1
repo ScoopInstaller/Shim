@@ -293,6 +293,81 @@ Invoke-ShimTest "Env var value %~dp0 expansion (multiple occurrences)" -Setup {
     @{ Pass = $r.Output -match [regex]::Escape("MY_D=$expected"); Message = "Expected: MY_D=$expected, Output: $($r.Output)" }
 }
 
+# --- env: prefix (force a reserved key to be an environment variable) -----------
+
+Invoke-ShimTest "env: prefix does not hijack the shim path" -Setup {
+    param($d)
+    # env:path comes first on purpose: a strip done inside the line parser would
+    # make it the target path and the shim would fail to launch. A bare "env:" has
+    # no name, so it is reported and skipped rather than defining a junk variable.
+    Write-Shim $d "test" "env:path = C:\nonexistent\fake.exe`nenv: = noname`npath = $probeExe`nargs = echo TARGET_OK"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "TARGET_OK") -and ($r.Output -match "empty variable name after 'env:'")
+    @{ Pass = $pass; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "env: prefix overrides a reserved key" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = env PATH`nenv:PATH = %PATH%;ZZZ_ENV_APPENDED"
+} -Assert {
+    param($r)
+    # The child's PATH keeps the inherited spelling ("Path"), so only the value is
+    # asserted: it must still start with the inherited PATH and carry the suffix.
+    $out = $r.Output.TrimEnd()
+    $val = $out.Substring($out.IndexOf('=') + 1)
+    $pass = $val.StartsWith("$($env:PATH);") -and $val.EndsWith("ZZZ_ENV_APPENDED")
+    @{ Pass = $pass; Message = "Expected value '$($env:PATH);ZZZ_ENV_APPENDED', Output: $($r.Output)" }
+}
+
+# probe env dumps the child's own block, so the stored spelling is matched exactly;
+# a %VAR% lookup could not tell lowercase from mixed case.
+Invoke-ShimTest "env: prefix is case-insensitive and preserves the name" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = env`nenv:LOW = a`nEnv:MID = b`nENV:UP = c`neNv:MiXeD = d"
+} -Assert {
+    param($r)
+    $lines = $r.Output -split "`r?`n"
+    $expected = @("LOW=a", "MID=b", "UP=c", "MiXeD=d")
+    $missing = @($expected | Where-Object { $lines -cnotcontains $_ })
+    @{ Pass = $missing.Count -eq 0; Message = "Missing from child env: $($missing -join ', ')" }
+}
+
+# --- Line grammar --------------------------------------------------------------
+
+Invoke-ShimTest "Key/value separator accepts no spaces" -Setup {
+    param($d)
+    Write-Shim $d "test" "path=$probeExe`nargs=args fromfile"
+} -RunArgs @("fromuser") -Assert {
+    param($r)
+    # Shim args must precede user args, and the no-space key/value form must parse.
+    $pass = ($r.Output -match '(?m)^Arg 0 is <fromfile>\r?$') -and ($r.Output -match '(?m)^Arg 1 is <fromuser>\r?$')
+    @{ Pass = $pass; Message = "Expected 'Arg 0 is <fromfile>' and 'Arg 1 is <fromuser>', Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "Case-variant env names keep the first spelling, last value" -Setup {
+    param($d)
+    # The full environment-block dump is matched case-sensitively: a %VAR% lookup
+    # cannot tell spellings apart, because Windows resolves names case-insensitively.
+    Write-Shim $d "test" "path = $probeExe`nargs = env`nenv:MARK = one`nenv:mark = two"
+} -Assert {
+    param($r)
+    $lines = $r.Output -split "`r?`n"
+    $pass = ($lines -ccontains "MARK=two") -and -not ($lines -ccontains "mark=two")
+    @{ Pass = $pass; Message = "Expected exactly 'MARK=two' in the child env, Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "Line without '=' is reported as malformed" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = echo TARGET_OK`nthis line is broken"
+} -Assert {
+    param($r)
+    # Count, not just match: the check must fire once, not once per pass.
+    $pass = ($r.ExitCode -ne 0) -and ($r.Output -match "malformed line 'this line is broken'") -and
+            ($r.Output -notmatch "TARGET_OK") -and ([regex]::Matches($r.Output, "malformed line").Count -eq 1)
+    @{ Pass = $pass; Message = "Expected exit!=0 and exactly one malformed-line error, Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
 # --- Case-insensitivity (Windows convention) -----------------------------------
 
 Invoke-ShimTest "Case-insensitive .shim parsing" -Setup {
@@ -453,12 +528,15 @@ Invoke-ShimTest "Invalid UTF-8 line skipped without abort" -Setup {
     Copy-Item $ShimExe "$d\test.exe"
     # path, then a line with an invalid UTF-8 sequence (C3 28), then args
     $bytes = [byte[]](0x70,0x61,0x74,0x68,0x20,0x3D,0x20) + [System.Text.Encoding]::UTF8.GetBytes("$probeExe") +
-        [byte[]](0x0A,0xC3,0x28,0x20,0x3D,0x20,0x62,0x61,0x64,0x0A) +
+        [byte[]](0x0A,0xC3,0x28,0x20,0x3D,0x20,0x5A,0x5A,0x5A,0x0A) +
         [System.Text.Encoding]::UTF8.GetBytes("args = args AFTER_BAD_LINE")
     [System.IO.File]::WriteAllBytes("$d\test.shim", $bytes)
 } -Assert {
     param($r)
-    @{ Pass = ($r.Output -match '(?m)^Arg 0 is <AFTER_BAD_LINE>\r?$') -and ($r.ExitCode -eq 0); Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+    # The line is reported and dropped, not decoded into U+FFFD and set as a variable.
+    $pass = ($r.Output -match '(?m)^Arg 0 is <AFTER_BAD_LINE>\r?$') -and ($r.ExitCode -eq 0) -and
+            ($r.Output -match "invalid UTF-8 line in shim file") -and ($r.Output -notmatch "=ZZZ")
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
 # --- Blank line handling --------------------------------------------------------
@@ -470,6 +548,21 @@ Invoke-ShimTest "Blank lines in shim file" -Setup {
     param($r)
     $pass = ($r.Output -match "BLANKLINE_OK") -and ($r.ExitCode -eq 0)
     @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
+Invoke-ShimTest "Line of U+180E is not blank" -Setup {
+    param($d)
+    Copy-Item $ShimExe "$d\test.exe"
+    # U+180E is not in the fixed whitespace set, so a line holding only it is
+    # malformed, not blank. Char.IsWhiteSpace has answered both ways for it
+    # across .NET versions, which is why no lane may delegate to it.
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("path = $probeExe`nargs = echo NEVER_REACHED`n") +
+        [System.Text.Encoding]::UTF8.GetBytes([string][char]0x180E)
+    [System.IO.File]::WriteAllBytes("$d\test.shim", $bytes)
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "malformed line") -and ($r.Output -notmatch "NEVER_REACHED")
+    @{ Pass = $pass; Message = "Expected exit 1 and a malformed-line error, Exit: $($r.ExitCode), Output: $($r.Output)" }
 }
 
 # --- Exit code width ------------------------------------------------------------

@@ -14,6 +14,14 @@ elevate = true|false|1|0|yes|no
 NAME = <environment variable override>
 ```
 
+### File Encoding
+
+The file is read as UTF-8, with or without a byte order mark; plain ASCII is fine. Line endings may be LF or CRLF.
+
+### Line Format
+
+A field is `key = value`, where the separator is the **first** `=` and spaces around it are optional -- `path = app.exe` and `path=app.exe` are the same field. The key is trimmed of surrounding whitespace, the value of leading whitespace. Any line that is not blank, a comment, or a field is a broken shim: the shim reports the offending line and exits with code 1 without starting the target.
+
 ### Comments
 
 Lines whose first non-whitespace characters are `#`, `;`, or `//`, as well as blank lines, are ignored.
@@ -43,7 +51,14 @@ User-provided runtime arguments are appended after those defined in `args`.
 
 ### Environment Variables
 
-Any line whose key is not `path`, `args`, `cwd`, `workdir`, `elevate`, or `runas` is treated as an environment variable override for the child process. Keys are case-insensitive.
+Any line whose key is not `path`, `args`, `cwd`, `workdir`, `elevate`, or `runas` is an environment variable override for the child process. To set one of those names as a variable rather than as the field, prefix the key with `env:`:
+
+```text
+path = %~dp0tool.exe
+env:PATH = %PATH%;%~dp0
+```
+
+The prefix is stripped case-insensitively and the remainder is the variable name verbatim. Duplicate names: the last definition wins.
 
 ### Exit Codes
 

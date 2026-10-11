@@ -60,6 +60,8 @@ const CTRL_SHUTDOWN_EVENT = 6;
 /// Compile-time UTF-8 -> WCHAR literal.
 const w = std.unicode.utf8ToUtf16LeStringLiteral;
 
+const env_prefix = w("env:");
+
 extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) ?HANDLE;
 extern "kernel32" fn WriteFile(
     hFile: HANDLE,
@@ -316,9 +318,10 @@ fn getDirectory(exe: []const WCHAR) []const WCHAR {
     return exe;
 }
 
-// Unicode whitespace, not just ASCII.
+// Unicode White_Space, not just ASCII.
 fn isWS(ch: WCHAR) bool {
     return ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or
+        ch == 0x0B or ch == 0x0C or ch == 0x0085 or
         ch == 0x00A0 or ch == 0x1680 or
         (ch >= 0x2000 and ch <= 0x200A) or ch == 0x2028 or ch == 0x2029 or
         ch == 0x202F or ch == 0x205F or ch == 0x3000;
@@ -333,6 +336,11 @@ fn trimTrailingWhitespace(sv: []const WCHAR) []const WCHAR {
 fn eqlIgnoreCase(a: []const WCHAR, b: []const WCHAR) bool {
     if (a.len != b.len) return false;
     return CompareStringOrdinal(a.ptr, @intCast(a.len), b.ptr, @intCast(b.len), .TRUE) == CSTR_EQUAL;
+}
+
+fn stripPrefixIgnoreCase(s: []const WCHAR, prefix: []const WCHAR) []const WCHAR {
+    if (s.len < prefix.len or !eqlIgnoreCase(s[0..prefix.len], prefix)) return s;
+    return s[prefix.len..];
 }
 
 fn indexOfIgnoreCase(hay: []const WCHAR, needle: []const WCHAR, from: usize) ?usize {
@@ -559,28 +567,28 @@ const ShimInfo = struct {
     }
 };
 
-fn skipLineEndings(buf: []const u8, line_end: usize) usize {
-    var pos = line_end + 1;
-    while (pos < buf.len and (buf[pos] == '\n' or buf[pos] == '\r')) : (pos += 1) {}
-    return pos;
-}
-
 fn trimLeadingWhitespace(sv: []const WCHAR) []const WCHAR {
     var start: usize = 0;
     while (start < sv.len and isWS(sv[start])) : (start += 1) {}
     return sv[start..];
 }
 
-fn parseShimLine(line: []const WCHAR) ?struct { name: []const WCHAR, value: []const WCHAR } {
+const LineKind = enum { blank, field, malformed };
+const ShimLine = struct { name: []const WCHAR, value: []const WCHAR };
+
+const key_value_separator: WCHAR = '=';
+
+const bom_utf8: []const u8 = &[_]u8{ 0xEF, 0xBB, 0xBF };
+
+fn parseShimLine(line: []const WCHAR, out: *ShimLine) LineKind {
     const trimmed = trimLeadingWhitespace(trimTrailingWhitespace(line));
-    if (trimmed.len == 0 or trimmed[0] == '#' or trimmed[0] == ';') return null;
-    if (trimmed.len >= 2 and trimmed[0] == '/' and trimmed[1] == '/') return null;
-    const sep = w(" = ");
-    const pos = std.mem.indexOf(WCHAR, trimmed, sep) orelse return null;
+    if (trimmed.len == 0 or trimmed[0] == '#' or trimmed[0] == ';') return .blank;
+    if (trimmed.len >= 2 and trimmed[0] == '/' and trimmed[1] == '/') return .blank;
+    const pos = std.mem.indexOfScalar(WCHAR, trimmed, key_value_separator) orelse return .malformed;
     const name = trimTrailingWhitespace(trimmed[0..pos]);
-    const value = trimLeadingWhitespace(trimmed[pos + sep.len ..]);
-    if (name.len == 0) return null;
-    return .{ .name = name, .value = value };
+    if (name.len == 0) return .malformed; // "= value" has no key
+    out.* = .{ .name = name, .value = trimLeadingWhitespace(trimmed[pos + 1 ..]) };
+    return .field;
 }
 
 /// Returns the *directory* portion (trailing backslash), not the resolved path. Caller owns it.
@@ -696,35 +704,42 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
     }
 
     // Decode every line once into the arena; expansion passes then work on UTF-16 slices.
-    const Line = struct { name: []const WCHAR, value: []const WCHAR };
-    var lines: std.ArrayListUnmanaged(Line) = .empty;
+    var lines: std.ArrayListUnmanaged(ShimLine) = .empty;
 
     {
-        var first = true;
-        var pos: usize = 0;
+        var pos: usize = if (bytes_read >= bom_utf8.len and std.mem.eql(u8, file_buf[0..bom_utf8.len], bom_utf8)) bom_utf8.len else 0;
         while (pos < bytes_read) {
             var le = pos;
-            while (le < bytes_read and file_buf[le] != '\n' and file_buf[le] != '\r') le += 1;
+            // LF only, like the other lanes: a trailing CR is trimmed as whitespace.
+            while (le < bytes_read and file_buf[le] != '\n') le += 1;
             if (le > pos) {
                 const line_bytes = file_buf[pos..le];
                 // One UTF-16 unit per byte worst case, sized from the byte length.
                 const lw = try allocator.alloc(WCHAR, line_bytes.len + 8);
                 const wlen = std.unicode.utf8ToUtf16Le(lw, line_bytes) catch {
                     writeError("Shim: invalid UTF-8 line in shim file\n");
-                    pos = skipLineEndings(file_buf, le);
+                    pos = le + 1;
                     continue;
                 };
-                var pl = trimTrailingWhitespace(lw[0..wlen]);
-                if (first and pl.len > 0 and pl[0] == 0xFEFF) pl = pl[1..];
-                first = false;
-                if (parseShimLine(pl)) |p| {
-                    try lines.append(allocator, .{
-                        .name = try allocator.dupe(WCHAR, p.name),
-                        .value = try allocator.dupe(WCHAR, p.value),
-                    });
+                const pl = trimTrailingWhitespace(lw[0..wlen]);
+                var field: ShimLine = undefined;
+                switch (parseShimLine(pl, &field)) {
+                    .field => try lines.append(allocator, .{
+                        .name = try allocator.dupe(WCHAR, field.name),
+                        .value = try allocator.dupe(WCHAR, field.value),
+                    }),
+                    .blank => {},
+                    .malformed => {
+                        writeError("Shim: malformed line '");
+                        writeErrorUtf8(pl);
+                        writeError("' in shim file '");
+                        writeErrorUtf8(filename[0..shim_name_len]);
+                        writeError("': expected 'key = value'.\n");
+                        return info;
+                    },
                 }
             }
-            pos = skipLineEndings(file_buf, le);
+            pos = le + 1;
         }
     }
 
@@ -769,8 +784,13 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         {
             info.elevate = parseBool(value);
         } else {
+            const env_name = stripPrefixIgnoreCase(name, env_prefix);
+            if (env_name.len == 0) {
+                writeError("Shim: empty variable name after 'env:' in shim file\n");
+                continue;
+            }
             const expanded = try expandPlaceholder(allocator, value, targetDir);
-            try info.env_vars.append(allocator, .{ .name = try allocator.dupe(WCHAR, name), .value = try expandEnvVarsAndUnquote(allocator, expanded) });
+            try info.env_vars.append(allocator, .{ .name = try allocator.dupe(WCHAR, env_name), .value = try expandEnvVarsAndUnquote(allocator, expanded) });
         }
     }
 

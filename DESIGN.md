@@ -55,14 +55,48 @@ The standard handles are seeded from the shim's own only where the creator left 
 
 ### Reading it
 
+**Lines are decoded one at a time, strictly.** A line that is not valid UTF-8 is reported as `Shim: invalid UTF-8 line in shim file` and dropped; the rest of the file still loads. Converting the whole file in one call is simpler and *wrong*: it replaces the bad bytes with U+FFFD, producing an environment variable whose name the user can neither type nor reference. A variable you cannot name is indistinguishable from a bug.
+
+**A byte order mark is skipped off the front of the raw bytes**, before lines are split out, rather than by checking whether a decoded line is the first one. A BOM only ever appears at byte 0, so tracking "is this the first line" would be state the format never needs -- and state that four implementations would have to agree on.
+
 **Line endings are LF and CRLF.** Every implementation splits on `\n` and drops a trailing `\r` as whitespace.
+
+**The set of characters that count as whitespace is fixed.** A line holding only whitespace is a blank line, so the set decides whether such a line is ignored or treated as a fatal one. It is the full 25-code-point Unicode White_Space set, and every lane has to agree on it exactly: a set that is too small turns a blank line into a fatal one in some implementations and not others.
+
+### Line format
+
+The separator is the **first** `=`, and spaces around it are optional, so `path = app.exe`, `path=app.exe` and `path =app.exe` all mean the same thing. Splitting on the first `=` leaves the value free to contain more `=`, which matters for `args` -- `--flag=a=b` must survive intact.
+
+The line is right-trimmed before it is split, so trailing spaces in a value are eaten -- and have to be, because a trailing space would otherwise defeat the double-quote unquote test on a `path` value. The key is trimmed on both sides and the value on the left, so a misindented key still works.
+
+**A line that is not blank, a comment, or a field is fatal.** The shim reports the line and the shim's own path, then exits 1 without starting anything. A shim file has no legitimate content beyond fields and comments, so such a line means the file is broken -- and the worst outcome for a launcher is to ignore the breakage and run a half-configured program. Failing loudly costs one visible error instead of a mystery.
+
+The check runs while the file is being read, the one place that sees every line. It cannot live in either of the later expansion passes: the one that resolves the target `path` stops as soon as it finds it, so it would miss a bad line further down; the one that reads every field would report the same line twice.
 
 ### Two passes over the fields
 
 `%~dp0` means the **shim's own directory** inside `path`, and the **target's directory** everywhere else. The target's directory is not known until `path` has been resolved, so the first pass finds and absolutises `path` and the second expands every other field against it. That is the only reason the parser needs two passes, and it is why `%~dp0` means two different things in the same file.
+
+### The `env:` prefix
+
+Reserved keys are matched case-insensitively, so `PATH = x` is the `path` field: it overwrites the target executable instead of the `PATH` variable. There is no way to override `PATH` otherwise, and the same would be true of every field added later. `env:` forces the key to be an environment variable name; the prefix is stripped case-insensitively and the remainder is used verbatim. It never reaches the reserved-key table, so no field can shadow it and adding one later cannot break a shim that already uses it.
+
+### Traps
+
+Each of these was a real bug at least once.
+
+1. **Strip the prefix constant, never a literal length.** Cutting `env:` itself means the length and the comparison cannot drift apart; a hardcoded length silently truncates variable names.
+2. **Strip in the key dispatch, not in the line parser.** The first expansion pass scans for `path` alone to resolve the target's directory. A strip in the parser hands it `env:path` instead, and the shim launches whatever that points at.
+3. **Share the value pipeline.** An `env:` value goes through the same expansion and unquoting as any other. A second code path for it will drift, and it will only ever fail for the new syntax.
+4. **The prefix guard must accept the prefix as the whole key.** A stricter guard makes the empty-name check unreachable, and `env:` then quietly defines a junk variable instead of saying anything.
+5. **A bare `env:` is not fatal.** It names no variable, so the line is reported and skipped and the target still starts. That is a different failure from a malformed line, and merging the two turns a typo into an outage.
 
 ### Expansion
 
 All `%VAR%` in a value expand when the file is read, against the environment the shim was started in. Every value therefore sees the same starting environment, which makes a shim file order-independent -- and means a value cannot reference a variable the shim itself defines. Expanding as each line was applied instead would make the file's meaning depend on line order.
 
 `args` is the exception and is passed through unexpanded, so the child can expand `%VAR%` itself against the environment it actually receives.
+
+## Errors
+
+A syntax error in the shim file is fatal: the shim reports it, exits 1, and never starts the target. A problem with one line -- an undecodable line, an `env:` key with no name, a variable the platform refuses -- is reported and that line is skipped. Nothing else stops the launch.

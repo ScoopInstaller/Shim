@@ -335,7 +335,9 @@ namespace Scoop
         static bool ParseBool(string value)
         {
             if (string.IsNullOrEmpty(value)) return false;
-            var lower = value.Trim().ToLowerInvariant();
+            // Already trimmed by ParseShimLine with the fixed set; a Trim() here
+            // would consult the runtime's tables instead.
+            var lower = value.ToLowerInvariant();
             return lower == "true" || lower == "1" || lower == "yes";
         }
 
@@ -510,23 +512,60 @@ namespace Scoop
             return result;
         }
 
-        static bool TryParseLine(string rawLine, out string? key, out string? value)
+        static string StripKeyPrefix(string key, string prefix)
+        {
+            return key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                ? key.Substring(prefix.Length)
+                : key;
+        }
+
+        enum LineKind { Blank, Field, Malformed }
+
+        // The fixed Unicode White_Space set the shim format specifies. Trim()'s
+        // Char.IsWhiteSpace follows the runtime's Unicode tables instead, which
+        // have answered differently for U+180E across .NET versions.
+        static bool IsWS(char c)
+        {
+            return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+                || c == '\u0085' || c == '\u00A0' || c == '\u1680'
+                || (c >= '\u2000' && c <= '\u200A') || c == '\u2028' || c == '\u2029'
+                || c == '\u202F' || c == '\u205F' || c == '\u3000';
+        }
+
+        static string TrimEndWS(string s)
+        {
+            int end = s.Length;
+            while (end > 0 && IsWS(s[end - 1])) end--;
+            return end == s.Length ? s : s.Substring(0, end);
+        }
+
+        static string TrimStartWS(string s)
+        {
+            int start = 0;
+            while (start < s.Length && IsWS(s[start])) start++;
+            return start == 0 ? s : s.Substring(start);
+        }
+
+        static LineKind ParseShimLine(string rawLine, out string? key, out string? value)
         {
             key = null; value = null;
-            var line = rawLine.TrimEnd();
+            var line = TrimEndWS(rawLine);
 
-            var trimmed = line.TrimStart();
+            var trimmed = TrimStartWS(line);
             if (trimmed.Length == 0 || trimmed[0] == '#' || trimmed[0] == ';' || trimmed.StartsWith("//"))
-                return false;
+                return LineKind.Blank;
 
-            int sepPos = line.IndexOf(" = ", StringComparison.Ordinal);
-            if (sepPos < 0) return false;
+            int sepPos = line.IndexOf('=');
+            if (sepPos < 0) return LineKind.Malformed;
 
-            key = line.Substring(0, sepPos).Trim();
-            if (string.IsNullOrEmpty(key)) { key = null; return false; }
-
-            value = line.Substring(sepPos + 3).TrimStart();
-            return true;
+            key = TrimStartWS(TrimEndWS(line.Substring(0, sepPos)));
+            if (key.Length == 0)
+            {
+                key = null;
+                return LineKind.Malformed;
+            }
+            value = TrimStartWS(line.Substring(sepPos + 1));
+            return LineKind.Field;
         }
 
         static void EnsureStandardHandles(ref STARTUPINFO si)
@@ -579,10 +618,10 @@ namespace Scoop
             int dot = exePath.LastIndexOf('.');
             var configPath = (dot >= 0 ? exePath.Substring(0, dot) : exePath) + ".shim";
 
-            string[] lines;
+            byte[] raw;
             try
             {
-                lines = File.ReadAllLines(configPath);
+                raw = File.ReadAllBytes(configPath);
             }
             catch (Exception ex)
             {
@@ -591,12 +630,45 @@ namespace Scoop
                 return new ShimInfo();
             }
 
+            // Strict: a line that is not valid UTF-8 is dropped, not decoded into U+FFFD.
+            var strictUtf8 = new UTF8Encoding(false, true);
+            var lines = new List<string>();
+            int start = raw.Length >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF ? 3 : 0;
+            for (int i = start; i <= raw.Length; i++)
+            {
+                bool atEnd = i == raw.Length;
+                if (!atEnd && raw[i] != (byte)'\n') continue;
+
+                int count = i - start;
+                start = i + 1;
+                if (count == 0) continue;
+
+                string text;
+                try
+                {
+                    text = strictUtf8.GetString(raw, i - count, count);
+                }
+                catch (DecoderFallbackException)
+                {
+                    WriteErrorW("Shim: invalid UTF-8 line in shim file\n");
+                    continue;
+                }
+
+                // Classified here, not in a pass: only this loop sees every line.
+                if (ParseShimLine(text, out _, out _) == LineKind.Malformed)
+                {
+                    WriteErrorW("Shim: malformed line '" + text.TrimEnd() + "' in shim file '" + configPath + "': expected 'key = value'.\n");
+                    return new ShimInfo();
+                }
+                lines.Add(text);
+            }
+
             // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
             // path to absolute so pass 2 can expand %~dp0 against the right base.
             var targetDir = dir;
             foreach (var rawLine in lines)
             {
-                if (!TryParseLine(rawLine, out var key, out var value) || !IsKey(key, "path"))
+                if (ParseShimLine(rawLine, out var key, out var value) != LineKind.Field || !IsKey(key, "path"))
                     continue;
 
                 // %~dp0 in the path field refers to the shim's own dir.
@@ -609,7 +681,7 @@ namespace Scoop
 
             foreach (var rawLine in lines)
             {
-                if (!TryParseLine(rawLine, out var key, out var value)) continue;
+                if (ParseShimLine(rawLine, out var key, out var value) != LineKind.Field) continue;
 
                 if (IsKey(key, "path"))
                 {
@@ -637,7 +709,13 @@ namespace Scoop
                 }
                 else
                 {
-                    info.EnvVars[key!] = ExpandAndUnquote(NormalizeArgs(value!, targetDir));
+                    var name = StripKeyPrefix(key!, "env:");
+                    if (name.Length == 0)
+                    {
+                        WriteErrorW("Shim: empty variable name after 'env:' in shim file\n");
+                        continue;
+                    }
+                    info.EnvVars[name] = ExpandAndUnquote(NormalizeArgs(value!, targetDir));
                 }
             }
 
