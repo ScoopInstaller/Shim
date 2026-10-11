@@ -132,6 +132,10 @@ namespace Scoop
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
+
         // --- P/Invoke: Console ---
 
         delegate bool HandlerRoutine(uint dwCtrlType);
@@ -764,7 +768,17 @@ namespace Scoop
                         ReportShimError("Could not assign process to job object", (uint)Marshal.GetLastWin32Error());
                 }
 
-                ResumeThread(pi.hThread);
+                // A failed resume leaves the child suspended while the shim waits on it forever.
+                if (ResumeThread(pi.hThread) == uint.MaxValue)
+                {
+                    uint resumeErr = (uint)Marshal.GetLastWin32Error();
+                    ReportShimError("Could not resume suspended process", resumeErr);
+                    if (jobHandle != IntPtr.Zero)
+                        TerminateJobObject(jobHandle, 1);
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                    return 1;
+                }
 
                 CloseHandle(pi.hThread);
 

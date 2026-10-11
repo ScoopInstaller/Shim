@@ -109,6 +109,7 @@ extern "kernel32" fn SetInformationJobObject(
     cbJobObjectInformationLength: DWORD,
 ) callconv(.winapi) BOOL;
 extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
+extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: u32) callconv(.winapi) BOOL;
 extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) callconv(.winapi) BOOL;
 extern "kernel32" fn ResumeThread(hThread: HANDLE) callconv(.winapi) DWORD;
@@ -929,7 +930,20 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
                 writeErrorSys(job_err);
             }
         }
-        _ = ResumeThread(pi.hThread);
+        // A failed resume would leave the shim blocked in WaitForSingleObject forever.
+        if (ResumeThread(pi.hThread) == 0xFFFFFFFF) {
+            const resume_err = GetLastError();
+            writeError("Shim: Could not resume suspended process");
+            writeErrorSys(resume_err);
+            if (job_handle) |jh| {
+                _ = TerminateJobObject(jh, 1);
+            }
+            _ = windows.CloseHandle(pi.hThread);
+            _ = windows.CloseHandle(pi.hProcess);
+            result.process = null;
+            result.thread = null;
+            return result;
+        }
     } else {
         const err = GetLastError();
         if (err == ERROR_ELEVATION_REQUIRED) {
