@@ -621,8 +621,10 @@ namespace Scoop
             int sep = Math.Max(exePath.LastIndexOf('\\'), exePath.LastIndexOf('/'));
             if (sep >= 0) dir = exePath.Substring(0, sep);
 
+            // Only replace the extension of the file name, not a dot in a parent directory.
+            int nameStart = Math.Max(exePath.LastIndexOf('\\'), exePath.LastIndexOf('/')) + 1;
             int dot = exePath.LastIndexOf('.');
-            var configPath = (dot >= 0 ? exePath.Substring(0, dot) : exePath) + ".shim";
+            var configPath = (dot >= nameStart ? exePath.Substring(0, dot) : exePath) + ".shim";
 
             byte[] raw;
             try

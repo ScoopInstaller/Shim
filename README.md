@@ -68,6 +68,8 @@ The shim waits for the child process to finish and forwards its exit code, inclu
 
 ## Usage
 
+The `.shim` file is found next to the executable: take the executable's own path, replace the extension of the final path component with `.shim`, or append `.shim` if that component has no dot. A dot in a parent directory is not an extension. Copying a lane's `shim.exe` to `test.exe` therefore pairs it with `test.shim`.
+
 ```pwsh
 New-Item -Path test.shim -Value 'path = C:\Windows\System32\calc.exe'
 Copy-Item -Path .\cpp\bin\x64\shim.exe -Destination .\test.exe

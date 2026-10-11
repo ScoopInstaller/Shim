@@ -199,6 +199,27 @@ Invoke-ShimTest "path value with quotes stripped" -Setup {
     Write-Shim $d "test" "path = `"$probeExe`"`nargs = echo PATH_QUOTE_OK"
 } -Assert { param($r) $r.Output -match "PATH_QUOTE_OK" }
 
+# Invoke-ShimTest hardcodes test.exe, so a .shim name derived from a dotted directory
+# and a missing extension needs its own harness. The probe launches it because a
+# no-extension image is not executable through PowerShell or cmd.
+$script:TestNumber++
+$num = $script:TestNumber
+$testDir = New-TestEnvironment
+try {
+    $dotDir = Join-Path $testDir "has.dot"
+    New-Item -ItemType Directory -Path $dotDir -Force | Out-Null
+    Copy-Item $ShimExe "$dotDir\app"
+    $marker = Join-Path $testDir "dotdir.marker"
+    Set-Content -Path "$dotDir\app.shim" -Value "path = $probeExe`nargs = touch $marker"
+
+    & $probeExe create "$dotDir\app" --default 2>&1 | Out-Null
+    $pass = ($LASTEXITCODE -eq 0) -and (Test-Path $marker)
+    Write-TestResult "#$num .shim name from the final path component" $pass "Exit: $LASTEXITCODE, marker: $(Test-Path $marker)"
+}
+finally {
+    Remove-TestEnvironment $testDir
+}
+
 # The one test that keeps a .cmd target. Scoop never pairs shim.exe with a batch file,
 # so only a hand-written .shim reaches it -- but nothing else here would notice if
 # CreateProcessW stopped launching it. Argument handling is deliberately not asserted:

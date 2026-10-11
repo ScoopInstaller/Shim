@@ -545,9 +545,21 @@ enum class LineKind
         return {};
     }
 
-    // Overwrite the ".exe" suffix in place with "shim" (4 chars + null).
-    std::wmemcpy(filename.data() + filenameSize - 3, L"shim", 4);
-    filename[filenameSize + 1] = L'\0';
+    // Only replace the extension of the file name, not a dot in a parent directory.
+    {
+        std::wstring shimPath(filename.data(), filenameSize);
+        size_t compStart = shimPath.find_last_of(L"\\/");
+        compStart = (compStart == std::wstring::npos) ? 0 : compStart + 1;
+        const size_t dot = shimPath.rfind(L'.');
+        if (dot != std::wstring::npos && dot >= compStart)
+            shimPath.replace(dot, std::wstring::npos, L".shim");
+        else
+            shimPath += L".shim";
+
+        filenameSize = static_cast<DWORD>(shimPath.size());
+        filename.assign(shimPath.begin(), shimPath.end());
+        filename.push_back(L'\0');
+    }
 
     // Raw ReadFile instead of stdio: the CRT's FILE machinery and ccs=UTF-8 decoder
     // are dead weight under a static CRT, and _wfopen_s reports errno instead of a
