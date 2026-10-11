@@ -47,7 +47,7 @@ Values may be wrapped in double quotes (e.g. `path = "C:\Program Files\app.exe"`
 
 ### Argument Parsing
 
-User-provided runtime arguments are appended after those defined in `args`.
+User-provided runtime arguments are appended after those defined in `args`. Duplicate `args` keys accumulate in file order: `args` is the only list-valued field, so a repeated key appends, while every repeated scalar key except `path` takes its last value (`path` is first-wins, as stated above). An empty `args` value contributes nothing.
 
 ### Environment Variables
 

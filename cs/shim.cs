@@ -705,7 +705,7 @@ namespace Scoop
                 {
                     string normalized = NormalizeArgs(value!, targetDir);
                     if (!string.IsNullOrEmpty(normalized))
-                        info.Args = ParseArgsFromCmdLine(normalized);
+                        info.Args.AddRange(ParseArgsFromCmdLine(normalized));
                 }
                 else if (IsKey(key, "cwd") || IsKey(key, "workdir"))
                 {

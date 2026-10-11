@@ -477,6 +477,19 @@ Invoke-ShimTest "Shim args with trailing backslash and embedded quote" -Setup {
             ($r.Output -match [regex]::Escape('Arg 1 is <a\"b>'))
     @{ Pass = $pass; Message = "Output: $($r.Output)" }
 }
+
+# --- Duplicate keys ------------------------------------------------------------
+
+Invoke-ShimTest "Duplicate args keys accumulate in file order" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = args --one`nargs = --two"
+} -Assert {
+    param($r)
+    # args is the only list-valued field, so a repeated key appends rather than overrides.
+    $pass = ($r.Output -match '(?m)^Arg 0 is <--one>\r?$') -and ($r.Output -match '(?m)^Arg 1 is <--two>\r?$')
+    @{ Pass = $pass; Message = "Expected --one then --two, got: $($r.Output)" }
+}
+
 # --- Exit code & I/O -----------------------------------------------------------
 
 Invoke-ShimTest "Non-zero exit code (42)" -Setup {

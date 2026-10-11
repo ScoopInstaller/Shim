@@ -639,7 +639,7 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
             let mut args_str = value.to_string();
             normalize_args_str(&mut args_str, &target_dir);
             if !args_str.is_empty() {
-                info.args = parse_args_from_cmdline(&args_str);
+                info.args.extend(parse_args_from_cmdline(&args_str));
             }
         } else if key.eq_ignore_ascii_case("cwd") || key.eq_ignore_ascii_case("workdir") {
             let mut cwd_str = value.to_string();
