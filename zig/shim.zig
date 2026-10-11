@@ -232,7 +232,6 @@ fn writeErrorDec(v: u32) void {
     writeError(buf[i..]);
 }
 
-// System error text follows the OS language.
 fn writeErrorSys(err: DWORD) void {
     writeError(" (error ");
     writeErrorDec(err);
@@ -395,14 +394,14 @@ fn normalizeArgs(dest: []WCHAR, src: []const WCHAR, curDir: []const WCHAR) usize
     return out;
 }
 
-/// Expand `%~dp0` in `value` against `dir`. Caller owns the result.
+/// Expand `%~dp0` in `value` against `dir`.
 fn expandPlaceholder(allocator: std.mem.Allocator, value: []const WCHAR, dir: []const WCHAR) ![]WCHAR {
     const count = countPlaceholder(value);
     const buf = try allocator.alloc(WCHAR, value.len + count * (dir.len + 1) + 1);
     return buf[0..normalizeArgs(buf, value, dir)];
 }
 
-/// Windows CreateProcessW quoting rules. Caller owns the result.
+/// Windows CreateProcessW quoting rules.
 fn quoteArg(allocator: std.mem.Allocator, arg: []const WCHAR) ![]WCHAR {
     if (arg.len == 0) {
         const r = try allocator.alloc(WCHAR, 2);
@@ -455,7 +454,7 @@ fn quoteArg(allocator: std.mem.Allocator, arg: []const WCHAR) ![]WCHAR {
     return try result.toOwnedSlice(allocator);
 }
 
-/// Quote and space-join args, null-terminated. Caller owns the result.
+/// Quote and space-join args, null-terminated.
 fn buildJoinedArgs(allocator: std.mem.Allocator, args: []const []const WCHAR) ![:0]WCHAR {
     var result = try std.ArrayList(WCHAR).initCapacity(allocator, 64);
     for (args, 0..) |arg, i| {
@@ -468,7 +467,7 @@ fn buildJoinedArgs(allocator: std.mem.Allocator, args: []const []const WCHAR) ![
     return owned[0 .. owned.len - 1 :0];
 }
 
-/// CommandLineToArgvW parsing. Caller owns the result and each element.
+/// CommandLineToArgvW parsing.
 fn parseArgsFromCmdLine(allocator: std.mem.Allocator, cmdline: [:0]const WCHAR) ![][:0]WCHAR {
     if (cmdline.len == 0) return try allocator.alloc([:0]WCHAR, 0);
 
@@ -521,12 +520,10 @@ fn parseBool(value: []const WCHAR) bool {
         std.mem.eql(WCHAR, lv, w("yes"));
 }
 
-/// Caller owns the result.
 fn expandEnvVars(allocator: std.mem.Allocator, input: []const WCHAR) ![]WCHAR {
     const input_z = try allocator.alloc(WCHAR, input.len + 1);
     @memcpy(input_z[0..input.len], input);
     input_z[input.len] = 0;
-    // First call gets the required size, second expands.
     const required = ExpandEnvironmentStringsW(input_z[0..input.len :0].ptr, null, 0);
     if (required == 0) {
         writeError("Shim: Could not expand environment variables in '");
@@ -599,7 +596,7 @@ fn parseShimLine(line: []const WCHAR, out: *ShimLine) LineKind {
     return .field;
 }
 
-/// Returns the *directory* portion (trailing backslash), not the resolved path. Caller owns it.
+/// Returns the *directory* portion (trailing backslash), not the resolved path.
 fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir: []const WCHAR) ![]WCHAR {
     const is_absolute = (path.len >= 2 and path[1] == ':') or (path.len > 0 and (path[0] == '\\' or path[0] == '/'));
     var toResolve: []const WCHAR = undefined;
@@ -696,7 +693,6 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
             filename[abs_dot + 5] = 0;
             break :blk abs_dot + 5;
         }
-        // No extension in the final component: append ".shim".
         @memcpy(filename[filename_size .. filename_size + 5], w(".shim"));
         filename[filename_size + 5] = 0;
         break :blk filename_size + 5;
@@ -861,7 +857,6 @@ const ProcessResult = struct {
     thread: ?HANDLE = null,
 };
 
-// ShellExecuteExW "runas" - the only way to trigger a UAC prompt from this process.
 fn launchElevated(
     path_z: [*:0]WCHAR,
     args_z: [*:0]WCHAR,
@@ -1041,7 +1036,6 @@ fn shimMain() !u32 {
         }
     }
 
-    // KILL_ON_JOB_CLOSE ties child lifetime to the shim.
     const job_handle = CreateJobObjectW(null, null);
     if (job_handle) |jh| {
         var jeli: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);

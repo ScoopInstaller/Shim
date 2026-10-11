@@ -21,7 +21,6 @@
 
 using namespace std::string_view_literals;
 
-// A plain function with WINAPI linkage is required by SetConsoleCtrlHandler.
 BOOL WINAPI CtrlHandler(DWORD ctrlType) noexcept
 {
     switch (ctrlType)
@@ -87,8 +86,7 @@ struct ProcessResult
     UniqueHandle thread;
 };
 
-// Write to stderr, bypassing stdio buffering; WriteConsoleW only works on consoles,
-// so redirected pipes get UTF-8 via WriteFile.
+// WriteConsoleW fails on redirected handles, so route by file type; stdio deliberately, see DESIGN.md.
 inline void WriteErrorW(const wchar_t* msg) noexcept
 {
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
@@ -115,7 +113,6 @@ inline void WriteErrorW(const wchar_t* msg) noexcept
     }
 }
 
-// System error text follows the OS language.
 inline void WriteErrorSys(DWORD err)
 {
     wchar_t num[11] {};
@@ -200,7 +197,6 @@ inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
     // Handles are intentionally never closed: they live for the process lifetime.
 }
 
-// "Shim: <action>: '<file>'" plus the Win32 error text.
 inline void ReportShimFileError(const wchar_t* action, const wchar_t* file, DWORD err)
 {
     std::wstring msg = L"Shim: ";
@@ -385,7 +381,6 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
     std::wstring inputStr(input);
 
-    // First call gets the required size, second expands.
     auto reportFailure = [&inputStr]() {
         WriteErrorW(L"Shim: Could not expand environment variables in '");
         WriteErrorW(inputStr.c_str());
@@ -665,7 +660,6 @@ enum class LineKind
         break;
     }
 
-    // Second pass: expand all fields using targetDir for %~dp0.
     ShimInfo info;
     for (const auto& rawLine : decoded)
     {
@@ -677,7 +671,7 @@ enum class LineKind
 
         if (IEquals(name, c_pathPrefix))
         {
-            if (!info.path) // first path line wins
+            if (!info.path)
             {
                 std::wstring pathVal(value);
                 NormalizeArgsInPlace(pathVal, curDir);
@@ -801,7 +795,6 @@ enum class LineKind
     const auto* cwd = info.cwd ? info.cwd->c_str() : nullptr;
     std::wstring cmd = BuildCommandLine(path, info.args);
 
-    // Params are only consumed by ShellExecuteExW; not built on the normal CreateProcessW path.
     if (info.elevate) [[unlikely]]
         return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);
 
@@ -865,7 +858,6 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
-    // CommandLineToArgvW splits the raw command line; argv[0] is the shim itself.
     {
         int userArgc = 0;
         LPWSTR* userArgv = CommandLineToArgvW(GetCommandLineW(), &userArgc);
@@ -893,7 +885,6 @@ int wmain(int argc, wchar_t* argv[])
         }
     }
 
-    // KILL_ON_JOB_CLOSE ties child lifetime to the shim.
     UniqueHandle jobHandle(CreateJobObjectW(nullptr, nullptr));
     if (jobHandle) [[likely]]
     {
@@ -929,7 +920,7 @@ int wmain(int argc, wchar_t* argv[])
     {
         WriteErrorW(L"Shim: Could not get child exit code");
         WriteErrorSys(GetLastError());
-        exitCode = 1; // explicit: a failed query must not yield 0 (success)
+        exitCode = 1;
     }
 
     return static_cast<int>(exitCode);

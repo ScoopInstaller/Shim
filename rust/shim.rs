@@ -51,8 +51,7 @@ const INVALID_HANDLE: HANDLE = -1isize as *mut _;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 
 // FORMAT_MESSAGE_MAX_WIDTH_MASK lives in Win32_System_WindowsProgramming; inlined
-// to avoid a feature dependency for one constant. Keeps the messages byte-identical
-// to the previous format!-based output.
+// to avoid a feature dependency for one constant.
 const FORMAT_MESSAGE_MAX_WIDTH_MASK: u32 = 255;
 
 const FILE_SHARE_READ: FILE_SHARE_MODE = 1;
@@ -121,7 +120,6 @@ unsafe fn write_error_num(mut v: u32) {
     write_error_wide(&buf[i..]);
 }
 
-// System error text follows the OS language.
 unsafe fn write_error_sys(err: u32) {
     write_error_wide(&to_wide(" (error "));
     write_error_num(err);
@@ -685,7 +683,6 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
 
         if key.eq_ignore_ascii_case("path") {
             if info.path.is_none() {
-                // First path line wins; expand %~dp0 against the shim's own dir.
                 let mut path_val = value.to_string();
                 normalize_args_str(&mut path_val, cur_dir);
                 info.path = Some(expand_and_strip_quotes(&path_val));
@@ -739,7 +736,6 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
     info
 }
 
-// Quoted, space-joined argument string for ShellExecuteExW. Only elevation builds it.
 fn build_params(args: &[OsString]) -> Vec<u16> {
     let mut p: Vec<u16> = Vec::new();
     for (i, arg) in args.iter().enumerate() {
@@ -846,8 +842,6 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         None => std::ptr::null(),
     };
 
-    // ShellExecuteExW takes parameters separately from the file; only the elevation
-    // paths need them, so the normal CreateProcessW path never builds the string.
     if info.elevate {
         let params = build_params(&info.args);
         return unsafe { launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle) };
@@ -952,7 +946,6 @@ fn main() {
         }
     }
 
-    // KILL_ON_JOB_CLOSE ties child lifetime to the shim.
     let job_handle: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
 
     if job_handle != NULL_HANDLE {

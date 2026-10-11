@@ -283,7 +283,6 @@ namespace Scoop
             WriteErrorW(" (error " + err + ": " + new Win32Exception((int)err).Message.TrimEnd() + ").");
         }
 
-        // Win32Exception.Message renders the system error text in the OS language.
         static void ReportShimError(string context, uint error)
         {
             WriteErrorW("Shim: " + context);
@@ -728,7 +727,6 @@ namespace Scoop
                 if (ParseShimLine(rawLine, out var key, out var value) != LineKind.Field || !IsKey(key, "path"))
                     continue;
 
-                // %~dp0 in the path field refers to the shim's own dir.
                 var expanded = ExpandAndUnquote(NormalizeArgs(value!, dir));
                 targetDir = ResolveAgainstBase(expanded, dir);
                 break;
@@ -895,7 +893,6 @@ namespace Scoop
                 return 1;
             }
 
-            // Init to 1 so a failed query yields 1, not 0 (mirrors cpp).
             uint exitCode = 1;
             if (!GetExitCodeProcess(hProcess, out exitCode))
             {
@@ -918,7 +915,6 @@ namespace Scoop
                 return 1;
             }
 
-            // CommandLineToArgvW splits the raw command line; argv[0] is the shim itself.
             var runtimeArgs = ParseArgsFromCmdLine(Environment.CommandLine);
             for (int i = 1; i < runtimeArgs.Count; i++)
             {
