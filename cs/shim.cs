@@ -13,6 +13,7 @@ namespace Scoop
     public class Program
     {
         const int ERROR_ELEVATION_REQUIRED = 740;
+        const int ERROR_READ_FAULT = 30;
 
         // --- P/Invoke: Process ---
 
@@ -111,6 +112,9 @@ namespace Scoop
 
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern uint ResumeThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern uint ExpandEnvironmentStringsW(string lpSrc, StringBuilder lpDst, uint nSize);
 
         [DllImport("shell32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -348,7 +352,26 @@ namespace Scoop
         static string ExpandEnvVars(string input)
         {
             if (string.IsNullOrEmpty(input)) return input;
-            return Environment.ExpandEnvironmentVariables(input);
+
+            // Two-call sizing, matching the other lanes: ExpandEnvironmentStringsW
+            // returns the required size (not 0) when the buffer is too small.
+            var probe = new StringBuilder(1);
+            uint required = ExpandEnvironmentStringsW(input, probe, 1);
+            if (required == 0)
+            {
+                ReportShimError($"Could not expand environment variables in '{input}'", (uint)Marshal.GetLastWin32Error());
+                return input;
+            }
+
+            var sb = new StringBuilder((int)required);
+            uint actual = ExpandEnvironmentStringsW(input, sb, required);
+            if (actual == 0 || actual > required)
+            {
+                ReportShimError($"Could not expand environment variables in '{input}'", (uint)Marshal.GetLastWin32Error());
+                return input;
+            }
+
+            return sb.ToString(0, (int)actual - 1);
         }
 
         static string ExpandAndUnquote(string value)
@@ -627,14 +650,40 @@ namespace Scoop
             var configPath = (dot >= nameStart ? exePath.Substring(0, dot) : exePath) + ".shim";
 
             byte[] raw;
+            FileStream file;
             try
             {
-                raw = File.ReadAllBytes(configPath);
+                file = new FileStream(configPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             }
             catch (Exception ex)
             {
                 uint err = (uint)(ex.HResult & 0xFFFF);
                 ReportShimError($"Cannot open shim file for read: '{configPath}'", err);
+                return new ShimInfo();
+            }
+            try
+            {
+                using (file)
+                {
+                    raw = new byte[file.Length];
+                    int off = 0;
+                    while (off < raw.Length)
+                    {
+                        int n = file.Read(raw, off, raw.Length - off);
+                        if (n <= 0)
+                        {
+                            // Short read: the file shrank mid-read, so no Win32 error is set.
+                            ReportShimError($"Cannot read shim file: '{configPath}'", ERROR_READ_FAULT);
+                            return new ShimInfo();
+                        }
+                        off += n;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                uint err = (uint)(ex.HResult & 0xFFFF);
+                ReportShimError($"Cannot read shim file: '{configPath}'", err);
                 return new ShimInfo();
             }
 
@@ -802,7 +851,9 @@ namespace Scoop
                 lpVerb = "runas",
                 lpFile = path,
                 lpParameters = params_.Length == 0 ? null : params_,
-                lpDirectory = string.IsNullOrEmpty(cwd) ? null : cwd,
+                // Empty means the key was present with an empty value, matching
+                // the other lanes; null means the key was absent.
+                lpDirectory = cwd,
                 nShow = SW_SHOW
             };
 
@@ -846,7 +897,11 @@ namespace Scoop
 
             // Init to 1 so a failed query yields 1, not 0 (mirrors cpp).
             uint exitCode = 1;
-            GetExitCodeProcess(hProcess, out exitCode);
+            if (!GetExitCodeProcess(hProcess, out exitCode))
+            {
+                ReportShimError("Could not get child exit code", (uint)Marshal.GetLastWin32Error());
+                exitCode = 1;
+            }
             CloseHandle(hProcess);
 
             return (int)exitCode;
@@ -883,7 +938,7 @@ namespace Scoop
             }
 
             IntPtr jobHandle = CreateJobObjectW(IntPtr.Zero, null);
-            if (jobHandle != IntPtr.Zero && jobHandle != INVALID_HANDLE_VALUE)
+            if (jobHandle != IntPtr.Zero)
             {
                 var jeli = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
                 jeli.BasicLimitInformation.LimitFlags =
@@ -891,7 +946,7 @@ namespace Scoop
                 if (!SetInformationJobObject(jobHandle, JobObjectExtendedLimitInformation,
                     ref jeli, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
                 {
-                    ReportShimError("Could not configure job object", (uint)Marshal.GetLastWin32Error());
+                    ReportShimError("Could not set job object limits", (uint)Marshal.GetLastWin32Error());
                 }
             }
 

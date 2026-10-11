@@ -46,6 +46,7 @@ const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
 const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
 const NULL_HANDLE: HANDLE = std::ptr::null_mut();
 const INVALID_HANDLE: HANDLE = -1isize as *mut _;
+const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 
 // FORMAT_MESSAGE_MAX_WIDTH_MASK lives in Win32_System_WindowsProgramming; inlined
 // to avoid a feature dependency for one constant. Keeps the messages byte-identical
@@ -258,6 +259,12 @@ fn expand_env_vars(input: &str) -> String {
             ExpandEnvironmentStringsW(wide.as_ptr(), stack.as_mut_ptr(), stack.len() as u32);
         // On overflow the API returns the REQUIRED size (larger than the buffer), not 0.
         if actual == 0 {
+            write_error_wide(&to_wide(
+                "Shim: Could not expand environment variables in '",
+            ));
+            write_error_wide(&to_wide(input));
+            write_error_wide(&to_wide("'"));
+            write_error_sys(GetLastError());
             return input.to_string();
         }
         if actual as usize <= stack.len() {
@@ -267,6 +274,12 @@ fn expand_env_vars(input: &str) -> String {
         let mut buf = vec![0u16; actual as usize];
         let written = ExpandEnvironmentStringsW(wide.as_ptr(), buf.as_mut_ptr(), actual);
         if written == 0 || written > actual {
+            write_error_wide(&to_wide(
+                "Shim: Could not expand environment variables in '",
+            ));
+            write_error_wide(&to_wide(input));
+            write_error_wide(&to_wide("'"));
+            write_error_sys(GetLastError());
             return input.to_string();
         }
         String::from_utf16_lossy(&buf[..written as usize - 1])
@@ -738,10 +751,7 @@ unsafe fn launch_elevated(
     let proc_handle: HANDLE = sei.hProcess;
     if job_handle != NULL_HANDLE && proc_handle != NULL_HANDLE {
         if AssignProcessToJobObject(job_handle, proc_handle) == 0 {
-            write_error_ctx(
-                "Warning: could not assign process to job object",
-                GetLastError(),
-            );
+            write_error_ctx("Could not assign process to job object", GetLastError());
         }
     }
 
@@ -822,10 +832,7 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         if job_handle != NULL_HANDLE {
             if unsafe { AssignProcessToJobObject(job_handle, pi.hProcess) } == 0 {
                 unsafe {
-                    write_error_ctx(
-                        "Warning: could not assign process to job object",
-                        GetLastError(),
-                    );
+                    write_error_ctx("Could not assign process to job object", GetLastError());
                 }
             }
         }
@@ -833,7 +840,7 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
             let err = unsafe { GetLastError() };
             unsafe {
-                write_error_ctx("Could not resume process", err);
+                write_error_ctx("Could not resume suspended process", err);
                 if job_handle != NULL_HANDLE {
                     TerminateJobObject(job_handle, 1);
                 }
@@ -917,7 +924,7 @@ fn main() {
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
             if ok == 0 {
-                write_error_ctx("Warning: could not set job object limits", GetLastError());
+                write_error_ctx("Could not set job object limits", GetLastError());
             }
         }
     }
@@ -935,10 +942,16 @@ fn main() {
     }
 
     unsafe {
-        WaitForSingleObject(process_handle, INFINITE);
+        if WaitForSingleObject(process_handle, INFINITE) == WAIT_FAILED {
+            write_error_ctx("Could not wait for process to exit", GetLastError());
+            std::process::exit(1);
+        }
 
         let mut exit_code: u32 = 1;
-        GetExitCodeProcess(process_handle, &mut exit_code);
+        if GetExitCodeProcess(process_handle, &mut exit_code) == 0 {
+            write_error_ctx("Could not get child exit code", GetLastError());
+            exit_code = 1;
+        }
 
         if thread_handle != NULL_HANDLE {
             CloseHandle(thread_handle);

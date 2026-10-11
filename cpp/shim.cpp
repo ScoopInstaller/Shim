@@ -386,14 +386,27 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     std::wstring inputStr(input);
 
     // First call gets the required size, second expands.
+    auto reportFailure = [&inputStr]() {
+        WriteErrorW(L"Shim: Could not expand environment variables in '");
+        WriteErrorW(inputStr.c_str());
+        WriteErrorW(L"'");
+        WriteErrorSys(GetLastError());
+    };
+
     DWORD required = ExpandEnvironmentStringsW(inputStr.c_str(), nullptr, 0);
     if (required == 0) [[unlikely]]
+    {
+        reportFailure();
         return inputStr;
+    }
 
     std::wstring result(required - 1, L'\0');
     DWORD actual = ExpandEnvironmentStringsW(inputStr.c_str(), result.data(), required);
     if (actual == 0 || actual > required) [[unlikely]]
+    {
+        reportFailure();
         return inputStr;
+    }
 
     result.resize(actual - 1);
     return result;
@@ -755,8 +768,11 @@ enum class LineKind
     }
 
     result.process.reset(sei.hProcess);
-    if (jobHandle && result.process)
-        AssignProcessToJobObject(jobHandle, result.process.get());
+    if (jobHandle && result.process && !AssignProcessToJobObject(jobHandle, result.process.get())) [[unlikely]]
+    {
+        WriteErrorW(L"Shim: Could not assign process to job object");
+        WriteErrorSys(GetLastError());
+    }
 
     return result;
 }
@@ -802,8 +818,11 @@ enum class LineKind
         result.thread.reset(pi.hThread);
         result.process.reset(pi.hProcess);
 
-        if (jobHandle)
-            AssignProcessToJobObject(jobHandle, pi.hProcess);
+        if (jobHandle && !AssignProcessToJobObject(jobHandle, pi.hProcess)) [[unlikely]]
+        {
+            WriteErrorW(L"Shim: Could not assign process to job object");
+            WriteErrorSys(GetLastError());
+        }
 
         // A failed resume leaves the child suspended while the shim waits on it forever.
         if (ResumeThread(result.thread.get()) == static_cast<DWORD>(-1)) [[unlikely]]
@@ -880,7 +899,11 @@ int wmain(int argc, wchar_t* argv[])
     {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli {};
         jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
-        SetInformationJobObject(jobHandle.get(), JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+        if (!SetInformationJobObject(jobHandle.get(), JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) [[unlikely]]
+        {
+            WriteErrorW(L"Shim: Could not set job object limits");
+            WriteErrorSys(GetLastError());
+        }
     }
 
     // Before spawn: a Ctrl event in the gap would kill the shim and
@@ -894,7 +917,12 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
-    WaitForSingleObject(processHandle.get(), INFINITE);
+    if (WaitForSingleObject(processHandle.get(), INFINITE) == WAIT_FAILED) [[unlikely]]
+    {
+        WriteErrorW(L"Shim: Could not wait for process to exit");
+        WriteErrorSys(GetLastError());
+        return 1;
+    }
 
     DWORD exitCode = 1;
     if (!GetExitCodeProcess(processHandle.get(), &exitCode)) [[unlikely]]

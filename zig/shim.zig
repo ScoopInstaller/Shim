@@ -21,6 +21,7 @@ const CHAR = windows.CHAR;
 const WCHAR = windows.WCHAR;
 const INFINITE: windows.DWORD = std.math.maxInt(windows.DWORD);
 const INVALID_FILE_SIZE: windows.DWORD = std.math.maxInt(windows.DWORD);
+const WAIT_FAILED: windows.DWORD = std.math.maxInt(windows.DWORD);
 
 const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
 
@@ -892,7 +893,7 @@ fn launchElevated(
         if (sei.hProcess) |ph| {
             if (!AssignProcessToJobObject(jh, ph).toBool()) {
                 const job_err = GetLastError();
-                writeError("Shim: Could not assign elevated process to job object");
+                writeError("Shim: Could not assign process to job object");
                 writeErrorSys(job_err);
             }
         }
@@ -1045,7 +1046,7 @@ fn shimMain() !u32 {
         jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         if (!SetInformationJobObject(jh, JobObjectExtendedLimitInformation, &jeli, @sizeOf(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)).toBool()) {
             const job_err = GetLastError();
-            writeError("Shim: Could not set job object limits (KILL_ON_JOB_CLOSE)");
+            writeError("Shim: Could not set job object limits");
             writeErrorSys(job_err);
         }
     }
@@ -1057,10 +1058,18 @@ fn shimMain() !u32 {
     const proc_result = try makeProcess(allocator, &info, job_handle);
     const process_handle = proc_result.process orelse return 1;
 
-    _ = WaitForSingleObject(process_handle, INFINITE);
+    if (WaitForSingleObject(process_handle, INFINITE) == WAIT_FAILED) {
+        writeError("Shim: Could not wait for process to exit");
+        writeErrorSys(GetLastError());
+        return 1;
+    }
 
     var exit_code: DWORD = 1;
-    _ = GetExitCodeProcess(process_handle, &exit_code);
+    if (GetExitCodeProcess(process_handle, &exit_code).toBool() == false) {
+        writeError("Shim: Could not get child exit code");
+        writeErrorSys(GetLastError());
+        exit_code = 1;
+    }
 
     return exit_code;
 }
