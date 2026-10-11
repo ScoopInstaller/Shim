@@ -4,7 +4,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
@@ -23,7 +23,9 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
 };
-use windows_sys::Win32::System::Environment::{ExpandEnvironmentStringsW, SetEnvironmentVariableW};
+use windows_sys::Win32::System::Environment::{
+    ExpandEnvironmentStringsW, GetCommandLineW, SetEnvironmentVariableW,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -163,7 +165,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 // One GetModuleFileNameW call yields both the shim's directory and its paired .shim path.
-fn get_shim_paths() -> Option<(String, String)> {
+fn get_shim_paths() -> Option<(String, String, Vec<u16>)> {
     unsafe {
         const MAX_MODULE_PATH_CHARS: usize = 32768;
         let mut buf = vec![0u16; 260];
@@ -181,22 +183,30 @@ fn get_shim_paths() -> Option<(String, String)> {
                 return None;
             }
             if (len as usize) < buf.len() {
-                let full = String::from_utf16_lossy(&buf[..len as usize]);
+                let wide = &buf[..len as usize];
+                // Directory and message text are lossy; the .shim path opened below is
+                // not, so a lone surrogate in the install path still resolves.
+                let full = String::from_utf16_lossy(wide);
                 let dir = match full.rfind(['\\', '/']) {
                     Some(pos) => full[..pos].to_string(),
                     None => full.clone(),
                 };
                 // Only replace the extension of the file name, not a dot in a parent directory.
-                let mut shim = full;
-                let name_start = shim.rfind(['\\', '/']).map_or(0, |p| p + 1);
-                match shim[name_start..].rfind('.') {
-                    Some(dot) => {
-                        shim.truncate(name_start + dot);
-                        shim.push_str(".shim");
-                    }
-                    None => shim.push_str(".shim"),
-                }
-                return Some((dir, shim));
+                let name_start = wide
+                    .iter()
+                    .rposition(|&c| c == b'\\' as u16 || c == b'/' as u16)
+                    .map_or(0, |p| p + 1);
+                let dot = wide[name_start..]
+                    .iter()
+                    .rposition(|&c| c == b'.' as u16)
+                    .map(|d| name_start + d);
+                let mut shim_wide: Vec<u16> = match dot {
+                    Some(d) => wide[..d].to_vec(),
+                    None => wide.to_vec(),
+                };
+                shim_wide.extend_from_slice(&to_wide(".shim"));
+                let shim = String::from_utf16_lossy(&shim_wide);
+                return Some((dir, shim, shim_wide));
             }
 
             // Truncation returns the required size: grow and retry, capped at the path limit.
@@ -369,6 +379,35 @@ fn parse_args_from_cmdline(cmdline: &str) -> Vec<OsString> {
                 }
                 let slice = std::slice::from_raw_parts(ptr, len);
                 result.push(OsString::from(String::from_utf16_lossy(slice)));
+            }
+        }
+        LocalFree(argv as *mut _);
+        result
+    }
+}
+
+// The shim's own command line, parsed by the same Win32 rules as the other lanes and
+// kept in raw UTF-16 so a lone surrogate survives into the child's command line.
+fn parse_user_args_from_cmdline() -> Vec<OsString> {
+    unsafe {
+        let wide = GetCommandLineW();
+        if wide.is_null() {
+            return Vec::new();
+        }
+        let mut argc: i32 = 0;
+        let argv = CommandLineToArgvW(wide, &mut argc);
+        if argv.is_null() {
+            return Vec::new();
+        }
+        let mut result = Vec::with_capacity(argc as usize);
+        for i in 0..argc as isize {
+            let ptr = *argv.offset(i);
+            if !ptr.is_null() {
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                result.push(OsString::from_wide(std::slice::from_raw_parts(ptr, len)));
             }
         }
         LocalFree(argv as *mut _);
@@ -570,11 +609,12 @@ unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
     // Handles live for the process lifetime - do not close.
 }
 
-fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
+fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInfo {
     let mut info = ShimInfo::default();
 
     let mut raw = Vec::new();
-    let mut shim_file = match File::open(shim_path) {
+    let shim_os = OsString::from_wide(shim_wide);
+    let mut shim_file = match File::open(&shim_os) {
         Ok(f) => f,
         Err(e) => {
             let err = e.raw_os_error().unwrap_or(0) as u32;
@@ -780,15 +820,17 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         }
     }
 
-    let cmd_str = {
+    // Keep the command line in UTF-16 end to end: quote_arg already preserves
+    // unpaired surrogates, so a lossy round-trip here would destroy them.
+    let mut cmd = {
         let mut c = quote_arg(OsStr::new(path));
         for arg in &info.args {
             c.push(b' ' as u16);
             c.extend_from_slice(&quote_arg(arg));
         }
-        String::from_utf16_lossy(&c)
+        c.push(0);
+        c
     };
-    let mut cmd = to_wide_null(&cmd_str);
     let path_w = to_wide_null(path);
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -861,7 +903,8 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
 
     unsafe {
         write_error_wide(&to_wide("Shim: Could not create process with command '"));
-        write_error_wide(&to_wide(&cmd_str));
+        // Lossy copy only for the message; the spawn above used the raw UTF-16 line.
+        write_error_wide(&to_wide(&String::from_utf16_lossy(&cmd[..cmd.len() - 1])));
         write_error_wide(&to_wide("'"));
         write_error_sys(err);
     }
@@ -877,20 +920,20 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
 }
 
 fn main() {
-    let (cur_dir, shim_path) = match get_shim_paths() {
+    let (cur_dir, shim_path, shim_wide) = match get_shim_paths() {
         Some(p) => p,
         None => std::process::exit(1),
     };
-    let mut info = parse_shim_info(&cur_dir, &shim_path);
+    let mut info = parse_shim_info(&cur_dir, &shim_path, &shim_wide);
 
     if info.path.is_none() {
         std::process::exit(1);
     }
 
-    let user_args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let has_user_args = !user_args.is_empty();
+    let user_args = parse_user_args_from_cmdline();
+    let has_user_args = user_args.len() > 1;
 
-    for arg_str in user_args {
+    for arg_str in user_args.into_iter().skip(1) {
         info.args.push(arg_str);
     }
 

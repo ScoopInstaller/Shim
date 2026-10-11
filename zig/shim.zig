@@ -22,6 +22,7 @@ const WCHAR = windows.WCHAR;
 const INFINITE: windows.DWORD = std.math.maxInt(windows.DWORD);
 const INVALID_FILE_SIZE: windows.DWORD = std.math.maxInt(windows.DWORD);
 const WAIT_FAILED: windows.DWORD = std.math.maxInt(windows.DWORD);
+const ERROR_READ_FAULT: windows.DWORD = 30;
 
 const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
 
@@ -259,16 +260,15 @@ fn writeErrorUtf8(s: []const WCHAR) void {
         _ = WriteConsoleW(hErr, s.ptr, @intCast(s.len), &written, null);
         return;
     }
-    var remaining = s;
-    while (remaining.len > 0) {
-        // worst case 4 UTF-8 bytes per WCHAR (surrogate pair); chunk keeps buf bounded
-        const chunk = remaining[0..@min(remaining.len, 512)];
-        var buf: [2048]u8 = undefined;
-        const n = WideCharToMultiByte(65001, 0, chunk.ptr, @intCast(chunk.len), &buf, @intCast(buf.len), null, null);
-        if (n <= 0) return;
-        writeError(buf[0..@intCast(n)]);
-        remaining = remaining[chunk.len..];
-    }
+    // One conversion, sized by a first call: converting in fixed chunks split a
+    // surrogate pair straddling a chunk boundary into two '?'.
+    const needed = WideCharToMultiByte(65001, 0, s.ptr, @intCast(s.len), null, 0, null, null);
+    if (needed <= 0) return;
+    const buf = std.heap.page_allocator.alloc(u8, @intCast(needed)) catch return;
+    defer std.heap.page_allocator.free(buf);
+    const n = WideCharToMultiByte(65001, 0, s.ptr, @intCast(s.len), buf.ptr, needed, null, null);
+    if (n <= 0) return;
+    writeError(buf[0..@intCast(n)]);
 }
 
 // GUI/redirected launches can yield null or INVALID_HANDLE_VALUE std handles.
@@ -736,8 +736,10 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
     const file_buf = try allocator.alloc(u8, @intCast(file_size));
 
     var bytes_read: DWORD = 0;
-    if (!ReadFile(file_handle, file_buf.ptr, file_size, &bytes_read, null).toBool() or bytes_read != file_size) {
-        const read_err = GetLastError();
+    const read_ok = ReadFile(file_handle, file_buf.ptr, file_size, &bytes_read, null).toBool();
+    if (!read_ok or bytes_read != file_size) {
+        // Short read: the file shrank between GetFileSize and ReadFile, so GetLastError() is 0.
+        const read_err = if (read_ok) ERROR_READ_FAULT else GetLastError();
         writeError("Shim: Cannot read shim file: '");
         writeErrorUtf8(filename[0..shim_name_len]);
         writeError("'");
