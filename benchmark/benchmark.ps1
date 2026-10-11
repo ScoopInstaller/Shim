@@ -1,10 +1,15 @@
 # Scoop-Shim startup benchmark.
 #
-# Candidates run without the system shell (hyperfine --shell=none escapes
-# backslashes, so paths use forward slashes) and are interleaved in randomized
-# rounds. Values are pooled medians with the inter-quartile range; CPU time
-# (user+system) is reported next to wall clock because wall clock is unreliable on
-# a busy machine.
+# Candidates run without the system shell (hyperfine's shell-words parser
+# escapes backslashes, so paths use forward slashes). Each candidate gets its
+# own invocation per round, in a reshuffled order - see the comment at the
+# timing loop for why one invocation for all of them would be wrong. Wall and
+# CPU are pooled per run, so the two medians and IQRs describe the same set of
+# measurements. CPU time is reported next to wall clock because wall clock is
+# unreliable on a busy machine.
+#
+# Requires hyperfine 2.x: the export layout is schema_version 2, where per-run
+# samples live in results[].measurements[].time_wall_clock.value.
 #
 # Usage:
 #   pwsh -File benchmark/benchmark.ps1
@@ -79,8 +84,8 @@ foreach ($name in $impls.Keys) {
     Write-Host ("  {0,-7} {1,6} KB" -f $name, [Math]::Round((Get-Item $dest).Length / 1KB)) -ForegroundColor Gray
 }
 
-# --shell=none: shell-words treats backslashes as escapes, and an unquoted space
-# would split the argument - so fall back to the shell if a path has whitespace.
+# hyperfine's shell-words parser treats backslashes as escapes in BOTH modes, so a
+# Windows path must use forward slashes either way. cmd.exe accepts them too.
 $noShell = -not $UseShell
 if ($noShell -and ($paths.Values | Where-Object { $_ -match '\s' })) {
     Write-Warning "A command path contains whitespace; falling back to shell mode."
@@ -88,7 +93,7 @@ if ($noShell -and ($paths.Values | Where-Object { $_ -match '\s' })) {
 }
 $commandPaths = [ordered]@{}
 foreach ($name in $paths.Keys) {
-    $commandPaths[$name] = if ($noShell) { $paths[$name] -replace '\\', '/' } else { $paths[$name] }
+    $commandPaths[$name] = $paths[$name] -replace '\\', '/'
 }
 Write-Host ("[Mode] {0}" -f ($(if ($noShell) { "--shell=none (direct exec)" } else { "system shell" }))) -ForegroundColor Cyan
 
@@ -105,7 +110,7 @@ foreach ($name in @($paths.Keys)) {
     }
 }
 
-# name -> pooled wall samples (ms) and per-round CPU samples (ms)
+# name -> pooled per-run samples (ms), wall and CPU from the same runs
 $wall = @{}
 $cpu = @{}
 foreach ($name in $paths.Keys) {
@@ -114,24 +119,45 @@ foreach ($name in $paths.Keys) {
 }
 
 $names = @($paths.Keys)
-Write-Host "[Bench] $Rounds rounds x $Runs runs, warmup $Warmup once (order randomized per round)" -ForegroundColor Cyan
+# One hyperfine invocation per candidate per round, in a freshly shuffled order.
+# hyperfine 2.x does NOT interleave: src/benchmark/scheduler.rs runs every run of
+# command 1, then every run of command 2, so passing all candidates to a single
+# invocation would confound measurement position with candidate identity across
+# every round. Upstream issue #21 asks for interleaving and is still open.
+$tmp = Join-Path $env:TEMP "shim-bench-$PID.json"
+Write-Host "[Bench] $Rounds rounds x $Runs runs per candidate, warmup $Warmup once (order shuffled per round)" -ForegroundColor Cyan
 for ($round = 1; $round -le $Rounds; $round++) {
     # Warm up once; the cold-start cost does not recur.
     $w = if ($round -eq 1) { $Warmup } else { 0 }
     foreach ($name in ($names | Sort-Object { Get-Random })) {
-        $tmp = Join-Path $env:TEMP "shim-bench-$PID.json"
-        $hfArgs = @("-w", "$w", "-r", "$Runs", "--export-json", $tmp, "--ignore-failure")
+        $hfArgs = @("-w", "$w", "-r", "$Runs", "--export-json", $tmp, "--ignore-failure", "-n", $name)
         if ($noShell) { $hfArgs += "--shell=none" }
         $hfArgs += $commandPaths[$name]
 
-        & $hf @hfArgs 2>&1 | Out-Null
-        $r = (Get-Content $tmp -Raw | ConvertFrom-Json).results[0]
-        if (@($r.times).Count -eq 0) {
-            Write-Warning "$name produced no samples - command failed to run: $($commandPaths[$name])"
+        # Keep hyperfine's diagnostics: a failure that produces no export file is
+        # otherwise indistinguishable from one that merely timed nothing.
+        $hfOut = & $hf @hfArgs 2>&1
+        if (-not (Test-Path $tmp)) {
+            throw "hyperfine produced no export for $name in round $round`n$($hfOut -join "`n")"
         }
-        foreach ($t in $r.times) { [void]$wall[$name].Add([double]$t * 1000) }
-        [void]$cpu[$name].Add(($r.user + $r.system) * 1000)
+        $parsed = Get-Content $tmp -Raw | ConvertFrom-Json
+        $entry = $parsed.results[0]
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+
+        # Fail loudly rather than emitting a table of NaN: an absent array reads as
+        # null and would sail through the empty check below.
+        if (-not $entry -or -not $entry.measurements) {
+            throw "hyperfine export for '$name' has no 'measurements' array (schema_version='$($parsed.schema_version)'). This script targets the hyperfine 2.x export layout.`n$($hfOut -join "`n")"
+        }
+        $samples = @($entry.measurements)
+        if ($samples.Count -eq 0) {
+            Write-Warning "$name produced no samples - command failed to run: $($commandPaths[$name])"
+            continue
+        }
+        foreach ($m in $samples) {
+            [void]$wall[$name].Add([double]$m.time_wall_clock.value * 1000)
+            [void]$cpu[$name].Add([double]$m.time_cpu.value * 1000)
+        }
     }
     Write-Host "  round $round/$Rounds" -ForegroundColor DarkGray
 }

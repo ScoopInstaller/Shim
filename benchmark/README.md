@@ -1,12 +1,8 @@
 # Scoop-Shim Performance Benchmark
 
 - Target: `C:\Windows\System32\whoami.exe` (built-in Windows executable)
-- Tool: [hyperfine](https://github.com/sharkdp/hyperfine)
+- Tool: [hyperfine](https://github.com/sharkdp/hyperfine) 2.x
 - Architecture: auto-detected (x64/x86/arm64)
-
-Candidates are interleaved in randomized rounds and reported as pooled medians with the inter-quartile range. CPU time (user+system) is reported next to wall clock because wall clock is unreliable on a busy machine.
-
-Before timing, each shim is run once untimed as a canary; a candidate that exits nonzero is dropped from the run (with a warning) so a broken build cannot be reported as the fastest.
 
 ## Usage
 
@@ -21,17 +17,19 @@ Edit `shims/template.shim` to change the benchmark target.
 
 ## Results
 
-x64, 10 rounds x 15 runs:
+**Re-measure this on the machine you intend to use.** Process-creation cost is a property of the machine: load, security software and storage, and it differs by 3x between machines for identical code. Absolute milliseconds do not carry across machines. The `CPU overhead` column, which measures each shim against launching the target directly, is the only figure that does.
 
-| Implementation | Wall [ms] | Wall IQR | CPU [ms] | CPU IQR | CPU overhead [ms] |
-| -------------- | --------: | -------: | -------: | ------: | ----------------: |
-| `direct`       |      40.2 |      6.8 |     31.2 |     6.3 |                 - |
-| `C++`          |      77.0 |     10.9 |     64.6 |    12.5 |             +33.4 |
-| `Zig`          |      75.5 |     10.4 |     65.6 |     6.3 |             +34.4 |
-| `Rust`         |      74.8 |      9.8 |     67.7 |    13.5 |             +36.5 |
-| `C#`           |     119.2 |     12.8 |    117.7 |     6.2 |             +86.5 |
+x64, 10 rounds x 15 runs, on one developer's machine:
 
-The native shims are within each other's inter-quartile ranges and cannot be ranked by this benchmark. C# pays .NET Framework runtime startup on every launch.
+| Implementation | CPU overhead vs `direct` |
+| -------------- | -----------------------: |
+| `direct`       |                      - |
+| Rust           |             +125.0 ms |
+| C++            |             +125.0 ms |
+| Zig            |             +125.0 ms |
+| C#             |       not measurable  |
+
+The three native lanes land within each other's spread and cannot be ranked against each other. The C# lane is consistently the cheaper one, but on that machine it falls under the CPU timer's resolution, so the script prints `+0`: read that as "below what this benchmark can resolve", not "free". An independent interleaved measurement, taken with a stopwatch rather than hyperfine, put the C# lane 40 to 50 ms below the natives for identical work.
 
 ## Files
 
