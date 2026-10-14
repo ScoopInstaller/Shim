@@ -1,4 +1,4 @@
-# Design Notes
+# Design Rationale
 
 Why the shim is shaped this way, and the traps that shaped it. For the file format itself, see [README.md](README.md); for per-language conventions, see [AGENTS.md](AGENTS.md).
 

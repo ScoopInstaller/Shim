@@ -86,7 +86,7 @@ struct ProcessResult
     UniqueHandle thread;
 };
 
-// WriteConsoleW fails on redirected handles, so route by file type; stdio deliberately, see DESIGN.md.
+// WriteConsoleW fails on redirected handles, so route by file type; stdio deliberately, see RATIONALE.md.
 inline void WriteErrorW(const wchar_t* msg) noexcept
 {
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);

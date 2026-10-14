@@ -9,12 +9,12 @@ The four lanes are independent implementations that must behave identically. A c
 | Question | Read |
 | -------- | ---- |
 | What is valid in a `.shim` file, what errors, what expands | [README.md](README.md) |
-| Why the shim is shaped this way, and which traps are load-bearing | [DESIGN.md](DESIGN.md) |
+| Why the shim is shaped this way, and which traps are load-bearing | [RATIONALE.md](RATIONALE.md) |
 | How to build and test one lane, and its language conventions | [`cpp/`](cpp/README.md) / [`cs/`](cs/README.md) / [`rust/`](rust/README.md) / [`zig/`](zig/README.md) |
 | How to run and write a test | [test/README.md](test/README.md) |
 | How to measure startup cost | [benchmark/README.md](benchmark/README.md) |
 
-Do not restate a rule from those documents here -- this file routes. If one of them is wrong, fix it there. Update a document in the same commit as the change that makes it untrue. Touch `DESIGN.md` whenever a design decision or one of its traps changes: the code shows what the shim does, only that file records why.
+Do not restate a rule from those documents here -- this file routes. If one of them is wrong, fix it there. Update a document in the same commit as the change that makes it untrue. Touch `RATIONALE.md` whenever a design decision or one of its traps changes: the code shows what the shim does, only that file records why.
 
 ## Build & test
 
@@ -42,8 +42,8 @@ Every lane builds, and every lane reports 0 failed. No lane is skipped because i
 
 ## Repository layout
 
-Each lane is self-contained. Build scripts, version files and resource generation are duplicated across lanes on purpose. Why that is the shape rather than a shared library is in [DESIGN.md](DESIGN.md).
+Each lane is self-contained. Build scripts, version files and resource generation are duplicated across lanes on purpose. Why that is the shape rather than a shared library is in [RATIONALE.md](RATIONALE.md).
 
 ## Commit style
 
-Conventional commits: `feat(cpp):`, `fix(rust):`, `test:`, `docs:`, `chore:`, etc. Scope is the language lane, or `test`/`ci`/`docs` for cross-cutting changes. One line, capitalised after the type, no body. The history is the record of what changed; a change that needs explaining is a change that needs a comment, a test, or a line in `DESIGN.md`.
+Conventional commits: `feat(cpp):`, `fix(rust):`, `test:`, `docs:`, `chore:`, etc. Scope is the language lane, or `test`/`ci`/`docs` for cross-cutting changes. One line, capitalised after the type, no body. The history is the record of what changed; a change that needs explaining is a change that needs a comment, a test, or a line in `RATIONALE.md`.

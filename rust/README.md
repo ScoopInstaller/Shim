@@ -1,6 +1,6 @@
 # Rust Shim Development Guide
 
-Shim file format and usage: [../README.md](../README.md). Design rationale: [../DESIGN.md](../DESIGN.md).
+Shim file format and usage: [../README.md](../README.md). Design rationale: [../RATIONALE.md](../RATIONALE.md).
 
 ## Overview
 

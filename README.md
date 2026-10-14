@@ -101,7 +101,7 @@ All implementations share the same `.shim` format.
 - C++ developer guide: [`cpp/README.md`](cpp/README.md)
 - Rust developer guide: [`rust/README.md`](rust/README.md)
 - Zig developer guide: [`zig/README.md`](zig/README.md)
-- Design rationale: [`DESIGN.md`](DESIGN.md)
+- Design rationale: [`RATIONALE.md`](RATIONALE.md)
 - Agent conventions: [`AGENTS.md`](AGENTS.md)
 - Test suite: [`test/run-tests.ps1`](test/run-tests.ps1)
 - Test guide: [`test/README.md`](test/README.md)
