@@ -186,10 +186,6 @@ jobs:
           $exe = "${{ matrix.component }}\bin\$t\shim.exe"
           Copy-Item $exe "$tmp\shim.exe"
           Copy-Item "${{ matrix.component }}\version" "$tmp\version" -ErrorAction SilentlyContinue
-          $sha256 = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          "$sha256  shim.exe" | Out-File "$tmp\shim.exe.sha256" -Encoding ascii
-          $sha512 = (Get-FileHash $exe -Algorithm SHA512).Hash.ToLower()
-          "$sha512  shim.exe" | Out-File "$tmp\shim.exe.sha512" -Encoding ascii
           Compress-Archive -Path "$tmp\*" -DestinationPath "$dist\shim-$t.zip" -Force
         }
     - name: Upload release artifacts
@@ -206,6 +202,8 @@ jobs:
     if: github.ref_type == 'tag' && needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -227,6 +225,10 @@ jobs:
       with:
         name: release-${{ matrix.component }}
         path: ${{ matrix.component }}/dist
+    - name: Attest build provenance
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: '${{ matrix.component }}/dist/shim-*.zip'
     - name: Resolve fromTag
       id: fromtag
       shell: pwsh
