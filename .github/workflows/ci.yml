@@ -19,8 +19,8 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.value }}
     steps:
-    - uses: actions/checkout@v7
-    - uses: dorny/paths-filter@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
       if: github.ref_type != 'tag'
       id: filter
       with:
@@ -65,7 +65,7 @@ jobs:
   hygiene:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Check whitespace hygiene
       shell: pwsh
       run: |
@@ -109,16 +109,16 @@ jobs:
     if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Setup Zig
-      uses: mlugg/setup-zig@v2
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       with:
         version: 0.17.0
     - name: Build the test probe
       shell: pwsh
       run: .\test\build-probe.ps1
     - name: Upload the probe
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: probe
         path: test/probe.exe
@@ -133,24 +133,24 @@ jobs:
         include: ${{ fromJSON(needs.detect.outputs.matrix) }}
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-tags: true
     - name: Setup .NET
       if: matrix.setup == 'dotnet'
-      uses: actions/setup-dotnet@v6
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
     - name: Setup Zig
       if: matrix.setup == 'zig'
-      uses: mlugg/setup-zig@v2
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       with:
         version: 0.17.0
     - name: Setup Rust
       if: matrix.setup == 'rust'
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       with:
         targets: aarch64-pc-windows-msvc
     - name: Fetch the shared probe
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: probe
         path: test
@@ -190,7 +190,7 @@ jobs:
         }
     - name: Upload release artifacts
       if: github.ref_type == 'tag'
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: release-${{ matrix.component }}
         path: ${{ matrix.component }}/dist/*.zip
@@ -210,7 +210,7 @@ jobs:
         include: ${{ fromJSON(needs.detect.outputs.matrix) }}
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-tags: true
     - name: Preflight VT_API_KEY
@@ -221,12 +221,12 @@ jobs:
         if (-not $env:VT_API_KEY) {
           throw "Missing required secret VT_API_KEY; set it in repository secrets before tagging a release."
         }
-    - uses: actions/download-artifact@v8
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: release-${{ matrix.component }}
         path: ${{ matrix.component }}/dist
     - name: Attest build provenance
-      uses: actions/attest-build-provenance@v4
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
       with:
         subject-path: '${{ matrix.component }}/dist/shim-*.zip'
     - name: Resolve fromTag
@@ -244,7 +244,7 @@ jobs:
         echo "tag=$prev" >> $env:GITHUB_OUTPUT
     - name: Build Changelog
       id: changelog
-      uses: mikepenz/release-changelog-builder-action@v6
+      uses: mikepenz/release-changelog-builder-action@aa013739bbc8e7067dbbecd4525ff11aeb51a84b # v6.4.0
       with:
         mode: "HYBRID"
         fromTag: ${{ steps.fromtag.outputs.tag }}
@@ -282,14 +282,14 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     - name: Release
       id: release
-      uses: softprops/action-gh-release@v3
+      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
       with:
         files: ${{ matrix.component }}/dist/*.zip
         name: ${{ matrix.display }} Shim v${{ matrix.version }}
         body: ${{ steps.changelog.outputs.changelog }}
         fail_on_unmatched_files: true
     - name: VirusTotal Scan
-      uses: cssnr/virustotal-action@v2
+      uses: cssnr/virustotal-action@5edfa4c982eb0caec6d568ea27cf715269f5c23b # v2.0.0
       with:
         vt_api_key: ${{ secrets.VT_API_KEY }}
         file_globs: ${{ matrix.component }}/dist/*.zip
