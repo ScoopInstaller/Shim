@@ -12,10 +12,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   detect:
     needs: hygiene
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.value }}
     steps:
@@ -28,17 +36,26 @@ jobs:
           cs:
             - 'cs/**'
             - 'test/**'
+            - '.github/workflows/**'
           cpp:
             - 'cpp/**'
             - 'test/**'
+            - '.github/workflows/**'
           rust:
             - 'rust/**'
             - 'test/**'
+            - '.github/workflows/**'
           zig:
             - 'zig/**'
             - 'test/**'
+            - '.github/workflows/**'
     - id: matrix
       shell: pwsh
+      env:
+        REF_TYPE: ${{ github.ref_type }}
+        REF_NAME: ${{ github.ref_name }}
+        EVENT_NAME: ${{ github.event_name }}
+        CHANGES: ${{ steps.filter.outputs.changes }}
       run: |
         $all = @(
           @{component='cs'; display='C#'; setup='dotnet'}
@@ -46,16 +63,17 @@ jobs:
           @{component='rust'; display='Rust'; setup='rust'}
           @{component='zig'; display='Zig'; setup='zig'}
         )
-        if ('${{ github.ref_type }}' -eq 'tag') {
-          $tag = '${{ github.ref_name }}'
+        if ($env:REF_TYPE -eq 'tag') {
+          $tag = $env:REF_NAME
           $c = $all | Where-Object { $tag -like "$($_.component)/v*" }
           if (-not $c) { throw "Unsupported tag: $tag" }
           $ver = $tag -replace '^[^/]+/v?', ''
+          if ($ver -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid tag: $tag" }
           $filtered = $c | ForEach-Object { $_ | Select-Object *, @{N='version';E={$ver}} }
-        } elseif ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+        } elseif ($env:EVENT_NAME -eq 'workflow_dispatch') {
           $filtered = $all
         } else {
-          $changes = '${{ steps.filter.outputs.changes }}' | ConvertFrom-Json
+          $changes = $env:CHANGES | ConvertFrom-Json
           $filtered = $all | Where-Object { $changes -contains $_.component }
         }
         if (-not $filtered) { $filtered = @() }
@@ -64,6 +82,7 @@ jobs:
   # Always runs: a docs-only change yields an empty lane matrix and must still be checked.
   hygiene:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Check whitespace hygiene
@@ -71,20 +90,14 @@ jobs:
       run: |
         $binaryExts = @('.exe', '.dll', '.png', '.ico', '.zip', '.sha256', '.sha512')
         $bad = @()
-        foreach ($f in git ls-files) {
+        $files = git -c core.quotepath=off ls-files -z | ForEach-Object { $_ -split "`0" } | Where-Object { $_ }
+        foreach ($f in $files) {
           if ($binaryExts -contains [System.IO.Path]::GetExtension($f).ToLowerInvariant()) { continue }
           $b = [System.IO.File]::ReadAllBytes((Join-Path $PWD $f))
           if ($b.Length -eq 0) { continue }
           if ($b[-1] -ne 0x0A) { $bad += "$f (no final newline)"; continue }
-          $i = 0
-          while ($i -lt $b.Length) {
-            if ($b[$i] -eq 0x0A) {
-              $j = $i - 1
-              if ($j -ge 0 -and $b[$j] -eq 0x0D) { $j-- }
-              if ($j -ge 0 -and ($b[$j] -eq 0x20 -or $b[$j] -eq 0x09)) { $bad += "$f (trailing whitespace)"; break }
-            }
-            $i++
-          }
+          $text = [System.Text.Encoding]::UTF8.GetString($b)
+          if ($text -match '(?m)[ \t]+\r?$') { $bad += "$f (trailing whitespace)" }
         }
         if ($bad) { throw "Whitespace issues: $($bad -join '; ')" }
         Write-Host "All tracked files pass whitespace checks."
@@ -94,7 +107,8 @@ jobs:
       run: |
         $binaryExts = @('.exe', '.dll', '.png', '.ico', '.zip', '.sha256', '.sha512')
         $bad = @()
-        foreach ($f in git ls-files) {
+        $files = git -c core.quotepath=off ls-files -z | ForEach-Object { $_ -split "`0" } | Where-Object { $_ }
+        foreach ($f in $files) {
           if ($binaryExts -contains [System.IO.Path]::GetExtension($f).ToLowerInvariant()) { continue }
           $b = [System.IO.File]::ReadAllBytes((Join-Path $PWD $f))
           if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $bad += "$f (UTF-8 BOM)" }
@@ -108,6 +122,7 @@ jobs:
     needs: [detect, hygiene]
     if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Setup Zig
@@ -132,6 +147,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.detect.outputs.matrix) }}
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -204,11 +220,13 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.detect.outputs.matrix) }}
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -225,22 +243,21 @@ jobs:
       with:
         name: release-${{ matrix.component }}
         path: ${{ matrix.component }}/dist
-    - name: Attest build provenance
-      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-      with:
-        subject-path: '${{ matrix.component }}/dist/shim-*.zip'
     - name: Resolve fromTag
       id: fromtag
       shell: pwsh
+      env:
+        COMPONENT: ${{ matrix.component }}
+        VERSION: ${{ matrix.version }}
       run: |
-        $tags = git tag --list "${{ matrix.component }}/v*" | ForEach-Object { $_ -replace '^[^/]+/v', '' } | Where-Object { $_ -match '^\d+\.\d+\.\d+$' }
-        $ver = "${{ matrix.version }}"
+        $tags = git tag --list "$env:COMPONENT/v*" | ForEach-Object { $_ -replace '^[^/]+/v', '' } | Where-Object { $_ -match '^\d+\.\d+\.\d+$' }
+        $ver = $env:VERSION
         $sorted = @($tags | Sort-Object { [version]$_ })
         $i = [array]::IndexOf($sorted, $ver)
         if ($i -lt 1) {
-          throw "Cannot resolve previous release tag for ${{ matrix.component }} v$ver (known release tags: $($sorted -join ', '))"
+          throw "Cannot resolve previous release tag for $env:COMPONENT v$ver (known release tags: $($sorted -join ', '))"
         }
-        $prev = "${{ matrix.component }}/v$($sorted[$i-1])"
+        $prev = "$env:COMPONENT/v$($sorted[$i-1])"
         echo "tag=$prev" >> $env:GITHUB_OUTPUT
     - name: Build Changelog
       id: changelog
