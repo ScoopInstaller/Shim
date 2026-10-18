@@ -6,13 +6,28 @@
  *   report <file>              Report the standard handles this process was given.
  *                              A managed host (pwsh, .NET) repairs an invalid
  *                              stdout handle during startup, which hides exactly
- *                              the defect these tests exist to catch. Nothing here
- *                              touches stdio except to read its state. Writes one
- *                              line: stdout_valid= stdout_type= stdout_is_console=
- *                              [stdout_inherit=] stdout_write=, where 2 is
- *                              FILE_TYPE_CHAR.
+ *                              the defect these tests exist to catch. Nothing in
+ *                              this mode touches stdio except to read its state.
+ *                              Writes one line: stdout_valid= stdout_type=
+ *                              stdout_is_console= [stdout_inherit=] stdout_write=
+ *                              console= window=, where 2 is FILE_TYPE_CHAR.
+ *                              console= is GetConsoleProcessList != 0 and window=
+ *                              is GetConsoleWindow() != NULL: a windowless console
+ *                              is still a console, so the two differ.
  *
- *   create <exe> [--null-out|--default] [-- <args>...]
+ *   manifest <exe>             Write <exe>'s embedded manifest, raw UTF-8, to
+ *                              stdout. The image is mapped as data, which runs
+ *                              nothing and reads either architecture, and the
+ *                              resource is looked up as type 24 by number and ID
+ *                              1 by number. That numeric lookup is the point: a
+ *                              cross-compiling toolchain that emitted the manifest
+ *                              as a *named* resource -- which the loader ignores
+ *                              without any error -- makes this lookup fail instead.
+ *                              One stderr line and a distinct non-zero exit when
+ *                              the image or the resource is absent, so a missing
+ *                              manifest reads as a failure, not as empty output.
+ *
+ *   create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- <args>...]
  *                              Launch <exe> as a creator. --null-out sets
  *                              STARTF_USESTDHANDLES while passing stdout as NULL
  *                              and stdin/stderr as pipes, which is the shape Go's
@@ -23,6 +38,18 @@
  *                              application resolves the console's own handles. A
  *                              console is allocated first, so the outcome does not
  *                              depend on what the runner happens to have.
+ *                              --detached adds DETACHED_PROCESS, which leaves the
+ *                              child with no console at all -- the state a GUI
+ *                              host's detached windowless spawn produces.
+ *                              --stdin <text> pipes <text> to the child's stdin,
+ *                              newline appended when it lacks one, and pipes all
+ *                              three streams. stdout/stderr are probe's own
+ *                              handles, so a console-less child's output still
+ *                              reaches the runner, and no stream is nulled so
+ *                              the CONIN$/CONOUT$ fallback stays inert. It
+ *                              contradicts --null-out; the pair exits 5.
+ *                              Every argument after -- is re-quoted per the MS
+ *                              command-line rules, so a spaced argument survives.
  *
  *   args <arg>...              One "Arg N is <value>" line per argument, index
  *                              zero-based, value UTF-8 and unescaped, after a
@@ -170,6 +197,14 @@ static void report(const wchar_t *path)
     int valid = (h != NULL && h != INVALID_HANDLE_VALUE) ? 1 : 0;
     int writable = WriteFile(h, "", 0, NULL, NULL) ? 1 : 0;
 
+    /* GetConsoleProcessList needs a real buffer: a NULL list with count 0 is
+     * documented misuse and returns 0 with ERROR_INVALID_PARAMETER regardless of
+     * whether a console is attached. GetConsoleWindow cannot stand in for this,
+     * because it is NULL both with no console and with a windowless one. */
+    DWORD consolePid = 0;
+    int hasConsole = GetConsoleProcessList(&consolePid, 1) != 0;
+    int hasWindow = GetConsoleWindow() != NULL ? 1 : 0;
+
     char *p = line;
     p = put_str(p, "stdout_valid=");
     p = put_num(p, (unsigned long)valid);
@@ -183,6 +218,10 @@ static void report(const wchar_t *path)
     }
     p = put_str(p, " stdout_write=");
     p = put_num(p, (unsigned long)writable);
+    p = put_str(p, " console=");
+    p = put_num(p, (unsigned long)hasConsole);
+    p = put_str(p, " window=");
+    p = put_num(p, (unsigned long)hasWindow);
     *p++ = '\n';
 
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -359,7 +398,29 @@ static void do_touch(const wchar_t *path)
 /* Global so the command line does not land on the stack. */
 static wchar_t g_cmd[CMD_MAX];
 
-static int create(const wchar_t *exe, int nullOut, int firstArg)
+/* Quote one argument the way CommandLineToArgvW parses it back (parse_cmdline run backwards). */
+static void append_arg(int *len, const wchar_t *s)
+{
+    g_cmd[(*len)++] = L'"';
+    for (const wchar_t *q = s; *q; q++) {
+        int n = 0;
+
+        while (*q == L'\\') { n++; q++; }
+        if (!*q) {
+            for (int i = 0; i < 2 * n; i++) g_cmd[(*len)++] = L'\\';
+            break;
+        }
+        if (*q == L'"') {
+            for (int i = 0; i < 2 * n + 1; i++) g_cmd[(*len)++] = L'\\';
+        } else {
+            for (int i = 0; i < n; i++) g_cmd[(*len)++] = L'\\';
+        }
+        g_cmd[(*len)++] = *q;
+    }
+    g_cmd[(*len)++] = L'"';
+}
+
+static int create(const wchar_t *exe, int nullOut, int detached, const wchar_t *stdinText, int firstArg)
 {
     int len = 0;
 
@@ -408,7 +469,33 @@ static int create(const wchar_t *exe, int nullOut, int firstArg)
     HANDLE inRd = NULL, inWr = NULL, erRd = NULL, erWr = NULL;
     BOOL inherit = FALSE;
 
-    if (nullOut) {
+    if (stdinText) {
+        /* Closing the write end gives the child EOF; the read end may stay open,
+         * this process exits right after the child does. */
+        static char feed[ARGS_BUF];
+        int cb = WideCharToMultiByte(CP_UTF8, 0, stdinText, wlen(stdinText), feed,
+                                     (int)sizeof(feed) - 2, NULL, NULL);
+        DWORD wrote = 0;
+
+        if (cb < 0) cb = 0;
+        if (cb == 0 || feed[cb - 1] != '\n') feed[cb++] = '\n';
+
+        if (!CreatePipe(&inRd, &inWr, &sa, 0)) return 3;
+        SetHandleInformation(inWr, HANDLE_FLAG_INHERIT, 0);
+        WriteFile(inWr, feed, (DWORD)cb, &wrote, NULL);
+        CloseHandle(inWr);
+        inWr = NULL;
+
+        /* A handle probe inherited is not automatically inheritable by probe's child. */
+        SetHandleInformation(GetStdHandle(STD_OUTPUT_HANDLE), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(GetStdHandle(STD_ERROR_HANDLE), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = inRd;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        inherit = TRUE;
+    } else if (nullOut) {
         if (!CreatePipe(&inRd, &inWr, &sa, 0)) return 3;
         if (!CreatePipe(&erRd, &erWr, &sa, 0)) return 3;
         SetHandleInformation(inWr, HANDLE_FLAG_INHERIT, 0);
@@ -431,6 +518,44 @@ static int create(const wchar_t *exe, int nullOut, int firstArg)
     return (int)code;
 }
 
+/* Exit 5, so a bad flag combination is told apart from the usage fallthrough's arity error. */
+static void usage_error(const char *msg)
+{
+    DWORD n = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, lstrlenA(msg), &n, NULL);
+    ExitProcess(5);
+}
+
+/* The manifest's own failure exit: 6, apart from the usage fallthrough's 1 and
+ * usage_error's 5. */
+static void manifest_error(const char *msg)
+{
+    DWORD n = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, lstrlenA(msg), &n, NULL);
+    ExitProcess(6);
+}
+
+/* manifest <exe>: dump the embedded manifest resource, raw. Mapping as data runs
+ * nothing and is architecture-agnostic. Type 24 and ID 1 both by number, never by
+ * a resolved symbol: an llvm-rc that named the resource leaves the loader ignoring
+ * it with no error anywhere, and this lookup is what turns that into a visible
+ * failure (RATIONALE.md). */
+static void print_manifest(const wchar_t *path)
+{
+    HMODULE h = LoadLibraryExW(path, NULL, LOAD_LIBRARY_AS_DATAFILE);
+    DWORD written = 0;
+
+    if (!h) manifest_error("probe: cannot map the image\n");
+    HRSRC res = FindResourceW(h, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24));
+    if (!res) manifest_error("probe: no manifest resource (type 24, id 1)\n");
+    HGLOBAL data = LoadResource(h, res);
+    if (!data) manifest_error("probe: cannot load the manifest resource\n");
+    const void *bytes = LockResource(data);
+    DWORD size = SizeofResource(h, res);
+    if (!bytes || size == 0) manifest_error("probe: empty manifest resource\n");
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), bytes, size, &written, NULL);
+}
+
 void __stdcall probe_entry(void)
 {
     parse_cmdline();
@@ -440,19 +565,37 @@ void __stdcall probe_entry(void)
         ExitProcess(0);
     }
 
+    if (arg_is(1, L"manifest") && g_argc >= 3) {
+        print_manifest(g_argv[2]);
+        ExitProcess(0);
+    }
+
     if (arg_is(1, L"create") && g_argc >= 3) {
         int i = 3;
         int nullOut = 0;
+        int detached = 0;
+        const wchar_t *stdinText = NULL;
 
-        if (arg_is(i, L"--null-out")) {
-            nullOut = 1;
-            i++;
-        } else if (arg_is(i, L"--default")) {
-            i++;
+        /* Flags are order-independent so a test can pair --detached with either
+         * stdio shape without depending on argument order. */
+        for (;;) {
+            if (arg_is(i, L"--null-out")) { nullOut = 1; i++; }
+            else if (arg_is(i, L"--default")) { i++; }
+            else if (arg_is(i, L"--detached")) { detached = 1; i++; }
+            else if (arg_is(i, L"--stdin")) {
+                if (i + 1 >= g_argc) usage_error("probe: --stdin needs the text to feed\n");
+                stdinText = g_argv[i + 1];
+                i += 2;
+            }
+            else break;
         }
+
+        /* Letting either win would report a shape the creator never built. */
+        if (stdinText && nullOut) usage_error("probe: --stdin cannot be combined with --null-out\n");
+
         if (arg_is(i, L"--")) i++;
 
-        ExitProcess((UINT)create(g_argv[2], nullOut, i));
+        ExitProcess((UINT)create(g_argv[2], nullOut, detached, stdinText, i));
     }
 
     if (arg_is(1, L"args")) {
@@ -502,7 +645,8 @@ void __stdcall probe_entry(void)
 
     static const wchar_t usage[] =
         L"usage: probe report <file>\n"
-        L"       probe create <exe> [--null-out|--default] [-- args...]\n"
+        L"       probe manifest <exe>\n"
+        L"       probe create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- args...]\n"
         L"       probe args <arg>...\n"
         L"       probe env [name...] | cwd | echo|echoerr <text...>\n"
         L"       probe exit [code] | stdin | wait <ms> | touch <file>\n";

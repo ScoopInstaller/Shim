@@ -806,7 +806,14 @@ enum class LineKind
     PROCESS_INFORMATION pi {};
 
     // SUSPENDED: the child must join the job object before it can spawn its own children.
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr, cwd, &si, &pi)) [[likely]]
+    // Without the flag a console-less shim gives a console target a fresh windowed console.
+    // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
+    DWORD consolePid = 0;
+    DWORD creationFlags = CREATE_SUSPENDED;
+    if (GetConsoleProcessList(&consolePid, 1) == 0)
+        creationFlags |= CREATE_NO_WINDOW;
+
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, creationFlags, nullptr, cwd, &si, &pi)) [[likely]]
     {
         result.thread.reset(pi.hThread);
         result.process.reset(pi.hProcess);

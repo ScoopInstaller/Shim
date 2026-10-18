@@ -76,16 +76,19 @@ function Write-Batch {
 
 # Run a standard console shim test.
 # Setup: scriptblock receiving $testDir, sets up batch files and .shim content
-# RunArgs: arguments passed to the shim executable
-# Assert: scriptblock receiving @{Output; ExitCode; TestDir; Elapsed} returning $true/$false + message
-# PipeInput: optional string piped to the shim's stdin
+# RunArgs: arguments passed to the shim executable; with CreatorArgs they follow '--'
+#           so both apply and a RunArg is never eaten as a create flag.
+# Assert: scriptblock receiving @{Output; ExitCode; TestDir; Elapsed}; returns $true/$false + message
+# PipeInput: optional string for the shim's stdin; with CreatorArgs it becomes probe's --stdin
+# CreatorArgs: probe create flags -- the only way to control the console the shim starts with
 function Invoke-ShimTest {
     param(
         [string]$Name,
         [Parameter(Mandatory=$true)][scriptblock]$Setup,
         [string[]]$RunArgs = @(),
         [Parameter(Mandatory=$true)][scriptblock]$Assert,
-        [string]$PipeInput = $null
+        [string]$PipeInput = $null,
+        [string[]]$CreatorArgs = @()
     )
     $script:TestNumber++
     $num = $script:TestNumber
@@ -93,7 +96,11 @@ function Invoke-ShimTest {
     try {
         & $Setup $testDir
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        if ($PipeInput) {
+        if ($CreatorArgs.Count -gt 0) {
+            $creatorArgs = @($CreatorArgs)
+            if ($PipeInput) { $creatorArgs += @('--stdin', $PipeInput) }
+            $output = & $probeExe create "$testDir\test.exe" @creatorArgs -- @RunArgs 2>&1 | Out-String
+        } elseif ($PipeInput) {
             $output = $PipeInput | & "$testDir\test.exe" @RunArgs 2>&1 | Out-String
         } else {
             $output = & "$testDir\test.exe" @RunArgs 2>&1 | Out-String
@@ -848,6 +855,43 @@ Invoke-GuiShimTest "GUI shim exit code (7)" -Setup {
     @{ Pass = $r.ExitCode -eq 7; Message = "Expected: 7, Got: $($r.ExitCode)" }
 }
 
+# --- Target console ------------------------------------------------------------
+
+# DETACHED_PROCESS is what leaves the shim console-less (CREATE_NO_WINDOW is ignored
+# beside it); the host's other flag, CREATE_NEW_PROCESS_GROUP, only reroutes Ctrl+C.
+# Only the probe can build this creator -- PowerShell always gives the shim a console.
+
+Invoke-ShimTest "Console-less creator gives the target no window" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = report $d\report.txt"
+} -CreatorArgs @('--detached') -Assert {
+    param($r)
+    $report = Join-Path $r.TestDir 'report.txt'
+    $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
+    # window=1 is never asserted: this runner's own console has no window.
+    @{ Pass = ($got -match 'window=0'); Message = "Report: $got" }
+}
+
+Invoke-ShimTest "A shim with a console still shares it with the target" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = report $d\report.txt"
+} -Assert {
+    param($r)
+    $report = Join-Path $r.TestDir 'report.txt'
+    $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
+    @{ Pass = ($got -match 'console=1'); Message = "Report: $got" }
+}
+
+# The target's answer only reaches the runner because probe forwards its own stdout
+# down to a console-less child.
+Invoke-ShimTest "Console-less creator still feeds the target's stdin" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = stdin"
+} -CreatorArgs @('--detached') -PipeInput "PIPE_FROM_GUI_HOST" -Assert {
+    param($r)
+    @{ Pass = ($r.Output -match '(?m)^GOT=PIPE_FROM_GUI_HOST\r?$'); Message = "Output: $($r.Output)" }
+}
+
 # --- Null-stream creator ---------------------------------------------------------
 
 # The CONIN$/CONOUT$ fallback only runs when a creator sets STARTF_USESTDHANDLES with a
@@ -888,6 +932,19 @@ $script:TestNumber++
 $num = $script:TestNumber
 $sub = Get-PESubsystem -FilePath $ShimExe
 Write-TestResult "#$num Console shim subsystem is CUI" ($sub -eq 3) "Subsystem: $sub (expected 3)"
+
+# The manifest is asserted as a resource, never by searching the binary's bytes: a
+# toolchain that emitted it as a named resource leaves the loader ignoring it with no
+# error anywhere. probe reads it as type 24 by number and id 1 by number, which is what
+# turns that trap into a failure here.
+$script:TestNumber++
+$num = $script:TestNumber
+$manifest = & $probeExe manifest $ShimExe 2>&1 | Out-String
+Write-TestResult "#$num Shim manifest carries longPathAware and consoleAllocationPolicy" `
+    (($manifest -match '>true</longPathAware>') -and
+     ($manifest -match '>detached</consoleAllocationPolicy>') -and
+     ($manifest -match 'SMI/2024/WindowsSettings')) `
+    "Manifest: $manifest"
 
 # ============================================================================
 # Summary

@@ -17,8 +17,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GetStdHandle, SetConsoleCtrlHandler, WriteConsoleW,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    AttachConsole, FreeConsole, GetConsoleProcessList, GetStdHandle, SetConsoleCtrlHandler,
+    WriteConsoleW, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -33,8 +33,9 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, GetStartupInfoW, ResumeThread, WaitForSingleObject,
-    CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, GetStartupInfoW, ResumeThread, TerminateProcess,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{
     CommandLineToArgvW, ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -850,6 +851,14 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     // SUSPENDED: the child must join the job object before it can spawn its own children.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
+    // Without the flag a console-less shim gives a console target a fresh windowed console.
+    // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
+    let mut console_pid: u32 = 0;
+    let mut creation_flags = CREATE_SUSPENDED;
+    if unsafe { GetConsoleProcessList(&mut console_pid, 1) } == 0 {
+        creation_flags |= CREATE_NO_WINDOW;
+    }
+
     if unsafe {
         CreateProcessW(
             std::ptr::null(),
@@ -857,7 +866,7 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            CREATE_SUSPENDED,
+            creation_flags,
             std::ptr::null(),
             cwd_ptr,
             &mut si,

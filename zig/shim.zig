@@ -31,6 +31,7 @@ const STD_OUTPUT_HANDLE = @as(DWORD, @bitCast(@as(i32, -11)));
 const STD_ERROR_HANDLE = @as(DWORD, @bitCast(@as(i32, -12)));
 
 const CREATE_SUSPENDED = 0x00000004;
+const CREATE_NO_WINDOW = 0x08000000;
 const SW_SHOW = 5;
 
 const IMAGE_DOS_SIGNATURE = 0x5A4D;
@@ -102,6 +103,7 @@ extern "kernel32" fn CreateFileW(
 ) callconv(.winapi) HANDLE;
 extern "kernel32" fn FreeConsole() callconv(.winapi) BOOL;
 extern "kernel32" fn AttachConsole(dwProcessId: i32) callconv(.winapi) BOOL;
+extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]DWORD, dwProcessCount: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const WCHAR;
 extern "kernel32" fn CreateJobObjectW(lpJobAttributes: ?*anyopaque, lpName: ?[*:0]const WCHAR) callconv(.winapi) ?HANDLE;
 extern "kernel32" fn SetInformationJobObject(
@@ -950,8 +952,16 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     }
 
     var pi: windows.PROCESS.INFORMATION = undefined;
+    // Without the flag a console-less shim gives a console target a fresh windowed console.
+    // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
+    var console_pid: DWORD = 0;
+    var creation_flags: DWORD = CREATE_SUSPENDED;
+    if (GetConsoleProcessList(@ptrCast(&console_pid), 1) == 0) {
+        creation_flags |= CREATE_NO_WINDOW;
+    }
+
     // SUSPENDED: the child must join the job object before it can spawn its own children.
-    if (CreateProcessW(null, @ptrCast(@constCast(cmd.ptr)), null, null, .TRUE, CREATE_SUSPENDED, null, if (cwd) |c| @ptrCast(c.ptr) else null, &si, &pi).toBool()) {
+    if (CreateProcessW(null, @ptrCast(@constCast(cmd.ptr)), null, null, .TRUE, creation_flags, null, if (cwd) |c| @ptrCast(c.ptr) else null, &si, &pi).toBool()) {
         result.thread = pi.hThread;
         result.process = pi.hProcess;
 

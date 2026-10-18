@@ -156,6 +156,9 @@ namespace Scoop
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool AttachConsole(int dwProcessId);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint GetConsoleProcessList(ref uint lpdwProcessList, uint dwProcessCount);
+
         // --- P/Invoke: Handles ---
 
         [StructLayout(LayoutKind.Sequential)]
@@ -207,6 +210,7 @@ namespace Scoop
         // --- Constants ---
 
         const uint CREATE_SUSPENDED = 0x00000004;
+        const uint CREATE_NO_WINDOW = 0x08000000;
         const uint INFINITE = 0xFFFFFFFF;
         const uint WAIT_OBJECT_0 = 0x00000000;
         const uint SEE_MASK_NOCLOSEPROCESS = 0x00000040;
@@ -803,8 +807,16 @@ namespace Scoop
             }
 
             PROCESS_INFORMATION pi;
+
+            // Without the flag a console-less shim gives a console target a fresh windowed console.
+            // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
+            uint consolePid = 0;
+            uint creationFlags = CREATE_SUSPENDED;
+            if (GetConsoleProcessList(ref consolePid, 1) == 0)
+                creationFlags |= CREATE_NO_WINDOW;
+
             if (CreateProcessW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
-                true, CREATE_SUSPENDED, IntPtr.Zero, info.Cwd,
+                true, creationFlags, IntPtr.Zero, info.Cwd,
                 ref si, out pi))
             {
                 if (jobHandle != IntPtr.Zero)
