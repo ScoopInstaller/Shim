@@ -20,7 +20,6 @@ const HMODULE = windows.HMODULE;
 const CHAR = windows.CHAR;
 const WCHAR = windows.WCHAR;
 const INFINITE: windows.DWORD = std.math.maxInt(windows.DWORD);
-const INVALID_FILE_SIZE: windows.DWORD = std.math.maxInt(windows.DWORD);
 const WAIT_FAILED: windows.DWORD = std.math.maxInt(windows.DWORD);
 const ERROR_READ_FAULT: windows.DWORD = 30;
 
@@ -81,7 +80,7 @@ extern "kernel32" fn ReadFile(
     lpOverlapped: ?*anyopaque,
 ) callconv(.winapi) BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
-extern "kernel32" fn GetFileSize(hFile: HANDLE, lpFileSizeHigh: ?*DWORD) callconv(.winapi) DWORD;
+extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *windows.LARGE_INTEGER) callconv(.winapi) BOOL;
 extern "kernel32" fn WriteConsoleW(
     hConsoleOutput: HANDLE,
     lpBuffer: [*]const WCHAR,
@@ -739,8 +738,10 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
 
     const cur_dir = getDirectory(filename[0..filename_size]);
 
-    const file_size = GetFileSize(file_handle, null);
-    if (file_size == INVALID_FILE_SIZE) {
+    // GetFileSizeEx: INVALID_FILE_SIZE is also a legitimate 4GB-1 size; ReadFile takes a DWORD count.
+    var size64: windows.LARGE_INTEGER = 0;
+    const size_ok = GetFileSizeEx(file_handle, &size64).toBool() and size64 >= 0 and size64 <= std.math.maxInt(DWORD);
+    if (!size_ok) {
         const size_err = GetLastError();
         writeError("Shim: Cannot read shim file: '");
         writeErrorUtf8(filename[0..shim_name_len]);
@@ -748,6 +749,7 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         writeErrorSys(size_err);
         return info;
     }
+    const file_size: DWORD = @intCast(size64);
 
     const file_buf = try allocator.alloc(u8, @intCast(file_size));
 
@@ -1100,6 +1102,10 @@ fn shimMain() !u32 {
         writeError("Shim: Could not get child exit code");
         writeErrorSys(GetLastError());
         exit_code = 1;
+    }
+
+    if (job_handle) |jh| {
+        _ = windows.CloseHandle(jh);
     }
 
     return exit_code;

@@ -600,8 +600,23 @@ enum class LineKind
         return {};
     }
 
-    const DWORD fileSize = GetFileSize(shimFile.get(), nullptr);
-    std::vector<char> raw(fileSize == INVALID_FILE_SIZE ? 0 : fileSize);
+    // GetFileSizeEx: INVALID_FILE_SIZE is both an error and a legitimate 4GB-1 size.
+    LARGE_INTEGER size {};
+    if (!GetFileSizeEx(shimFile.get(), &size)) [[unlikely]]
+    {
+        ReportShimFileError(L"Cannot read shim file", filename.data(), GetLastError());
+        return {};
+    }
+
+    // ReadFile takes a DWORD count, so a shim past 4GB is an error, not a truncation.
+    if (size.QuadPart < 0 || size.QuadPart > MAXDWORD) [[unlikely]]
+    {
+        ReportShimFileError(L"Cannot read shim file", filename.data(), ERROR_READ_FAULT);
+        return {};
+    }
+
+    const DWORD fileSize = static_cast<DWORD>(size.QuadPart);
+    std::vector<char> raw(fileSize);
     DWORD bytesRead = 0;
     bool readOk = true;
     DWORD readErr = ERROR_READ_FAULT;

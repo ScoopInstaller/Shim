@@ -993,6 +993,10 @@ namespace Scoop
 
             int exitCode = LaunchProcess(info, jobHandle);
 
+            // Close the job after the child exits: closing it fires KILL_ON_JOB_CLOSE.
+            if (jobHandle != IntPtr.Zero)
+                CloseHandle(jobHandle);
+
             // Return the raw exit code (>= 0x80000000 must survive the int round-trip).
             return exitCode;
         }

@@ -67,7 +67,7 @@ A GUI-subsystem shim given no arguments reaches the flag by a second route: `Fre
 
 ### Reading it
 
-**Lines are decoded one at a time, strictly.** A line that is not valid UTF-8 is reported as `Shim: invalid UTF-8 line in shim file` and dropped; the rest of the file still loads. Converting the whole file in one call is simpler and *wrong*: it replaces the bad bytes with U+FFFD, producing an environment variable whose name the user can neither type nor reference. A variable you cannot name is indistinguishable from a bug.
+**Lines are decoded one at a time, strictly.** A line that is not valid UTF-8 is reported as `Shim: invalid UTF-8 line in shim file` and dropped; the rest of the file still loads. Converting the whole file in one call is simpler and *wrong*: it replaces the bad bytes with U+FFFD, producing an environment variable whose name the user can neither type nor reference. A variable you cannot name is indistinguishable from a bug. The file is sized with `GetFileSizeEx`: `GetFileSize`'s `INVALID_FILE_SIZE` is also a legitimate 4GB-1 size, and `ReadFile` cannot take a larger count anyway.
 
 **A byte order mark is skipped off the front of the raw bytes**, before lines are split out, rather than by checking whether a decoded line is the first one. A BOM only ever appears at byte 0, so tracking "is this the first line" would be state the format never needs -- and state that four implementations would have to agree on.
 
