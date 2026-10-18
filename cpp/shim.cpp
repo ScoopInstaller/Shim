@@ -7,7 +7,6 @@
 #include <shellapi.h>
 
 #include <array>
-#include <cstring>
 #include <cwchar>
 #include <memory>
 #include <optional>
@@ -103,13 +102,23 @@ inline void WriteErrorW(const wchar_t* msg) noexcept
         return;
     }
 
-    const int cb = WideCharToMultiByte(CP_UTF8, 0, msg, static_cast<int>(len), nullptr, 0, nullptr, nullptr);
-    if (cb > 0)
+    // Segmented through a stack buffer: the error channel must not allocate or truncate.
+    std::array<char, 1024> utf8 {};
+    constexpr size_t chunkChars = utf8.size() / 4;
+    for (size_t off = 0; off < len;)
     {
-        std::vector<char> buf(static_cast<size_t>(cb));
-        WideCharToMultiByte(CP_UTF8, 0, msg, static_cast<int>(len), buf.data(), cb, nullptr, nullptr);
+        size_t count = (len - off < chunkChars) ? len - off : chunkChars;
+        // Never split a surrogate pair across segments: half of one converts to '?'.
+        if (off + count < len && msg[off + count - 1] >= 0xD800 && msg[off + count - 1] <= 0xDBFF)
+            --count;
+
+        const int cb = WideCharToMultiByte(CP_UTF8, 0, msg + off, static_cast<int>(count), utf8.data(), static_cast<int>(utf8.size()), nullptr, nullptr);
+        if (cb <= 0)
+            return;
+
         DWORD written;
-        WriteFile(hErr, buf.data(), static_cast<DWORD>(cb), &written, nullptr);
+        WriteFile(hErr, utf8.data(), static_cast<DWORD>(cb), &written, nullptr);
+        off += count;
     }
 }
 
@@ -762,6 +771,8 @@ enum class LineKind
 
     if (!info.path || info.path->empty())
     {
+        // Reset, not just report: MakeProcess has its own copy of this check.
+        info.path.reset();
         std::wstring msg = L"Shim: 'path' not found in shim file '";
         msg += filename.data();
         msg += L"'.\n";

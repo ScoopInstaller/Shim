@@ -678,6 +678,17 @@ Invoke-ShimTest "Empty path value consumes the first-wins slot" -Setup {
     @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
+Invoke-ShimTest "Empty path value stops before the launch" -Setup {
+    param($d)
+    # The args line makes a launch visible if a lane let the empty value past its guard.
+    Write-Shim $d "test" "path =`nargs = echo EMPTY_PATH_ARG_OK"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "'path' not found in shim file") -and
+            ($r.Output -notmatch "Could not create process") -and ($r.Output -notmatch "EMPTY_PATH_ARG_OK")
+    @{ Pass = $pass; Message = "Expected one 'path' not found error and no launch, Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
 Invoke-ShimTest "Missing target exe reports command and win32 error" -Setup {
     param($d)
     Write-Shim $d "test" "path = $d\does-not-exist.exe"

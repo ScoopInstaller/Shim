@@ -8,7 +8,7 @@ A launcher, not a wrapper. It reads a small text file, prepares a process, spawn
 
 Two consequences run through the whole design.
 
-**Nothing may be in the way.** The shim holds the console while the child runs, so anything the shim prints or reacts to lands between the user and the program they asked for. That is why errors go directly to the stderr handle -- `WriteConsoleW` when it is a console, UTF-8 via `WriteFile` otherwise -- and never through stdio: a block-buffered stream would hold the shim's diagnostic until exit and print it *after* everything the child had already said, putting the message in the wrong place in the transcript. A pure-ASCII fragment may go through either writer, because both render it identically, which is why the rust and zig lanes bypass the routing for a few literals.
+**Nothing may be in the way.** The shim holds the console while the child runs, so anything the shim prints or reacts to lands between the user and the program they asked for. That is why errors go directly to the stderr handle -- `WriteConsoleW` when it is a console, UTF-8 via `WriteFile` otherwise -- and never through stdio: a block-buffered stream would hold the shim's diagnostic until exit and print it *after* everything the child had already said. A pure-ASCII fragment may go through either writer, because both render it identically, which is why the rust and zig lanes bypass the routing for a few literals.
 
 **There is no runtime to install and nothing to clean up.** The shim is one source file per lane compiled to a single executable. Direct Win32 calls, no wrapper library, no helper process.
 
@@ -111,4 +111,4 @@ All `%VAR%` in a value expand when the file is read, against the environment the
 
 ## Errors
 
-A syntax error in the shim file is fatal: the shim reports it, exits 1, and never starts the target. A problem with one line -- an undecodable line, an `env:` key with no name, a variable the platform refuses -- is reported and that line is skipped. Nothing else stops the launch.
+A syntax error in the shim file is fatal: the shim reports it, exits 1, and never starts the target. A problem with one line -- an undecodable line, an `env:` key with no name, a variable the platform refuses -- is reported and that line is skipped. Nothing else stops the launch. The error channel is allocation-free -- a diagnostic is what is left when something has already gone wrong, so a failed allocation would take the report down with it; the cpp lane writes through a segmented fixed stack buffer, which is why no wide character is split.
