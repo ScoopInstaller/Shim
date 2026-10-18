@@ -11,9 +11,23 @@
 .\benchmark.ps1 -Rounds 20 -Runs 25 -Warmup 5
 ```
 
-Defaults: `-Rounds 10`, `-Runs 15`, `-Warmup 5`, `-Arch auto` (x86/x64/arm64); `-UseShell` forces the system shell, which is also used when a path contains spaces.
+Defaults: `-Rounds 10`, `-Runs 15`, `-Warmup 5`, `-Arch auto` (x86/x64/arm64), `-CanaryTimeoutSec 30`; `-UseShell` forces the system shell, which is also used when a path contains spaces.
 
-Edit `shims/template.shim` to change the benchmark target.
+Edit `shims/template.shim` to change the benchmark target. `path` may be quoted and may carry a trailing `#` comment: `path = 'C:\...\tool.exe'  # note`.
+
+## Canary and sample policy
+
+Before timing, each shim gets one canary run with stdin closed and a
+`-CanaryTimeoutSec` (default 30 s) timeout. A non-zero exit is **not** a failure: a
+target that prints usage and exits 1 or 2 is a normal target and stays in the
+timing set. Only the Windows loader's launch failures (`0xC0000135` missing DLL,
+`0xC000007B` bad image, and the rest of that NTSTATUS family) and a timeout exclude
+a shim. If no shim survives, the script fails with exit 1 rather than ranking
+`direct` alone.
+
+Below `minIqrSamples` (5) samples per candidate the IQR is withheld (`n/a` in the
+table, `null` in the JSON) and no ranking is asserted - at N=1 a zero IQR would
+otherwise read as "separated by more than IQR".
 
 ## Results
 
@@ -35,4 +49,4 @@ The three native lanes land within each other's spread and cannot be ranked agai
 
 - `benchmark.ps1` - benchmark runner
 - `shims/template.shim` - .shim content template
-- `results.md` / `results.json` - last run, regenerated on every run (not tracked)
+- `results.md` / `results.json` - last run, regenerated on every run (not tracked). `results.json` is valid JSON with no BOM, and records the per-candidate sample count, the `shuffleSeed` used for round ordering, and any candidate the canary excluded.
