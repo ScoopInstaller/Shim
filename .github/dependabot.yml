@@ -4,7 +4,20 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    labels:
+      - dependencies
+      - github-actions
+    open-pull-requests-limit: 3
   - package-ecosystem: cargo
     directory: /rust
     schedule:
       interval: weekly
+    labels:
+      - dependencies
+      - rust
+    open-pull-requests-limit: 3
+    groups:
+      # windows-sys minors rename features, so an upgrade must pass the four-lane suite; group it.
+      windows-sys:
+        patterns:
+          - windows-sys
