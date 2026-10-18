@@ -25,7 +25,13 @@ function New-AssemblyInfo {
   $verFile = Join-Path $PSScriptRoot 'version'
   $outDir  = Join-Path $PSScriptRoot 'Properties'
   $outFile = Join-Path $outDir 'AssemblyInfo.cs'
-  $ver     = (Get-Content $verFile).Trim()
+  $ver     = (Get-Content $verFile -Raw).Trim()
+  if ($ver -notmatch '^\d+(\.\d+){0,3}$') {
+    throw "Invalid version '$ver' in $verFile (expected N[.N[.N[.N]]])"
+  }
+  $parts = @($ver.Split('.'))
+  while ($parts.Count -lt 4) { $parts += '0' }
+  $v4 = $parts[0..3] -join '.'
 
   New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
@@ -55,11 +61,19 @@ function Invoke-Build {
   if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
   $exe = Join-Path $PSScriptRoot "bin\$Target\shim.exe"
   if (-not (Test-Path $exe)) { throw "Output not found: $exe" }
+  if ((Get-Item $exe).LastWriteTime -lt $buildStart) { throw "Stale output: $exe was not rebuilt by this run" }
 }
 
 # Clean bin, build
 $binDir = Join-Path $PSScriptRoot 'bin'
-Remove-Item -Path $binDir -Recurse -Force -ErrorAction SilentlyContinue
+# Clean only the target's own output directory so sibling architectures survive.
+if ($Target) {
+  $targetDir = Join-Path $binDir $Target
+  if (Test-Path $targetDir) { Remove-Item -Path $targetDir -Recurse -Force }
+} elseif (Test-Path $binDir) {
+  Remove-Item -Path $binDir -Recurse -Force
+}
+$buildStart = Get-Date
 
 if ($Target) { Invoke-Build $Target }
 else { foreach ($t in @('x86', 'x64', 'arm64')) { Invoke-Build $t } }

@@ -18,10 +18,17 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # The version file is the source of truth; Cargo.toml stores the package version separately.
-$ver = (Get-Content (Join-Path $PSScriptRoot 'version')).Trim()
+$verFile = Join-Path $PSScriptRoot 'version'
+$ver = (Get-Content $verFile -Raw).Trim()
+if ($ver -notmatch '^\d+(\.\d+){0,3}$') {
+  throw "Invalid version '$ver' in $verFile (expected N[.N[.N[.N]]])"
+}
 $toml = Get-Content (Join-Path $PSScriptRoot 'Cargo.toml') -Raw
-if ($toml -notmatch '(?m)^version\s*=\s*"' + [regex]::Escape($ver) + '"') {
-  throw "Cargo.toml version does not match version file ($ver). Update Cargo.toml."
+# Match inside the [package] section only; a dependency's version line must not satisfy this.
+$pkg = [regex]::Match($toml, '(?ms)^\[package\][^\n]*\n(.*?)(?=^\[|\z)')
+if (-not $pkg.Success) { throw "Cargo.toml has no [package] section" }
+if ($pkg.Groups[1].Value -notmatch '(?m)^\s*version\s*=\s*"' + [regex]::Escape($ver) + '"\s*$') {
+  throw "Cargo.toml [package] version does not match version file ($ver). Update Cargo.toml."
 }
 
 $targetMap = @{
@@ -57,11 +64,20 @@ function Invoke-Build {
 
   $exe = Join-Path $dstDir 'shim.exe'
   if (-not (Test-Path $exe)) { throw "Copy failed: $exe" }
+  # cargo keeps a cache-hit artifact's mtime, so creation time proves this run produced it.
+  if ((Get-Item $exe).CreationTime -lt $buildStart) { throw "Stale output: $exe was not rebuilt by this run" }
 }
 
 # Clean bin, build
 $binDir = Join-Path $PSScriptRoot 'bin'
-Remove-Item -Path $binDir -Recurse -Force -ErrorAction SilentlyContinue
+# Clean only the target's own output directory so sibling architectures survive.
+if ($Target) {
+  $targetDir = Join-Path $binDir $Target
+  if (Test-Path $targetDir) { Remove-Item -Path $targetDir -Recurse -Force }
+} elseif (Test-Path $binDir) {
+  Remove-Item -Path $binDir -Recurse -Force
+}
+$buildStart = Get-Date
 
 if ($Target) { Invoke-Build $Target }
 else { foreach ($t in @('x86', 'x64', 'arm64')) { Invoke-Build $t } }

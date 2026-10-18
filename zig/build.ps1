@@ -23,8 +23,11 @@ $zigArchMap = @{ 'x86' = 'x86-windows-msvc'; 'x64' = 'x86_64-windows-msvc'; 'arm
 function New-ShimResourceFile {
   $verFile = Join-Path $PSScriptRoot 'version'
   $rcFile  = Join-Path $PSScriptRoot 'shim.rc'
-  $ver     = (Get-Content $verFile).Trim()
-  $parts   = $ver.Split('.')
+  $ver     = (Get-Content $verFile -Raw).Trim()
+  if ($ver -notmatch '^\d+(\.\d+){0,3}$') {
+    throw "Invalid version '$ver' in $verFile (expected N[.N[.N[.N]]])"
+  }
+  $parts = @($ver.Split('.'))
   while ($parts.Count -lt 4) { $parts += '0' }
   $v1, $v2, $v3, $v4 = $parts
 
@@ -88,6 +91,7 @@ function Invoke-Build {
 
   $exe = Join-Path $PSScriptRoot "bin\$Target\shim.exe"
   if (-not (Test-Path $exe)) { throw "Output not found: $exe" }
+  if ((Get-Item $exe).LastWriteTime -lt $buildStart) { throw "Stale output: $exe was not rebuilt by this run" }
 }
 
 # Clean only the target's own output directory so sibling architectures survive.
@@ -97,6 +101,7 @@ if ($Target) {
 } else {
   Remove-Item -Path $binDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+$buildStart = Get-Date
 
 if ($Target) { Invoke-Build $Target }
 else { foreach ($t in @('x86', 'x64', 'arm64')) { Invoke-Build $t } }
