@@ -269,7 +269,11 @@ static void write_out(HANDLE h, const char *buf, int len)
 
 static char *put_utf8(char *p, int room, const wchar_t *s)
 {
-    int cb = WideCharToMultiByte(CP_UTF8, 0, s, wlen(s), p, room, NULL, NULL);
+    int cb;
+
+    /* Callers pass whatever room is left, which can reach zero. */
+    if (room <= 0) return p;
+    cb = WideCharToMultiByte(CP_UTF8, 0, s, wlen(s), p, room, NULL, NULL);
     return cb > 0 ? p + cb : p;
 }
 
@@ -424,16 +428,18 @@ static int create(const wchar_t *exe, int nullOut, int detached, const wchar_t *
 {
     int len = 0;
 
+    if (wlen(exe) + 3 >= CMD_MAX) return 2;
     g_cmd[len++] = L'"';
     for (const wchar_t *s = exe; *s; s++) g_cmd[len++] = *s;
     g_cmd[len++] = L'"';
     g_cmd[len] = 0;
 
     for (int i = firstArg; i < g_argc; i++) {
-        int need = len + wlen(g_argv[i]) + 3;
+        /* Quoting may double the argument; the budget has to assume it does. */
+        int need = len + 2 * wlen(g_argv[i]) + 4;
         if (need >= CMD_MAX) return 2;
         g_cmd[len++] = L' ';
-        for (const wchar_t *s = g_argv[i]; *s; s++) g_cmd[len++] = *s;
+        append_arg(&len, g_argv[i]);
         g_cmd[len] = 0;
     }
 
@@ -508,7 +514,13 @@ static int create(const wchar_t *exe, int nullOut, int detached, const wchar_t *
     }
 
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(exe, g_cmd, NULL, NULL, inherit, 0, NULL, NULL, &si, &pi)) return 4;
+    DWORD flags = detached ? DETACHED_PROCESS : 0;
+    BOOL started = CreateProcessW(exe, g_cmd, NULL, NULL, inherit, flags, NULL, NULL, &si, &pi);
+
+    /* Close probe's pipe ends: stdin sees EOF, a full stderr pipe fails a write not a deadlock. */
+    if (inWr) CloseHandle(inWr);
+    if (erRd) CloseHandle(erRd);
+    if (!started) return 4;
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
