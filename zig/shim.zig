@@ -119,7 +119,6 @@ extern "kernel32" fn ResumeThread(hThread: HANDLE) callconv(.winapi) DWORD;
 extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv(.winapi) BOOL;
 extern "kernel32" fn ExitProcess(exitCode: u32) callconv(.winapi) void;
 extern "shell32" fn ShellExecuteExW(lpExecInfo: *SHELLEXECUTEINFOW) callconv(.winapi) BOOL;
-extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const WCHAR, lpBuffer: ?[*]WCHAR, nSize: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn SetEnvironmentVariableW(lpName: [*:0]const WCHAR, lpValue: ?[*:0]const WCHAR) callconv(.winapi) BOOL;
 extern "shell32" fn CommandLineToArgvW(lpCmdLine: [*:0]const WCHAR, pNumArgs: *i32) callconv(.winapi) ?[*]const [*:0]const WCHAR;
 extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;

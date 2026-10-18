@@ -37,6 +37,6 @@ cd zig
 
 - A custom `wWinMainCRTStartup` entry point, not `std.start` or `pub fn main()`
 - `.toBool()` on `windows.BOOL` return values, never `@intFromEnum(...) != 0`
-- Split sentinel constants by what they mean even when the values are identical (`INVALID_FILE_SIZE` vs `INFINITE`, both `maxInt(DWORD)`)
+- Split sentinel constants by what they mean even when the values are identical (`WAIT_FAILED` vs `INFINITE`, both `maxInt(DWORD)`)
 - `pub` only on a type another module actually imports
 - An OR-able bitmask parameter is declared as `DWORD` and passed named `u32` constants such as `GENERIC_READ`; mutually exclusive parameters may use `enum(u32)`
