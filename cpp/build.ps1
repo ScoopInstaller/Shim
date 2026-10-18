@@ -92,6 +92,8 @@ function Invoke-ZigBuild {
   try {
     $a = @('build', "-Dtarget=$zigTarget", "-Doptimize=$opt", '--prefix', "bin/$Target")
     if ($Configuration -eq 'Release') { $a += '-Dstrip=true' }
+    # Native stderr on the zig call terminates under EAP=Stop before the exit-code check.
+    $ErrorActionPreference = 'Continue'
     & zig @a; if ($LASTEXITCODE -ne 0) { throw "zig failed" }
   }
   finally { Pop-Location }
@@ -108,7 +110,11 @@ function Invoke-MSBuild {
   Write-Host "MSBuild: $msPlatform ($Configuration)" -ForegroundColor Cyan
   Push-Location $PSScriptRoot
   try {
-    $r = cmd.exe /c "`"$devCmd`" -arch=$msHostArch -host_arch=amd64 -no_logo > nul 2>&1 && msbuild shim.vcxproj /p:Configuration=$Configuration /p:Platform=$msPlatform /p:OutDir=$PSScriptRoot\bin\$Target\ /t:Build /v:q /nologo" 2>&1
+    # Native stderr terminates under EAP=Stop before the exit-code check; keep it flowing.
+    $ErrorActionPreference = 'Continue'
+    # OutDir quoted for cmd.exe (spaces/metacharacters); trailing \\ is the value's own escaping.
+    $outDir = "$PSScriptRoot\bin\$Target\\"
+    $r = cmd.exe /c "`"$devCmd`" -arch=$msHostArch -host_arch=amd64 -no_logo > nul 2>&1 && msbuild shim.vcxproj /p:Configuration=$Configuration /p:Platform=$msPlatform /p:OutDir=`"$outDir`" /t:Build /v:q /nologo" 2>&1
     if ($LASTEXITCODE -ne 0) { $r | ForEach-Object { Write-Host $_ -ForegroundColor Red }; throw "MSBuild failed" }
     # /v:q leaves the success path otherwise silent, so anything captured here is a warning.
     $r | Where-Object { $_ } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }

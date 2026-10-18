@@ -57,7 +57,9 @@ function Invoke-Build {
 
   $rid = $ridMap[$Target]
   Write-Host "Publishing shim for $Target ($rid, $Configuration)..." -ForegroundColor Cyan
-  & dotnet publish (Join-Path $PSScriptRoot 'shim.csproj') -c $Configuration -r $rid --self-contained false --nologo "-p:PublishDir=bin\$Target"
+  # Absolute PublishDir: MSBuild otherwise resolves a relative one against the project.
+  $publishDir = Join-Path $PSScriptRoot "bin\$Target"
+  & dotnet publish (Join-Path $PSScriptRoot 'shim.csproj') -c $Configuration -r $rid --self-contained false --nologo "-p:PublishDir=$publishDir"
   if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
   $exe = Join-Path $PSScriptRoot "bin\$Target\shim.exe"
   if (-not (Test-Path $exe)) { throw "Output not found: $exe" }
