@@ -41,6 +41,8 @@ function Invoke-Build {
   param([string]$Target)
 
   $rustTarget = $targetMap[$Target]
+  $profile = if ($Configuration -eq 'Release') { 'release' } else { 'debug' }
+  $src = Join-Path $PSScriptRoot "target\$rustTarget\$profile\shim.exe"
   Write-Host "Cargo: $rustTarget ($Configuration)" -ForegroundColor Cyan
 
   Push-Location $PSScriptRoot
@@ -54,8 +56,6 @@ function Invoke-Build {
   }
   finally { Pop-Location }
 
-  $profile = if ($Configuration -eq 'Release') { 'release' } else { 'debug' }
-  $src = Join-Path $PSScriptRoot "target\$rustTarget\$profile\shim.exe"
   if (-not (Test-Path $src)) { throw "Output not found: $src" }
 
   $dstDir = Join-Path $PSScriptRoot "bin\$Target"

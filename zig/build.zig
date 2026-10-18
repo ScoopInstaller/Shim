@@ -48,7 +48,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Disable runtime safety checks for smaller binary
+    // The suite asserts the console subsystem, so pin it rather than let linker inference decide.
+    exe.subsystem = .console;
+
+    // Drops frame pointers only; a Debug/ReleaseSafe panic would mask the target's exit code.
     exe.root_module.omit_frame_pointer = true;
 
     // Reduce stack reservation from default 1MB to 64KB

@@ -29,7 +29,7 @@ function New-ShimResourceFile {
   }
   $parts = @($ver.Split('.'))
   while ($parts.Count -lt 4) { $parts += '0' }
-  $v1, $v2, $v3, $v4 = $parts
+  $v1 = $parts[0]; $v2 = $parts[1]; $v3 = $parts[2]; $v4 = $parts[3]
 
   $rc = @"
 #define VS_VERSION_INFO     1

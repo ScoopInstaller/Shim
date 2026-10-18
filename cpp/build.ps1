@@ -32,7 +32,7 @@ function New-ShimResourceFile {
   }
   $parts = @($ver.Split('.'))
   while ($parts.Count -lt 4) { $parts += '0' }
-  $v1, $v2, $v3, $v4 = $parts
+  $v1 = $parts[0]; $v2 = $parts[1]; $v3 = $parts[2]; $v4 = $parts[3]
 
   $rc = @"
 #define VS_VERSION_INFO     1
@@ -110,6 +110,8 @@ function Invoke-MSBuild {
   try {
     $r = cmd.exe /c "`"$devCmd`" -arch=$msHostArch -host_arch=amd64 -no_logo > nul 2>&1 && msbuild shim.vcxproj /p:Configuration=$Configuration /p:Platform=$msPlatform /p:OutDir=$PSScriptRoot\bin\$Target\ /t:Build /v:q /nologo" 2>&1
     if ($LASTEXITCODE -ne 0) { $r | ForEach-Object { Write-Host $_ -ForegroundColor Red }; throw "MSBuild failed" }
+    # /v:q leaves the success path otherwise silent, so anything captured here is a warning.
+    $r | Where-Object { $_ } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
   }
   finally { Pop-Location }
 }

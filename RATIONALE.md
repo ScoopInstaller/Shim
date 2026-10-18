@@ -18,6 +18,8 @@ Each lane is an independent implementation in its own language, with no code sha
 
 That makes parity across the four the hard constraint. Anything observable has to be specified rather than left to emerge, because emerging means differing somewhere. It is also why a rule that looks arbitrary usually has a real input behind it: getting it wrong costs four behaviors, not one.
 
+Build and test infrastructure is duplicated on purpose as well: each lane's build cleans only its own target directory and rejects output older than the run.
+
 ## The launch pipeline
 
 1. Read the shim file and classify every line.

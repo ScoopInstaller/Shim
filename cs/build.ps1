@@ -38,8 +38,8 @@ function New-AssemblyInfo {
   $content = @"
 using System.Reflection;
 
-[assembly: AssemblyVersion("$ver")]
-[assembly: AssemblyFileVersion("$ver")]
+[assembly: AssemblyVersion("$v4")]
+[assembly: AssemblyFileVersion("$v4")]
 [assembly: AssemblyInformationalVersion("$ver")]
 [assembly: AssemblyCompany("Scoop contributors")]
 [assembly: AssemblyProduct("Scoop Shim Ex")]

@@ -64,11 +64,12 @@ pub fn build(b: *std.Build) void {
     exe.link_gc_sections = true;
     exe.stack_size = 65536;
 
+    // Console subsystem is the repo-wide contract; pin it rather than rely on linker inference.
+    exe.subsystem = .console;
     if (target.result.abi == .msvc) {
         exe.root_module.link_libc = true;
     } else {
         exe.root_module.link_libcpp = true;
-        exe.subsystem = .console;
         exe.mingw_unicode_entry_point = true;
     }
 
