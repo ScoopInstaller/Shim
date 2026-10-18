@@ -29,6 +29,8 @@ Step 2 happens before step 3 for two reasons: `CreateProcessW` with a null envir
 
 Arguments come from two places -- the `args` field and the shim's own command line -- so the command line has to be rebuilt rather than appended to, and the user's arguments re-quoted on the way. `QuoteArg` implements the `CreateProcessW` rules for exactly that reason: the child must see the arguments the user typed, not a re-parse of them.
 
+`CommandLineToArgvW` returns a signed count, and a negative value is a failed parse, so every lane clamps it before using it as a capacity or loop bound.
+
 **Every shim carries a `longPathAware` manifest.** Windows only lets a process hand a path beyond `MAX_PATH` to `CreateProcessW` if that process opts in, and the opt-in is a manifest rather than anything in the code. The resource has to be written as type `24` by number: a cross-compiling `llvm-rc` does not resolve the `RT_MANIFEST` symbol and produces a *named* resource called `RT_MANIFEST` instead, which carries the manifest's bytes and is ignored by the loader. Nothing fails, and searching the binary for the manifest finds it.
 
 ## Process lifetime
@@ -37,7 +39,9 @@ The shim is not supposed to outlive its job, and the child is not supposed to ou
 
 **A job object ties them together.** `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means the child dies when the shim does, so a closed console window does not leave an orphaned process behind. `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` scopes that to the *direct* child: a process the tool deliberately detaches, or a server it spawns, is its own business. Owning the whole tree would break exactly the tools a launcher exists to run.
 
-**The child is created suspended.** It has to be in the job before it can spawn anything of its own. Without `CREATE_SUSPENDED` there is a window between creation and job assignment in which the child can start a grandchild, and that grandchild escapes the job. This holds for the `CreateProcessW` path only. `ShellExecuteExW` has no suspended option, so an elevated child is already running when it joins the job and that window is open there; the retry after `ERROR_ELEVATION_REQUIRED` launches the same way.
+**The child is created suspended.** It has to be in the job before it can spawn anything of its own. Without `CREATE_SUSPENDED` there is a window between creation and job assignment in which the child can start a grandchild, and that grandchild escapes the job. This holds for the `CreateProcessW` path only; `ShellExecuteExW` has no suspended option, so the elevated path and its `ERROR_ELEVATION_REQUIRED` retry keep that window open (see Elevation).
+
+**A job that could not be created is not fatal** -- every lane reports each job-object failure (create, set limits, assign) and runs ungoverned, and the resume-failure branch then terminates the child directly, since a child that never resumes would sit suspended holding its image until the shim exits.
 
 **The console belongs to the child.** The shim swallows every console control event and returns `TRUE`. The user is interacting with the program the shim launched, so Ctrl+C has to reach it and not the shim -- and if the shim died on Ctrl+C, `KILL_ON_JOB_CLOSE` would take the child down with it. The handler is installed *before* the spawn, which closes the remaining window where a Ctrl event would kill the shim and the child with it.
 
@@ -45,7 +49,7 @@ The shim is not supposed to outlive its job, and the child is not supposed to ou
 
 ## Console behavior
 
-A GUI-subsystem shim would flash a console window on every launch, so the shim calls `FreeConsole` when its own PE subsystem is `IMAGE_SUBSYSTEM_WINDOWS_GUI`. If that same shim is given arguments, it is being used as a command-line tool, so it calls `AttachConsole(ATTACH_PARENT_PROCESS)` instead and the target's output has somewhere to go. That decision belongs to the launch path alone -- nothing downstream re-attaches, because a failed `CONOUT$` open *is* the policy for the no-argument case, not a problem to work around.
+A GUI-subsystem shim would flash a console window on every launch, so the shim calls `FreeConsole` when its own PE subsystem is `IMAGE_SUBSYSTEM_WINDOWS_GUI`. If that same shim is given arguments, it is being used as a command-line tool, so it calls `AttachConsole(ATTACH_PARENT_PROCESS)` instead and the target's output has somewhere to go. That decision belongs to the launch path alone -- nothing downstream re-attaches, because a failed `CONOUT$` open *is* the policy for the no-argument case, not a problem to work around. The check reads the PE header, which lives in the module's first page, so an `e_lfanew` outside it is a bogus offset rather than a malformed image.
 
 The standard handles are seeded from the shim's own only where the creator left a slot empty, and the `CONIN$`/`CONOUT$` fallback only fires when the creator passed a null stream under `STARTF_USESTDHANDLES` -- which is what Go's `os/exec` does whenever only some of the three streams are set. Both blocks are inert for a creator that omits `STARTF_USESTDHANDLES` entirely, because `CreateProcessW` then ignores the seeded handles and the child resolves its own. That is why they read as load-bearing and mostly are not: a defect in either one stays invisible until something passes a null stream.
 
@@ -83,7 +87,7 @@ The check runs while the file is being read, the one place that sees every line.
 
 ### Two passes over the fields
 
-`%~dp0` means the **shim's own directory** inside `path`, and the **target's directory** everywhere else. The target's directory is not known until `path` has been resolved, so the first pass finds and absolutises `path` and the second expands every other field against it. That is the only reason the parser needs two passes, and it is why `%~dp0` means two different things in the same file.
+`%~dp0` means the **shim's own directory** inside `path`, and the **target's directory** everywhere else. The target's directory is not known until `path` has been resolved, so the first pass finds and absolutises `path` and the second expands every other field against it. That is the only reason the parser needs two passes, and it is why `%~dp0` means two different things in the same file. The target's directory is what `GetFullPathNameW` answers for the resolved `path`; when that call fails, the shim reports it and falls back to the input with its last component dropped, because expanding `%~dp0` into a value that still ends in the target's file name puts a path where a directory belongs.
 
 ### The `env:` prefix
 

@@ -140,6 +140,10 @@ namespace Scoop
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
         // --- P/Invoke: Console ---
 
         delegate bool HandlerRoutine(uint dwCtrlType);
@@ -229,6 +233,10 @@ namespace Scoop
         const uint OPEN_EXISTING = 3;
         const uint STARTF_USESTDHANDLES = 0x00000100;
 
+        const uint FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000;
+        const uint FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;
+        const uint FORMAT_MESSAGE_MAX_WIDTH_MASK = 0x000000FF;
+
         const ushort IMAGE_DOS_SIGNATURE = 0x5A4D;
         const uint IMAGE_NT_SIGNATURE = 0x00004550;
         const ushort IMAGE_SUBSYSTEM_WINDOWS_GUI = 2;
@@ -291,7 +299,6 @@ namespace Scoop
         {
             WriteErrorW("Shim: " + context);
             WriteErrorSys(error);
-            WriteErrorW("\n");
         }
 
         static string GetModulePath()
@@ -329,6 +336,8 @@ namespace Scoop
                 if (dosMagic != IMAGE_DOS_SIGNATURE) return false;
 
                 var peOffset = Marshal.ReadInt32(hModule, 0x3C);
+                // PE headers live in the first page; a bogus e_lfanew would read an unmapped page.
+                if (peOffset <= 0 || peOffset >= 0x1000) return false;
                 var peBase = hModule + peOffset;
 
                 var peSignature = (uint)Marshal.ReadInt32(peBase);
@@ -385,6 +394,18 @@ namespace Scoop
             return expanded;
         }
 
+        // Fallback after GetFullPathNameW fails: drop the last component, so %~dp0 is a directory.
+        static string ResolveFailedDir(string toResolve, uint err)
+        {
+            ReportShimError($"Could not resolve path '{toResolve}'", err);
+
+            int sep = Math.Max(toResolve.LastIndexOf('\\'), toResolve.LastIndexOf('/'));
+            string dir = sep < 0 ? toResolve : toResolve.Substring(0, sep);
+            if (dir.Length == 0 || (dir[dir.Length - 1] != '\\' && dir[dir.Length - 1] != '/'))
+                dir += "\\";
+            return dir;
+        }
+
         static string ResolveAgainstBase(string path, string baseDir)
         {
             // Rooted per README: a drive letter and a colon (drive-relative "C:app" counts), or a leading separator.
@@ -399,7 +420,7 @@ namespace Scoop
                 var sb = new StringBuilder(cap);
                 uint len = GetFullPathNameW(toResolve, (uint)sb.Capacity, sb, IntPtr.Zero);
                 if (len == 0)
-                    return toResolve + "\\"; // Best-effort fallback: hand back the unresolved path plus a separator.
+                    return ResolveFailedDir(toResolve, (uint)Marshal.GetLastWin32Error());
                 if (len >= sb.Capacity)
                 {
                     cap = (int)len + 1; // required size returned on overflow
@@ -523,6 +544,7 @@ namespace Scoop
 
             IntPtr argvPtr = CommandLineToArgvW(cmdLine, out int argc);
             if (argvPtr == IntPtr.Zero) return result;
+            if (argc < 0) argc = 0;
 
             try
             {
@@ -830,8 +852,11 @@ namespace Scoop
                 {
                     uint resumeErr = (uint)Marshal.GetLastWin32Error();
                     ReportShimError("Could not resume suspended process", resumeErr);
+                    // No job to end when CreateJobObjectW failed, so terminate the child itself.
                     if (jobHandle != IntPtr.Zero)
                         TerminateJobObject(jobHandle, 1);
+                    else
+                        TerminateProcess(pi.hProcess, 1);
                     CloseHandle(pi.hThread);
                     CloseHandle(pi.hProcess);
                     return 1;
@@ -956,6 +981,10 @@ namespace Scoop
                 {
                     ReportShimError("Could not set job object limits", (uint)Marshal.GetLastWin32Error());
                 }
+            }
+            else
+            {
+                ReportShimError("Could not create job object", (uint)Marshal.GetLastWin32Error());
             }
 
             // Before spawn: a Ctrl event in the gap would kill the shim and

@@ -362,6 +362,12 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         return false;
     }
 
+    // PE headers live in the first page, so an e_lfanew outside it is a bogus offset.
+    if (dosHeader->e_lfanew <= 0 || dosHeader->e_lfanew >= 0x1000) [[unlikely]]
+    {
+        return false;
+    }
+
     const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const BYTE*>(hModule) + dosHeader->e_lfanew);
     if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) [[unlikely]]
     {
@@ -418,6 +424,21 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return expanded;
 }
 
+// Fallback after GetFullPathNameW fails: drop the last component, so %~dp0 is a directory.
+[[nodiscard]] std::wstring ResolveFailedDir(const std::wstring& toResolve, DWORD err)
+{
+    WriteErrorW(L"Shim: Could not resolve path '");
+    WriteErrorW(toResolve.c_str());
+    WriteErrorW(L"'");
+    WriteErrorSys(err);
+
+    const size_t sep = toResolve.find_last_of(L"\\/");
+    std::wstring dir = (sep == std::wstring::npos) ? toResolve : toResolve.substr(0, sep);
+    if (dir.empty() || (dir.back() != L'\\' && dir.back() != L'/'))
+        dir += L'\\';
+    return dir;
+}
+
 // Returns the directory portion (trailing backslash) of the absolute form of `path`.
 [[nodiscard]] std::wstring ResolveAgainstBase(std::wstring_view path, std::wstring_view baseDir)
 {
@@ -445,12 +466,12 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         // Two-call sizing: len > MAX_PATH is the required buffer size (incl. null).
         DWORD required = (len >= MAX_PATH) ? len : GetFullPathNameW(toResolve.c_str(), 0, nullptr, nullptr);
         if (required == 0) [[unlikely]]
-            return toResolve + L'\\'; // retry failed too - best-effort fallback
+            return ResolveFailedDir(toResolve, GetLastError());
 
         std::vector<wchar_t> big(required);
         DWORD len2 = GetFullPathNameW(toResolve.c_str(), required, big.data(), &filePart);
         if (len2 == 0 || len2 >= required) [[unlikely]]
-            return toResolve + L'\\';
+            return ResolveFailedDir(toResolve, GetLastError());
         resolvedStr.assign(big.data());
         dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - big.data()) : resolvedStr.size();
     }
@@ -582,13 +603,13 @@ enum class LineKind
     const DWORD fileSize = GetFileSize(shimFile.get(), nullptr);
     std::vector<char> raw(fileSize == INVALID_FILE_SIZE ? 0 : fileSize);
     DWORD bytesRead = 0;
-    bool readOk = (fileSize != INVALID_FILE_SIZE);
+    bool readOk = true;
     DWORD readErr = ERROR_READ_FAULT;
-    if (readOk && fileSize > 0)
+    if (fileSize > 0)
     {
         readOk = ReadFile(shimFile.get(), raw.data(), fileSize, &bytesRead, nullptr) != FALSE;
         readErr = readOk ? ERROR_READ_FAULT : GetLastError();
-        // Short read: the file shrank between GetFileSize and ReadFile, so GetLastError() is 0.
+        // Short read: the file shrank between the size query and ReadFile, so GetLastError() is 0.
         if (readOk && bytesRead != fileSize)
             readOk = false;
     }
@@ -687,7 +708,7 @@ enum class LineKind
             {
                 int shimArgc = 0;
                 LPWSTR* shimArgv = CommandLineToArgvW(argsStr.c_str(), &shimArgc);
-                if (shimArgv)
+                if (shimArgv && shimArgc > 0)
                 {
                     for (int i = 0; i < shimArgc; ++i)
                     {
@@ -830,8 +851,11 @@ enum class LineKind
             const DWORD resumeErr = GetLastError();
             WriteErrorW(L"Shim: Could not resume suspended process");
             WriteErrorSys(resumeErr);
+            // No job to end when CreateJobObjectW failed, so terminate the child itself.
             if (jobHandle)
                 TerminateJobObject(jobHandle, 1);
+            else
+                TerminateProcess(result.process.get(), 1);
             result.thread.reset();
             result.process.reset();
         }
@@ -868,7 +892,7 @@ int wmain(int argc, wchar_t* argv[])
     {
         int userArgc = 0;
         LPWSTR* userArgv = CommandLineToArgvW(GetCommandLineW(), &userArgc);
-        if (userArgv)
+        if (userArgv && userArgc > 0)
         {
             for (int i = 1; i < userArgc; ++i)
             {
@@ -902,6 +926,11 @@ int wmain(int argc, wchar_t* argv[])
             WriteErrorW(L"Shim: Could not set job object limits");
             WriteErrorSys(GetLastError());
         }
+    }
+    else [[unlikely]]
+    {
+        WriteErrorW(L"Shim: Could not create job object");
+        WriteErrorSys(GetLastError());
     }
 
     // Before spawn: a Ctrl event in the gap would kill the shim and

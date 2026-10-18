@@ -238,6 +238,10 @@ unsafe fn is_gui_subsystem() -> bool {
     }
 
     let pe_offset = *(base.add(0x3C) as *const i32);
+    // PE headers live in the first page, so an e_lfanew outside it is a bogus offset.
+    if pe_offset <= 0 || pe_offset >= 0x1000 {
+        return false;
+    }
     let pe_base = base.offset(pe_offset as isize);
 
     let nt_sig = *(pe_base as *const u32);
@@ -368,6 +372,7 @@ fn parse_args_from_cmdline(cmdline: &str) -> Vec<OsString> {
         if argv.is_null() {
             return Vec::new();
         }
+        let argc = argc.max(0);
         let mut result = Vec::with_capacity(argc as usize);
         for i in 0..argc as isize {
             let ptr = *argv.offset(i);
@@ -398,6 +403,7 @@ fn parse_user_args_from_cmdline() -> Vec<OsString> {
         if argv.is_null() {
             return Vec::new();
         }
+        let argc = argc.max(0);
         let mut result = Vec::with_capacity(argc as usize);
         for i in 0..argc as isize {
             let ptr = *argv.offset(i);
@@ -412,6 +418,25 @@ fn parse_user_args_from_cmdline() -> Vec<OsString> {
         LocalFree(argv as *mut _);
         result
     }
+}
+
+// Fallback after GetFullPathNameW fails: drop the last component, so %~dp0 is a directory.
+fn resolve_failed_dir(to_resolve: &[u16], err: u32) -> String {
+    let input = String::from_utf16_lossy(&to_resolve[..to_resolve.len() - 1]);
+    unsafe {
+        write_error_wide(&to_wide("Shim: Could not resolve path '"));
+        write_error_wide(&to_resolve[..to_resolve.len() - 1]);
+        write_error_wide(&to_wide("'"));
+        write_error_sys(err);
+    }
+    let dir = match input.rfind(['\\', '/']) {
+        Some(sep) => input[..sep].to_string(),
+        None => input,
+    };
+    if dir.is_empty() || (!dir.ends_with('\\') && !dir.ends_with('/')) {
+        return dir + "\\";
+    }
+    dir
 }
 
 // Returns the directory portion (trailing backslash) of the absolute form of `path`.
@@ -445,15 +470,9 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
             &mut file_part,
         );
 
-        let fallback = || {
-            let mut s = String::from_utf16_lossy(&to_resolve[..to_resolve.len() - 1]);
-            s.push('\\');
-            s
-        };
-
         let mut big: Vec<u16>;
         let resolved: &[u16] = if len == 0 {
-            return fallback();
+            return resolve_failed_dir(&to_resolve, GetLastError());
         } else if len as usize >= stack.len() {
             // Overflow: len is the required size, including the null terminator.
             let required = len as usize + 1;
@@ -466,7 +485,7 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
                 &mut file_part,
             );
             if len == 0 || len as usize >= required {
-                return fallback();
+                return resolve_failed_dir(&to_resolve, GetLastError());
             }
             &big[..len as usize]
         } else {
@@ -886,8 +905,11 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
             let err = unsafe { GetLastError() };
             unsafe {
                 write_error_ctx("Could not resume suspended process", err);
+                // No job to end when CreateJobObjectW failed, so terminate the child itself.
                 if job_handle != NULL_HANDLE {
                     TerminateJobObject(job_handle, 1);
+                } else {
+                    TerminateProcess(pi.hProcess, 1);
                 }
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
@@ -971,6 +993,10 @@ fn main() {
             if ok == 0 {
                 write_error_ctx("Could not set job object limits", GetLastError());
             }
+        }
+    } else {
+        unsafe {
+            write_error_ctx("Could not create job object", GetLastError());
         }
     }
 

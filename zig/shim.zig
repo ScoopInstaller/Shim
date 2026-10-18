@@ -117,6 +117,7 @@ extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: u32) callconv(.
 extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) callconv(.winapi) BOOL;
 extern "kernel32" fn ResumeThread(hThread: HANDLE) callconv(.winapi) DWORD;
+extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv(.winapi) BOOL;
 extern "kernel32" fn ExitProcess(exitCode: u32) callconv(.winapi) void;
 extern "shell32" fn ShellExecuteExW(lpExecInfo: *SHELLEXECUTEINFOW) callconv(.winapi) BOOL;
 extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const WCHAR, lpBuffer: ?[*]WCHAR, nSize: DWORD) callconv(.winapi) DWORD;
@@ -478,8 +479,10 @@ fn parseArgsFromCmdLine(allocator: std.mem.Allocator, cmdline: [:0]const WCHAR) 
         return try allocator.alloc([:0]WCHAR, 0);
     defer _ = LocalFree(@ptrCast(@constCast(argv)));
 
-    var result = try allocator.alloc([:0]WCHAR, @intCast(argc));
-    for (0..@intCast(argc)) |idx| {
+    const argc_n: usize = if (argc > 0) @intCast(argc) else 0;
+
+    var result = try allocator.alloc([:0]WCHAR, argc_n);
+    for (0..argc_n) |idx| {
         const arg_z = argv[idx];
         const len = std.mem.len(arg_z);
         const copy = try allocator.alloc(WCHAR, len + 1);
@@ -499,6 +502,8 @@ fn isGuiSubsystem() bool {
     if (dos_sig != IMAGE_DOS_SIGNATURE) return false;
 
     const pe_offset = @as(*u32, @ptrCast(@alignCast(base + 0x3C))).*;
+    // PE headers live in the first page, so an e_lfanew outside it is a bogus offset.
+    if (pe_offset == 0 or pe_offset >= 0x1000) return false;
     const pe_sig = @as(*u32, @ptrCast(@alignCast(base + pe_offset))).*;
     if (pe_sig != IMAGE_NT_SIGNATURE) return false;
 
@@ -616,7 +621,7 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
     var stack_buf: [windows.MAX_PATH + 2:0]WCHAR = undefined;
     var file_part: ?*WCHAR = null;
     var len = GetFullPathNameW(@ptrCast(toResolve.ptr), stack_buf.len, &stack_buf, &file_part);
-    if (len == 0) return try fallbackDir(allocator, toResolve);
+    if (len == 0) return try fallbackDir(allocator, toResolve, GetLastError());
 
     var big: []WCHAR = undefined;
     const resolved_buf: []const WCHAR = if (len < stack_buf.len) stack_buf[0..len] else blk: {
@@ -627,7 +632,7 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
         // Plain pointer: big holds no sentinel at [required]; the null the API
         // writes lands at [required - 1], so a [:0] slice here would be invalid.
         len = GetFullPathNameW(@ptrCast(toResolve.ptr), required, @ptrCast(big.ptr), &file_part);
-        if (len == 0 or len >= required) return try fallbackDir(allocator, toResolve);
+        if (len == 0 or len >= required) return try fallbackDir(allocator, toResolve, GetLastError());
         break :blk big[0..len];
     };
 
@@ -644,12 +649,25 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
     return result;
 }
 
-/// Best-effort directory when resolution fails: the unresolved path plus a separator.
-fn fallbackDir(allocator: std.mem.Allocator, toResolve: []const WCHAR) ![]WCHAR {
-    const result = try allocator.alloc(WCHAR, toResolve.len + 1);
-    @memcpy(result[0..toResolve.len], toResolve);
-    result[toResolve.len] = '\\';
-    return result;
+/// Fallback after GetFullPathNameW fails: drop the last component, so %~dp0 is a directory.
+fn fallbackDir(allocator: std.mem.Allocator, toResolve: []const WCHAR, err: DWORD) ![]WCHAR {
+    writeError("Shim: Could not resolve path '");
+    writeErrorUtf8(toResolve);
+    writeError("'");
+    writeErrorSys(err);
+
+    const bs = std.mem.lastIndexOfScalar(WCHAR, toResolve, '\\');
+    const fs = std.mem.lastIndexOfScalar(WCHAR, toResolve, '/');
+    const sep: ?usize = if (bs == null) fs else if (fs == null) bs else if (bs.? > fs.?) bs else fs;
+    const dir = if (sep) |i| toResolve[0..i] else toResolve;
+
+    if (dir.len == 0 or (dir[dir.len - 1] != '\\' and dir[dir.len - 1] != '/')) {
+        const result = try allocator.alloc(WCHAR, dir.len + 1);
+        @memcpy(result[0..dir.len], dir);
+        result[dir.len] = '\\';
+        return result;
+    }
+    return try allocator.dupe(WCHAR, dir);
 }
 
 fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
@@ -977,8 +995,11 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
             const resume_err = GetLastError();
             writeError("Shim: Could not resume suspended process");
             writeErrorSys(resume_err);
+            // No job to end when CreateJobObjectW failed, so terminate the child itself.
             if (job_handle) |jh| {
                 _ = TerminateJobObject(jh, 1);
+            } else {
+                _ = TerminateProcess(pi.hProcess, 1);
             }
             _ = windows.CloseHandle(pi.hThread);
             _ = windows.CloseHandle(pi.hProcess);
@@ -1055,6 +1076,10 @@ fn shimMain() !u32 {
             writeError("Shim: Could not set job object limits");
             writeErrorSys(job_err);
         }
+    } else {
+        const job_err = GetLastError();
+        writeError("Shim: Could not create job object");
+        writeErrorSys(job_err);
     }
 
     // Before spawn: a Ctrl event in the gap would kill the shim and
