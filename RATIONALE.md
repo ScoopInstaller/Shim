@@ -31,7 +31,7 @@ Arguments come from two places -- the `args` field and the shim's own command li
 
 `CommandLineToArgvW` returns a signed count, and a negative value is a failed parse, so every lane clamps it before using it as a capacity or loop bound.
 
-**Every shim carries a `longPathAware` manifest.** Windows only lets a process hand a path beyond `MAX_PATH` to `CreateProcessW` if that process opts in, and the opt-in is a manifest rather than anything in the code. The resource has to be written as type `24` by number: a cross-compiling `llvm-rc` does not resolve the `RT_MANIFEST` symbol and produces a *named* resource called `RT_MANIFEST` instead, which carries the manifest's bytes and is ignored by the loader. Nothing fails, and searching the binary for the manifest finds it.
+**Every shim carries a `longPathAware` manifest.** Windows only lets a process hand a path beyond `MAX_PATH` to `CreateProcessW` if that process opts in, and the opt-in is a manifest rather than anything in the code. The resource has to be written as type `24` by number: a cross-compiling `llvm-rc` does not resolve the `RT_MANIFEST` symbol and produces a *named* resource called `RT_MANIFEST` instead, which carries the manifest's bytes and is ignored by the loader. Nothing fails, and searching the binary for the manifest finds it. The manifest also carries the console-allocation policy (see Console behavior); the suite's probe reads the resource by ID and type *number*, which makes the named-resource trap observable rather than silent. The Rust lane embeds that manifest through `winres`, which is unmaintained; replacing it changes how the manifest lands in the binary, so the swap has to keep the manifest-presence test (#66) watching it.
 
 ## Process lifetime
 
@@ -46,6 +46,8 @@ The shim is not supposed to outlive its job, and the child is not supposed to ou
 **The console belongs to the child.** The shim swallows every console control event and returns `TRUE`. The user is interacting with the program the shim launched, so Ctrl+C has to reach it and not the shim -- and if the shim died on Ctrl+C, `KILL_ON_JOB_CLOSE` would take the child down with it. The handler is installed *before* the spawn, which closes the remaining window where a Ctrl event would kill the shim and the child with it.
 
 **The exit code is forwarded unmangled**, including values above 255 and the `0xC0000005` family, so a caller can match on a specific crash code. Only an internal failure produces exit 1.
+
+**Rust buys size with `panic = "abort"`** (see rust/README), which sends a panic down the fast-fail path instead of the exit-1 path above; shim.rs therefore has to stay panic-free -- no `unwrap`, `expect` or `panic!`, and no indexing that can go out of bounds.
 
 ## Console behavior
 
