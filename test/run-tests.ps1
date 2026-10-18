@@ -711,6 +711,26 @@ Invoke-ShimTest "Empty path value stops before the launch" -Setup {
     @{ Pass = $pass; Message = "Expected one 'path' not found error and no launch, Exit: $($r.ExitCode), Output: $($r.Output)" }
 }
 
+Invoke-ShimTest "A leading backslash in path is rejected" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = \no\such\target.exe`nargs = echo SEP_PATH_ARG_OK"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "must not begin with a separator") -and
+            ($r.Output -notmatch "SEP_PATH_ARG_OK")
+    @{ Pass = $pass; Message = "Expected the leading-separator rejection and no launch, Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "A leading slash in path is rejected" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = /no/such/target.exe`nargs = echo SLASH_PATH_ARG_OK"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "must not begin with a separator") -and
+            ($r.Output -notmatch "SLASH_PATH_ARG_OK")
+    @{ Pass = $pass; Message = "Expected the leading-separator rejection and no launch, Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
 Invoke-ShimTest "Missing target exe reports command and win32 error" -Setup {
     param($d)
     Write-Shim $d "test" "path = $d\does-not-exist.exe"

@@ -860,6 +860,11 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         writeError("Shim: 'path' not found in shim file '");
         writeErrorUtf8(filename[0..shim_name_len]);
         writeError("'.\n");
+    } else if (info.path.?[0] == '\\' or info.path.?[0] == '/') {
+        info.path = null;
+        writeError("Shim: 'path' must not begin with a separator in shim file '");
+        writeErrorUtf8(filename[0..shim_name_len]);
+        writeError("'.\n");
     }
 
     return info;

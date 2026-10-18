@@ -778,6 +778,14 @@ enum class LineKind
         msg += L"'.\n";
         WriteErrorW(msg.c_str());
     }
+    else if (info.path->front() == L'\\' || info.path->front() == L'/')
+    {
+        info.path.reset();
+        std::wstring msg = L"Shim: 'path' must not begin with a separator in shim file '";
+        msg += filename.data();
+        msg += L"'.\n";
+        WriteErrorW(msg.c_str());
+    }
 
     return info;
 }

@@ -751,6 +751,19 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
             write_error_wide(&to_wide(shim_path));
             write_error_wide(&to_wide("'.\n"));
         }
+    } else if info
+        .path
+        .as_deref()
+        .is_some_and(|p| p.starts_with(['\\', '/']))
+    {
+        info.path = None;
+        unsafe {
+            write_error_wide(&to_wide(
+                "Shim: 'path' must not begin with a separator in shim file '",
+            ));
+            write_error_wide(&to_wide(shim_path));
+            write_error_wide(&to_wide("'.\n"));
+        }
     }
 
     info
