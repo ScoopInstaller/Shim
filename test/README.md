@@ -54,6 +54,8 @@ Each test is a single call:
 
 - `-Setup` -- scriptblock receiving the temp directory it created. Put the batch files and the `.shim` content there.
 - `-RunArgs` -- optional, passed to the shim as command-line arguments.
-- `-Assert` -- scriptblock receiving `@{Output; ExitCode; TestDir; Elapsed}` from `Invoke-ShimTest`, or `@{Output; ExitCode}` from `Invoke-GuiShimTest`; a GUI assertion reading `$r.TestDir` gets `$null`. Return a hashtable with `Pass` and `Message`.
+- `-Assert` -- scriptblock receiving `@{Output; ExitCode; TestDir; Elapsed}` from both helpers; a field an assertion reads is always present, so a helper that stopped supplying one would fail the assertion instead of quietly passing it. Return a hashtable with `Pass` and `Message`.
 
 Numbering is automatic. Never renumber by hand.
+
+A terminating error anywhere in a test -- `-Setup`, the shim invocation, or `-Assert` -- is reported as that test's `[FAIL]` with the exception message, and the suite continues: one broken test must not hide every test after it.

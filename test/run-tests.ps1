@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Pin UTF-8: native output decoding otherwise follows the host console's encoding.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 $script:TestNumber = 0
@@ -113,12 +115,16 @@ function Invoke-ShimTest {
         } else {
             Write-TestResult "#$num $Name" $check.Pass $check.Message
         }
+    } catch {
+        # A terminating error is this test's failure, not the suite's.
+        Write-TestResult "#$num $Name" $false $_.Exception.Message
     } finally {
         Remove-TestEnvironment $testDir
     }
 }
 
 # Run a GUI subsystem shim test (patches PE to Subsystem=2).
+# Assert: scriptblock receiving @{Output; ExitCode; TestDir; Elapsed}, as in Invoke-ShimTest.
 function Invoke-GuiShimTest {
     param(
         [string]$Name,
@@ -141,14 +147,18 @@ function Invoke-GuiShimTest {
 
         & $Setup $testDir
 
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $output = & $guiExe @RunArgs 2>&1 | Out-String
-        $result = @{ Output = $output; ExitCode = $LASTEXITCODE }
+        $sw.Stop()
+        $result = @{ Output = $output; ExitCode = $LASTEXITCODE; TestDir = $testDir; Elapsed = $sw.Elapsed }
         $check = & $Assert $result
         if ($check -is [bool]) {
             Write-TestResult "#$num $Name" $check "Output: $output"
         } else {
             Write-TestResult "#$num $Name" $check.Pass $check.Message
         }
+    } catch {
+        Write-TestResult "#$num $Name" $false $_.Exception.Message
     } finally {
         Remove-TestEnvironment $testDir
     }
@@ -158,7 +168,8 @@ function Invoke-GuiShimTest {
 # Verify shim.exe
 # ============================================================================
 if (-not (Test-Path $ShimExe)) {
-    Write-Error "Shim executable not found: $ShimExe"
+    # Write-Error is terminating under EAP='Stop', so it would swallow the exit below.
+    Write-Host "Shim executable not found: $ShimExe" -ForegroundColor Red
     exit 1
 }
 $ShimExe = (Resolve-Path $ShimExe).Path
@@ -287,7 +298,7 @@ Invoke-ShimTest "Environment variables from .shim" -Setup {
     Write-Shim $d "test" "path = $probeExe`nargs = env VAR1 VAR2 VAR3`nVAR1 = first`nVAR2 = %USERNAME%_suffix`nVAR3 = third"
 } -Assert {
     param($r)
-    $pass = ($r.Output -match "VAR1=first") -and ($r.Output -match "VAR3=third") -and ($r.Output -match "VAR2=$($env:USERNAME)_suffix")
+    $pass = ($r.Output -match "VAR1=first") -and ($r.Output -match "VAR3=third") -and ($r.Output -match [regex]::Escape("VAR2=$($env:USERNAME)_suffix"))
     @{ Pass = $pass; Message = "Output: $($r.Output)" }
 }
 
@@ -781,6 +792,8 @@ Invoke-ShimTest "workdir alias for cwd" -Setup {
 $script:TestNumber++
 $num = $script:TestNumber
 $testDir = New-TestEnvironment
+$gp = 0
+$shim = $null
 try {
     $done = Join-Path $testDir "done"
     $gpid = Join-Path $testDir "gpid"
@@ -801,6 +814,9 @@ try {
     $detail = "gpid=$($gp) grandchildAlive=$($alive) shimExited=$($shim.HasExited) childDone=$(Test-Path $done)"
     Write-TestResult "#$num Direct-child-only lifecycle" $pass $detail
 } finally {
+    # The test asserts the grandchild is alive; nothing else stops it, so each run would leak it.
+    if ($gp -gt 0) { Stop-Process -Id $gp -Force -ErrorAction SilentlyContinue }
+    if ($shim -and -not $shim.HasExited) { Stop-Process -Id $shim.Id -Force -ErrorAction SilentlyContinue }
     Remove-TestEnvironment $testDir
 }
 
@@ -825,28 +841,30 @@ Invoke-ShimTest "Special keys not leaked as env vars" -Setup {
     @{ Pass = ($r.Output -notmatch "ELEVATE=") -and ($r.Output -notmatch "CWD=") -and ($r.Output -notmatch "RUNAS="); Message = "Output: $($r.Output)" }
 }
 
-Invoke-ShimTest "elevate = true triggers elevation path" -Setup {
-    param($d)
-    # The probe's touch mode creates the marker, so the assertion holds whether the
-    # runner is elevated or not; the elevated path is what is under test.
-    Write-Shim $d "test" "path = $probeExe`nargs = touch $d\marker.txt`nelevate = true"
-} -Assert {
-    param($r)
-    $marker = Join-Path $r.TestDir "marker.txt"
+# The check runs before the shim: a UAC dialog cannot be automated, so a non-elevated run skips without launching.
+# IsInRole tolerates a filtered token, so check the group SID directly.
+if (([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }) -contains "S-1-5-32-544") {
+    Invoke-ShimTest "elevate = true triggers elevation path" -Setup {
+        param($d)
+        # The probe's touch mode creates the marker, so the assertion holds whether the
+        # runner is elevated or not; the elevated path is what is under test.
+        Write-Shim $d "test" "path = $probeExe`nargs = touch $d\marker.txt`nelevate = true"
+    } -Assert {
+        param($r)
+        $marker = Join-Path $r.TestDir "marker.txt"
 
-    # IsInRole tolerates a filtered token, so check the group SID directly.
-    $isAdmin = ([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }) -contains "S-1-5-32-544"
-    if (-not $isAdmin) {
-        Write-Host "  [SKIP] Test #$script:TestNumber elevation requires an elevated runner (UAC consent dialog cannot be automated); counting as pass" -ForegroundColor DarkYellow
-        return $true
+        # Positive assertion: a lane that errors out on elevate = true now fails.
+        $writable = $true
+        try { [System.IO.File]::WriteAllText($marker, "") } catch { $writable = $false }
+        $pass = $writable -and (Test-Path $marker)
+        Remove-Item $marker -Force -ErrorAction SilentlyContinue
+        @{ Pass = $pass; Message = "Elevated child did not write $marker; Output: $($r.Output), ExitCode: $($r.ExitCode)" }
     }
-
-    # Positive assertion: a lane that errors out on elevate = true now fails.
-    $writable = $true
-    try { [System.IO.File]::WriteAllText($marker, "") } catch { $writable = $false }
-    $pass = $writable -and (Test-Path $marker)
-    Remove-Item $marker -Force -ErrorAction SilentlyContinue
-    @{ Pass = $pass; Message = "Elevated child did not write $marker; Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+} else {
+    $script:TestNumber++
+    # Counted as a pass as the suite always has (the summary counts failures only), without launching.
+    Write-Host "  [SKIP] Test #$script:TestNumber elevation requires an elevated runner (UAC consent dialog cannot be automated); counting as pass" -ForegroundColor DarkYellow
+    $script:TestsPassed++
 }
 
 # --- GUI subsystem -------------------------------------------------------------
