@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -211,6 +210,11 @@ namespace Scoop
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern uint GetFileType(IntPtr hFile);
 
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern uint FormatMessageW(
+            uint dwFlags, IntPtr lpSource, uint dwMessageId, uint dwLanguageId,
+            StringBuilder lpBuffer, uint nSize, IntPtr Arguments);
+
         // --- Constants ---
 
         const uint CREATE_SUSPENDED = 0x00000004;
@@ -292,7 +296,20 @@ namespace Scoop
 
         static void WriteErrorSys(uint err)
         {
-            WriteErrorW(" (error " + err + ": " + new Win32Exception((int)err).Message.TrimEnd() + ").");
+            WriteErrorW(" (error " + err + ": ");
+            // FormatMessageW like the other lanes: Win32Exception reads .NET's own tables.
+            var buf = new StringBuilder(256);
+            uint n = FormatMessageW(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_MAX_WIDTH_MASK,
+                IntPtr.Zero, err, 0, buf, (uint)buf.Capacity, IntPtr.Zero);
+            if (n != 0)
+            {
+                int end = (int)n;
+                while (end > 0 && (buf[end - 1] == ' ' || buf[end - 1] == '\t' || buf[end - 1] == '\r' || buf[end - 1] == '\n'))
+                    end--;
+                WriteErrorW(buf.ToString(0, end));
+            }
+            WriteErrorW(").\n");
         }
 
         static void ReportShimError(string context, uint error)
@@ -357,8 +374,7 @@ namespace Scoop
             if (string.IsNullOrEmpty(value)) return false;
             // Already trimmed by ParseShimLine with the fixed set; a Trim() here
             // would consult the runtime's tables instead.
-            var lower = value.ToLowerInvariant();
-            return lower == "true" || lower == "1" || lower == "yes";
+            return IsAsciiEqual(value, "true") || value == "1" || IsAsciiEqual(value, "yes");
         }
 
         static string ExpandEnvVars(string input)
@@ -438,7 +454,38 @@ namespace Scoop
 
         static bool IsKey(string? key, string expected)
         {
-            return string.Equals(key, expected, StringComparison.OrdinalIgnoreCase);
+            return IsAsciiEqual(key, expected);
+        }
+
+        // Fold ASCII A-Z/a-z only: OrdinalIgnoreCase consults .NET's Unicode tables.
+        static bool IsAsciiEqual(string? a, string b)
+        {
+            if (a == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+            {
+                char x = a[i], y = b[i];
+                if (x >= 'A' && x <= 'Z') x += (char)32;
+                if (y >= 'A' && y <= 'Z') y += (char)32;
+                if (x != y) return false;
+            }
+            return true;
+        }
+
+        static int IndexOfAsciiIgnoreCase(string hay, string needle, int from)
+        {
+            int last = hay.Length - needle.Length;
+            for (int i = from; i <= last; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < needle.Length; j++)
+                {
+                    char h = hay[i + j];
+                    if (h >= 'A' && h <= 'Z') h += (char)32;
+                    if (h != needle[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
         }
 
         static string NormalizeArgs(string args, string curDir)
@@ -450,7 +497,7 @@ namespace Scoop
                 replacement += "\\";
 
             int pos = 0;
-            while ((pos = args.IndexOf("%~dp0", pos, StringComparison.OrdinalIgnoreCase)) >= 0)
+            while ((pos = IndexOfAsciiIgnoreCase(args, "%~dp0", pos)) >= 0)
             {
                 args = args.Remove(pos, 5).Insert(pos, replacement);
                 pos += replacement.Length;
@@ -564,7 +611,7 @@ namespace Scoop
 
         static string StripKeyPrefix(string key, string prefix)
         {
-            return key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            return key.Length >= prefix.Length && IsAsciiEqual(key.Substring(0, prefix.Length), prefix)
                 ? key.Substring(prefix.Length)
                 : key;
         }

@@ -91,7 +91,7 @@ The check runs while the file is being read, the one place that sees every line.
 
 ### The `env:` prefix
 
-Reserved keys are matched case-insensitively, so `PATH = x` is the `path` field: it overwrites the target executable instead of the `PATH` variable. There is no way to override `PATH` otherwise, and the same would be true of every field added later. `env:` forces the key to be an environment variable name; the prefix is stripped case-insensitively and the remainder is used verbatim. It never reaches the reserved-key table, so no field can shadow it and adding one later cannot break a shim that already uses it.
+Reserved keys are matched case-insensitively, so `PATH = x` is the `path` field: it overwrites the target executable instead of the `PATH` variable. There is no way to override `PATH` otherwise, and the same would be true of every field added later. `env:` forces the key to be an environment variable name; the prefix is stripped case-insensitively and the remainder is used verbatim. It never reaches the reserved-key table, so no field can shadow it and adding one later cannot break a shim that already uses it. Reserved keys and the `env:` prefix fold ASCII `A-Z`/`a-z` only, because matching through a Unicode case table would make the format depend on the runtime's tables.
 
 ### Traps
 

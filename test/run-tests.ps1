@@ -385,6 +385,17 @@ Invoke-ShimTest "Case-variant env names keep the first spelling, last value" -Se
     @{ Pass = $pass; Message = "Expected exactly 'MARK=two' in the child env, Output: $($r.Output)" }
 }
 
+# U+017F sits at the folding boundary: a Unicode-folding lane reads "argſ" as the args field.
+Invoke-ShimTest "A key that folds beyond ASCII is not a reserved key" -Setup {
+    param($d)
+    $ls = [char]0x017F
+    Write-Shim $d "test" "path = $probeExe`nargs = env arg$ls`narg$ls = 1"
+} -Assert {
+    param($r)
+    $ls = [char]0x017F
+    @{ Pass = $r.Output.Contains("arg$ls=1"); Message = "Expected 'arg$ls=1' in the child env, Output: $($r.Output)" }
+}
+
 Invoke-ShimTest "Line without '=' is reported as malformed" -Setup {
     param($d)
     Write-Shim $d "test" "path = $probeExe`nargs = echo TARGET_OK`nthis line is broken"
