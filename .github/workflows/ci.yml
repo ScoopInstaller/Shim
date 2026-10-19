@@ -195,14 +195,22 @@ jobs:
         $dist = "${{ matrix.component }}\dist"
         Remove-Item $dist -Recurse -Force -ErrorAction SilentlyContinue
         New-Item $dist -ItemType Directory -Force | Out-Null
+        # Compress-Archive stamps the wall clock into every entry, so the same build packed twice hashes differently; entries carry the version file's last change instead.
+        $stamp = [datetimeoffset]::Parse((git log -1 --format=%cI -- "${{ matrix.component }}/version").Trim())
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
         foreach ($t in @('x86','x64','arm64')) {
-          $tmp = Join-Path $env:TEMP "shim-release-$t"
-          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item $tmp -ItemType Directory -Force | Out-Null
-          $exe = "${{ matrix.component }}\bin\$t\shim.exe"
-          Copy-Item $exe "$tmp\shim.exe"
-          Copy-Item "${{ matrix.component }}\version" "$tmp\version" -ErrorAction SilentlyContinue
-          Compress-Archive -Path "$tmp\*" -DestinationPath "$dist\shim-$t.zip" -Force
+          $entries = @{ 'shim.exe' = "${{ matrix.component }}\bin\$t\shim.exe"; 'version' = "${{ matrix.component }}\version" }
+          $zip = [System.IO.Compression.ZipFile]::Open("$dist\shim-$t.zip", 'Create')
+          foreach ($name in 'shim.exe', 'version') {
+              $e = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
+              $e.LastWriteTime = $stamp
+              $in = [System.IO.File]::OpenRead($entries[$name])
+              $out = $e.Open()
+              $in.CopyTo($out)
+              $out.Dispose()
+              $in.Dispose()
+          }
+          $zip.Dispose()
         }
     - name: Upload release artifacts
       if: github.ref_type == 'tag'
