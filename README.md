@@ -83,10 +83,10 @@ Copy-Item -Path .\cpp\bin\x64\shim.exe -Destination .\test.exe
 
 | Implementation | Build Tool |      x86 |      x64 |    arm64 |
 | -------------- | ---------- | -------: | -------: | -------: |
-| C#             | dotnet     |  21.0 KB |  20.5 KB |  20.5 KB |
-| C++            | Zig        | 119.0 KB | 143.5 KB | 135.0 KB |
-| C++            | MSBuild    | 124.0 KB | 144.0 KB | 127.0 KB |
-| Rust           | Cargo      | 113.5 KB | 130.0 KB | 126.0 KB |
+| C#             | dotnet     |  21.5 KB |  21.0 KB |  21.0 KB |
+| C++            | Zig        | 120.0 KB | 143.5 KB | 135.5 KB |
+| C++            | MSBuild    | 124.5 KB | 145.0 KB | 127.5 KB |
+| Rust           | Cargo      | 114.0 KB | 130.5 KB | 126.5 KB |
 | Zig            | Zig        |  88.5 KB |  72.5 KB |  23.5 KB |
 
 ## Development
