@@ -20,11 +20,7 @@ The file is read as UTF-8, with or without a byte order mark; plain ASCII is fin
 
 ### Line Format
 
-A field is `key = value`, where the separator is the **first** `=` and spaces around it are optional -- `path = app.exe` and `path=app.exe` are the same field. The key is trimmed of surrounding whitespace, the value of leading whitespace. Any line that is not blank, a comment, or a field is a broken shim: the shim reports the offending line and exits with code 1 without starting the target.
-
-### Comments
-
-Lines whose first non-whitespace characters are `#`, `;`, or `//`, as well as blank lines, are ignored.
+A field is `key = value`, where the separator is the **first** `=` and spaces around it are optional -- `path = app.exe` and `path=app.exe` are the same field. The key is trimmed of surrounding whitespace, the value of leading whitespace. A line whose first non-whitespace characters are `#`, `;`, or `//` is a comment, and a blank line is ignored. Any other line is a broken shim: the shim reports it and exits with code 1 without starting the target.
 
 ### Fields
 
@@ -82,8 +78,6 @@ Copy-Item -Path .\cpp\bin\x64\shim.exe -Destination .\test.exe
 - **C++** — Native executable with no runtime dependencies. Zig build (default).
 - **Rust** — Native executable using `windows-sys` raw FFI bindings. Cargo build.
 - **Zig** — Native executable using custom `wWinMainCRTStartup` entry. Zig build only.
-
-All implementations share the same `.shim` format.
 
 ## Binary Size
 

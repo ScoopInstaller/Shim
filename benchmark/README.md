@@ -22,7 +22,7 @@ Before timing, each shim gets one canary run with stdin closed and a
 target that prints usage and exits 1 or 2 is a normal target and stays in the
 timing set. Only the Windows loader's launch failures (`0xC0000135` missing DLL,
 `0xC000007B` bad image, and the rest of that NTSTATUS family) and a timeout exclude
-a shim. If no shim survives, the script fails with exit 1 rather than ranking
+a shim; if no shim survives, the script fails with exit 1 rather than ranking
 `direct` alone.
 
 Below `minIqrSamples` (5) samples per candidate the IQR is withheld (`n/a` in the

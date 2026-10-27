@@ -16,10 +16,6 @@ The four lanes are independent implementations that must behave identically. A c
 
 Do not restate a rule from those documents here -- this file routes. If one of them is wrong, fix it there. Update a document in the same commit as the change that makes it untrue. Touch `RATIONALE.md` whenever a design decision or one of its traps changes: the code shows what the shim does, only that file records why.
 
-## Build & test
-
-Per lane: [`cpp/README.md`](cpp/README.md), [`cs/README.md`](cs/README.md), [`rust/README.md`](rust/README.md), [`zig/README.md`](zig/README.md). Shared suite: [test/README.md](test/README.md). Every build and test command, the output layout, and what CI runs are documented there.
-
 ## Verifying a cross-lane change
 
 The one rule is a requirement, not a description. Build every lane you touched and run the suite against all four before committing -- `test/run-tests.ps1` is the only thing that checks parity, so a change verified against one lane is not verified at all.
