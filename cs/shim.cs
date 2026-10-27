@@ -847,7 +847,7 @@ namespace Scoop
 
             if (string.IsNullOrEmpty(info.Path))
                 WriteErrorW("Shim: 'path' not found in shim file '" + configPath + "'.\n");
-            else if (info.Path[0] == '\\' || info.Path[0] == '/')
+            else if (info.Path![0] == '\\' || info.Path![0] == '/')
             {
                 info.Path = null;
                 WriteErrorW("Shim: 'path' must not begin with a separator in shim file '" + configPath + "'.\n");
