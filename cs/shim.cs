@@ -882,12 +882,19 @@ namespace Scoop
 
             PROCESS_INFORMATION pi;
 
-            // Without the flag a console-less shim gives a console target a fresh windowed console.
             // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
+            // Without the flag a console target gets a fresh windowed console; the flag is right
+            // only when the creator owns the output -- otherwise it needs a console of its own.
             uint consolePid = 0;
             uint creationFlags = CREATE_SUSPENDED;
             if (GetConsoleProcessList(ref consolePid, 1) == 0)
-                creationFlags |= CREATE_NO_WINDOW;
+            {
+                IntPtr shimOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                bool creatorOwnsOutput = (si.dwFlags & STARTF_USESTDHANDLES) != 0
+                    || (shimOut != IntPtr.Zero && shimOut != INVALID_HANDLE_VALUE);
+                if (creatorOwnsOutput)
+                    creationFlags |= CREATE_NO_WINDOW;
+            }
 
             if (CreateProcessW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
                 true, creationFlags, IntPtr.Zero, info.Cwd,

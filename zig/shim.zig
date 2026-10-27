@@ -976,12 +976,15 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     }
 
     var pi: windows.PROCESS.INFORMATION = undefined;
-    // Without the flag a console-less shim gives a console target a fresh windowed console.
     // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
+    // Without the flag a console target gets a fresh windowed console; the flag is right
+    // only when the creator owns the output -- otherwise it needs a console of its own.
     var console_pid: DWORD = 0;
     var creation_flags: DWORD = CREATE_SUSPENDED;
     if (GetConsoleProcessList(@ptrCast(&console_pid), 1) == 0) {
-        creation_flags |= CREATE_NO_WINDOW;
+        const own_stdout = if (GetStdHandle(STD_OUTPUT_HANDLE)) |h| h != INVALID_HANDLE_VALUE else false;
+        const creator_owns_output = (si.dwFlags & windows.STARTF_USESTDHANDLES) != 0 or own_stdout;
+        if (creator_owns_output) creation_flags |= CREATE_NO_WINDOW;
     }
 
     // SUSPENDED: the child must join the job object before it can spawn its own children.

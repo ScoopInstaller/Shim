@@ -27,7 +27,7 @@
  *                              the image or the resource is absent, so a missing
  *                              manifest reads as a failure, not as empty output.
  *
- *   create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- <args>...]
+ *   create <exe> [--null-out|--default] [--detached] [--inherit] [--stdin <text>] [-- <args>...]
  *                              Launch <exe> as a creator. --null-out sets
  *                              STARTF_USESTDHANDLES while passing stdout as NULL
  *                              and stdin/stderr as pipes, which is the shape Go's
@@ -41,6 +41,12 @@
  *                              --detached adds DETACHED_PROCESS, which leaves the
  *                              child with no console at all -- the state a GUI
  *                              host's detached windowless spawn produces.
+ *                              --inherit hands the child this process's own
+ *                              standard handles, marked inheritable, and sets no
+ *                              STARTF_USESTDHANDLES. This process frees its console
+ *                              first, so the child has none to inherit either: the
+ *                              shape a console-less creator with a usable stdout
+ *                              produces.
  *                              --stdin <text> pipes <text> to the child's stdin,
  *                              newline appended when it lacks one, and pipes all
  *                              three streams. stdout/stderr are probe's own
@@ -424,7 +430,7 @@ static void append_arg(int *len, const wchar_t *s)
     g_cmd[(*len)++] = L'"';
 }
 
-static int create(const wchar_t *exe, int nullOut, int detached, const wchar_t *stdinText, int firstArg)
+static int create(const wchar_t *exe, int nullOut, int detached, int inheritStdio, const wchar_t *stdinText, int firstArg)
 {
     int len = 0;
 
@@ -511,6 +517,16 @@ static int create(const wchar_t *exe, int nullOut, int detached, const wchar_t *
         si.hStdOutput = NULL; /* the case under test */
         si.hStdError = erWr;
         inherit = TRUE;
+    } else if (inheritStdio) {
+        /* The child inherits this process's standard handles and the startup info
+         * says nothing about them. The console goes first, so the child has none
+         * to inherit either -- DETACHED_PROCESS would do that too, but it also
+         * drops the inherited handles, which is the half of the shape under test. */
+        FreeConsole();
+        SetHandleInformation(GetStdHandle(STD_INPUT_HANDLE), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(GetStdHandle(STD_OUTPUT_HANDLE), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(GetStdHandle(STD_ERROR_HANDLE), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        inherit = TRUE;
     }
 
     PROCESS_INFORMATION pi;
@@ -586,6 +602,7 @@ void __stdcall probe_entry(void)
         int i = 3;
         int nullOut = 0;
         int detached = 0;
+        int inheritStdio = 0;
         const wchar_t *stdinText = NULL;
 
         /* Flags are order-independent so a test can pair --detached with either
@@ -594,6 +611,7 @@ void __stdcall probe_entry(void)
             if (arg_is(i, L"--null-out")) { nullOut = 1; i++; }
             else if (arg_is(i, L"--default")) { i++; }
             else if (arg_is(i, L"--detached")) { detached = 1; i++; }
+            else if (arg_is(i, L"--inherit")) { inheritStdio = 1; i++; }
             else if (arg_is(i, L"--stdin")) {
                 if (i + 1 >= g_argc) usage_error("probe: --stdin needs the text to feed\n");
                 stdinText = g_argv[i + 1];
@@ -604,10 +622,12 @@ void __stdcall probe_entry(void)
 
         /* Letting either win would report a shape the creator never built. */
         if (stdinText && nullOut) usage_error("probe: --stdin cannot be combined with --null-out\n");
+        /* --inherit builds the one shape with no STARTF_USESTDHANDLES at all. */
+        if (inheritStdio && (stdinText || nullOut)) usage_error("probe: --inherit cannot be combined with --stdin or --null-out\n");
 
         if (arg_is(i, L"--")) i++;
 
-        ExitProcess((UINT)create(g_argv[2], nullOut, detached, stdinText, i));
+        ExitProcess((UINT)create(g_argv[2], nullOut, detached, inheritStdio, stdinText, i));
     }
 
     if (arg_is(1, L"args")) {
@@ -658,7 +678,7 @@ void __stdcall probe_entry(void)
     static const wchar_t usage[] =
         L"usage: probe report <file>\n"
         L"       probe manifest <exe>\n"
-        L"       probe create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- args...]\n"
+        L"       probe create <exe> [--null-out|--default] [--detached] [--inherit] [--stdin <text>] [-- args...]\n"
         L"       probe args <arg>...\n"
         L"       probe env [name...] | cwd | echo|echoerr <text...>\n"
         L"       probe exit [code] | stdin | wait <ms> | touch <file>\n";

@@ -883,11 +883,15 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     // SUSPENDED: the child must join the job object before it can spawn its own children.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    // Without the flag a console-less shim gives a console target a fresh windowed console.
+    // Without the flag a console target gets a fresh windowed console; the flag is right
+    // only when the creator owns the output -- otherwise it needs a console of its own.
     // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
     let mut console_pid: u32 = 0;
     let mut creation_flags = CREATE_SUSPENDED;
-    if unsafe { GetConsoleProcessList(&mut console_pid, 1) } == 0 {
+    let stdout: HANDLE = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let creator_owns_output = si.dwFlags & STARTF_USESTDHANDLES != 0
+        || (stdout != NULL_HANDLE && stdout != INVALID_HANDLE);
+    if creator_owns_output && unsafe { GetConsoleProcessList(&mut console_pid, 1) } == 0 {
         creation_flags |= CREATE_NO_WINDOW;
     }
 

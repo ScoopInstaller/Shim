@@ -920,16 +920,49 @@ Invoke-GuiShimTest "GUI shim exit code (7)" -Setup {
 # DETACHED_PROCESS is what leaves the shim console-less (CREATE_NO_WINDOW is ignored
 # beside it); the host's other flag, CREATE_NEW_PROCESS_GROUP, only reroutes Ctrl+C.
 # Only the probe can build this creator -- PowerShell always gives the shim a console.
+#
+# A creator that took over the standard handles, or only let its own be inherited,
+# owns the target's output: the target then keeps a windowless console. A creator
+# that handed over nothing leaves it nowhere to write, so the target allocates one.
 
-Invoke-ShimTest "Console-less creator gives the target no window" -Setup {
+Invoke-ShimTest "A creator that took over the stdio gives the target no window" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = report $d\report.txt"
+} -CreatorArgs @('--detached') -PipeInput "PIPE" -Assert {
+    param($r)
+    $report = Join-Path $r.TestDir 'report.txt'
+    $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
+    @{ Pass = ($got -match 'window=0'); Message = "Report: $got" }
+}
+
+# Only the manifest's console policy keeps the shim console-less in this shape, and
+# only Windows 11 24H2 (build 26100) and Server 2025 honour it.
+$buildNumber = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuildNumber).CurrentBuildNumber
+if ([int]$buildNumber -ge 26100) {
+    Invoke-ShimTest "A creator that only inherited the stdio gives the target no window" -Setup {
+        param($d)
+        Write-Shim $d "test" "path = $probeExe`nargs = report $d\report.txt"
+    } -CreatorArgs @('--inherit') -Assert {
+        param($r)
+        $report = Join-Path $r.TestDir 'report.txt'
+        $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
+        @{ Pass = ($got -match 'window=0'); Message = "Report: $got" }
+    }
+} else {
+    $script:TestNumber++
+    Write-Host "  [SKIP] Test #$script:TestNumber the inherited-stdio creator needs the manifest's console policy (Windows 11 24H2, build 26100, and later); counting as pass" -ForegroundColor DarkYellow
+    $script:TestsPassed++
+}
+
+Invoke-ShimTest "A creator that handed over nothing gives the target a console window" -Setup {
     param($d)
     Write-Shim $d "test" "path = $probeExe`nargs = report $d\report.txt"
 } -CreatorArgs @('--detached') -Assert {
     param($r)
     $report = Join-Path $r.TestDir 'report.txt'
     $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
-    # window=1 is never asserted: this runner's own console has no window.
-    @{ Pass = ($got -match 'window=0'); Message = "Report: $got" }
+    # window=1 needs an environment where a new console really gets a window.
+    @{ Pass = ($got -match 'window=1'); Message = "Report: $got" }
 }
 
 Invoke-ShimTest "A shim with a console still shares it with the target" -Setup {
