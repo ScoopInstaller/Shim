@@ -2,19 +2,24 @@
 
 ## The one rule
 
-The four lanes are independent implementations that must behave identically. A change to the `.shim` format or the parser lands in **all four** in the same change, and `test/run-tests.ps1` is the only thing that checks it. Correct in three lanes and missing in the fourth is broken, not partial.
+[SPEC.md](SPEC.md) is the contract. The four lanes are independent implementations that must conform to it. A change to the `.shim` format, the parser, the launch behavior, or the self-description lands in **all four** in the same change, and `test/run-tests.ps1` is the only thing that checks parity. Correct in three lanes and missing in the fourth is broken, not partial.
 
-## Before you change anything
+## Document boundaries
+
+Each document answers one question. Do not restate a rule that belongs somewhere else.
 
 | Question | Read |
 | -------- | ---- |
-| What is valid in a `.shim` file, what errors, what expands | [README.md](README.md) |
-| Why the shim is shaped this way, and which traps are load-bearing | [RATIONALE.md](RATIONALE.md) |
-| How to build and test one lane, and its language conventions | [`cpp/`](cpp/README.md) / [`cs/`](cs/README.md) / [`rust/`](rust/README.md) / [`zig/`](zig/README.md) |
-| How to run and write a test | [test/README.md](test/README.md) |
-| How to measure startup cost | [benchmark/README.md](benchmark/README.md) |
+| How do I use the shim? | [README.md](README.md) |
+| What must or may a conforming shim do? | [SPEC.md](SPEC.md) |
+| Why is it shaped this way, and which traps are load-bearing? | [RATIONALE.md](RATIONALE.md) |
+| How do I build and test one lane, and its language conventions? | [`cpp/`](cpp/README.md) / [`cs/`](cs/README.md) / [`rust/`](rust/README.md) / [`zig/`](zig/README.md) |
+| How do I run and write a test? | [test/README.md](test/README.md) |
+| How do I measure startup cost? | [benchmark/README.md](benchmark/README.md) |
 
-Do not restate a rule from those documents here -- this file routes. If one of them is wrong, fix it there. Update a document in the same commit as the change that makes it untrue. Touch `RATIONALE.md` whenever a design decision or one of its traps changes: the code shows what the shim does, only that file records why.
+README is usage, not a specification. SPEC is normative and implementation-neutral: no language, build system, reference implementation, or binary layout. RATIONALE explains decisions; it does not define behavior. This file routes and records repository workflow; it does not define shim behavior.
+
+If two documents disagree about behavior, [SPEC.md](SPEC.md) wins. If code and SPEC disagree, the code is wrong unless the same change updates SPEC. Update a document in the same commit as the change that makes it untrue.
 
 ## Verifying a cross-lane change
 
@@ -29,6 +34,8 @@ A behaviour fix goes in its own commit, ahead of any cleanup in the same area, s
 ## Definition of done
 
 Every lane builds, and every lane reports 0 failed. No lane is skipped because its change looked equivalent.
+
+Every lane's self-description output (`--version`, `-v`, or no args) must match [SPEC.md](SPEC.md) §2.6 and §4, including the exact two-line shape and the advertised feature set. A lane that cannot advertise a feature must not claim it.
 
 ## Working in this repository
 

@@ -1,6 +1,6 @@
 # C++ Shim Development Guide
 
-Shim file format and usage: [../README.md](../README.md). Design rationale: [../RATIONALE.md](../RATIONALE.md).
+Usage: [../README.md](../README.md). Normative contract: [../SPEC.md](../SPEC.md). Design rationale: [../RATIONALE.md](../RATIONALE.md).
 
 ## Overview
 

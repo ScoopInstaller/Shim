@@ -1,6 +1,6 @@
 # C# Shim Development Guide
 
-Shim file format and usage: [../README.md](../README.md). Design rationale: [../RATIONALE.md](../RATIONALE.md).
+Usage: [../README.md](../README.md). Normative contract: [../SPEC.md](../SPEC.md). Design rationale: [../RATIONALE.md](../RATIONALE.md).
 
 ## Overview
 
@@ -34,4 +34,4 @@ cd cs
 
 - .NET Framework 4.5 target
 - P/Invoke for all Win32 calls
-- `GenerateAssemblyInfo=false` in the csproj, with a hand-written `AssemblyInfo.cs` generated at build time. It omits `AssemblyTitle` so `FileDescription` stays empty, matching the other lanes
+- `GenerateAssemblyInfo=false` in the csproj, with a hand-written `AssemblyInfo.cs` generated at build time. It omits `AssemblyTitle` so `FileDescription` stays empty, matching the other lanes.

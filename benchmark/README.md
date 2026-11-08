@@ -1,5 +1,7 @@
 # Scoop-Shim Performance Benchmark
 
+Usage: [../README.md](../README.md). Normative shim behavior: [../SPEC.md](../SPEC.md). Design rationale: [../RATIONALE.md](../RATIONALE.md). This file measures startup cost only.
+
 - Target: `C:\Windows\System32\whoami.exe` (built-in Windows executable)
 - Tool: [hyperfine](https://github.com/sharkdp/hyperfine) 2.x
 - Architecture: auto-detected (x64/x86/arm64)
@@ -17,17 +19,9 @@ Edit `shims/template.shim` to change the benchmark target. `path` may be quoted 
 
 ## Canary and sample policy
 
-Before timing, each shim gets one canary run with stdin closed and a
-`-CanaryTimeoutSec` (default 30 s) timeout. A non-zero exit is **not** a failure: a
-target that prints usage and exits 1 or 2 is a normal target and stays in the
-timing set. Only the Windows loader's launch failures (`0xC0000135` missing DLL,
-`0xC000007B` bad image, and the rest of that NTSTATUS family) and a timeout exclude
-a shim; if no shim survives, the script fails with exit 1 rather than ranking
-`direct` alone.
+Before timing, each shim gets one canary run with stdin closed and a `-CanaryTimeoutSec` (default 30 s) timeout. A non-zero exit is **not** a failure: a target that prints usage and exits 1 or 2 is a normal target and stays in the timing set. Only the Windows loader's launch failures (`0xC0000135` missing DLL, `0xC000007B` bad image, and the rest of that NTSTATUS family) and a timeout exclude a shim; if no shim survives, the script fails with exit 1 rather than ranking `direct` alone.
 
-Below `minIqrSamples` (5) samples per candidate the IQR is withheld (`n/a` in the
-table, `null` in the JSON) and no ranking is asserted - at N=1 a zero IQR would
-otherwise read as "separated by more than IQR".
+Below `minIqrSamples` (5) samples per candidate the IQR is withheld (`n/a` in the table, `null` in the JSON) and no ranking is asserted -- at N=1 a zero IQR would otherwise read as "separated by more than IQR".
 
 ## Results
 
@@ -47,6 +41,6 @@ The three native lanes land within each other's spread and cannot be ranked agai
 
 ## Files
 
-- `benchmark.ps1` - benchmark runner
-- `shims/template.shim` - .shim content template
-- `results.md` / `results.json` - last run, regenerated on every run (not tracked). `results.json` is valid JSON with no BOM, and records the per-candidate sample count, the `shuffleSeed` used for round ordering, and any candidate the canary excluded.
+- `benchmark.ps1` -- benchmark runner
+- `shims/template.shim` -- `.shim` content template
+- `results.md` / `results.json` -- last run, regenerated on every run (not tracked). `results.json` is valid JSON with no BOM, and records the per-candidate sample count, the `shuffleSeed` used for round ordering, and any candidate the canary excluded.

@@ -1,6 +1,6 @@
 # Design Rationale
 
-Why the shim is shaped this way, and the traps that shaped it. For the file format itself, see [README.md](README.md); for per-language conventions, see [AGENTS.md](AGENTS.md).
+Normative behavior lives in [SPEC.md](SPEC.md). This file explains why the shim is shaped this way, which decisions are load-bearing, and which traps have already caused real bugs. If this file and the specification disagree, the specification wins.
 
 ## What the shim is
 
@@ -47,7 +47,7 @@ The shim is not supposed to outlive its job, and the child is not supposed to ou
 
 **The exit code is forwarded unmangled**, including values above 255 and the `0xC0000005` family, so a caller can match on a specific crash code. Only an internal failure produces exit 1.
 
-**Rust buys size with `panic = "abort"`** (see rust/README), which sends a panic down the fast-fail path instead of the exit-1 path above, so shim.rs has to stay panic-free: no `unwrap`, `expect` or `panic!`, and no indexing that can go out of bounds.
+**Rust buys size with `panic = "abort"`** (see [rust/README.md](rust/README.md)), which sends a panic down the fast-fail path instead of the exit-1 path above, so `shim.rs` has to stay panic-free: no `unwrap`, `expect` or `panic!`, and no indexing that can go out of bounds.
 
 ## Console behavior
 
@@ -85,32 +85,57 @@ The separator is the **first** `=`, so the value stays free to contain more of t
 
 The line is right-trimmed before it is split, so trailing spaces in a value are eaten: a trailing space would otherwise defeat the double-quote unquote test on a `path` value. The key is trimmed on both sides and the value on the left, so a misindented key still works.
 
-**A line that is not blank, a comment, or a field is fatal.** A shim file has no legitimate content beyond fields and comments, so such a line means the file is broken, and the worst outcome for a launcher is to run a half-configured program. The check runs while the file is being read, the one place that sees every line: it cannot live in either of the later expansion passes, because the one that resolves the target `path` stops as soon as it finds it, and the one that reads every field would report the same line twice.
+**A line that is not blank, a comment, or a field is fatal.** A shim file has no legitimate content beyond fields and comments, so such a line means the file is broken, and the worst outcome for a launcher is to run a half-configured program. The check runs while the file is being read, the one place that sees every line: it cannot live in either of the later expansion passes, because the one that resolves the target `path` scans path lines only, and the one that reads every field would report the same line twice.
 
 ### Two passes over the fields
 
 `%~dp0` means the **shim's own directory** inside `path`, and the **target's directory** everywhere else. The target's directory is not known until `path` has been resolved, so the first pass finds and absolutises `path` and the second expands every other field against it -- the only reason the parser needs two passes, and the reason `%~dp0` means two different things in the same file. The target's directory is what `GetFullPathNameW` answers for the resolved `path`; when that call fails, the shim reports it and falls back to the input with its last component dropped, because expanding `%~dp0` into a value that still ends in the target's file name puts a path where a directory belongs.
 
-A `path` value is either drive-rooted or relative to the shim's own directory, and nothing in between is accepted. A leading separator anchors the target to the current drive, so the same shim would find a different target depending on where it was run from; rejecting it keeps the target a function of the shim's own location alone.
+A `path` value is either drive-qualified (an ASCII drive letter and `:`) or relative; a leading separator is rejected. A leading separator anchors the target to the current drive, so the same shim would find a different target depending on where it was run from; rejecting it keeps the target a function of the shim's own location alone. After expansion and unquoting, the value is passed to the platform as written, so a relative path follows the platform's executable search order; the shim does not prepend its own directory. A bare name can therefore use `PATH`, and environment overrides are applied first so it sees the overridden `PATH`.
 
-### The `env:` prefix
+### The `env:` and `env!:` prefixes
 
-Reserved keys are matched case-insensitively, so `PATH = x` is the `path` field: it overwrites the target executable instead of the `PATH` variable, and there is no way to override `PATH` otherwise. `env:` forces the key to be an environment variable name; the prefix is stripped case-insensitively and the remainder is used verbatim. It never reaches the reserved-key table, so no field can shadow it and adding one later cannot break a shim that already uses it. Reserved keys and the prefix fold ASCII `A-Z`/`a-z` only, because matching through a Unicode case table would make the format depend on the runtime's tables.
+Reserved keys are matched case-insensitively, so `PATH = x` is the `path` field: it overwrites the target executable instead of the `PATH` variable, and there is no way to override `PATH` otherwise. `env:` and `env!:` mark the key as an environment variable name; the prefix is stripped case-insensitively and the remainder is used verbatim. `env:` supplies a default, `env!:` forces the value. Neither reaches the reserved-key table, so no field can shadow it and adding one later cannot break a shim that already uses it. Reserved keys and the prefixes fold ASCII `A-Z`/`a-z` only, because matching through a Unicode case table would make the format depend on the runtime's tables.
 
 ### Traps
 
 Each of these was a real bug at least once.
 
-1. **Strip the prefix constant, never a literal length.** Cutting `env:` itself means the length and the comparison cannot drift apart; a hardcoded length silently truncates variable names.
-2. **Strip in the key dispatch, not in the line parser.** The first expansion pass scans for `path` alone to resolve the target's directory. A strip in the parser hands it `env:path` instead, and the shim launches whatever that points at.
-3. **Share the value pipeline.** An `env:` value goes through the same expansion and unquoting as any other. A second code path for it will drift, and it will only ever fail for the new syntax.
-4. **The prefix guard must accept the prefix as the whole key.** A stricter guard makes the empty-name check unreachable, and `env:` then quietly defines a junk variable instead of saying anything.
-5. **A bare `env:` is not fatal.** It names no variable, so the line is reported and skipped and the target still starts. That is a different failure from a malformed line, and merging the two turns a typo into an outage.
+1. **Strip the prefix constant, never a literal length.** Cutting the prefix itself means the length and the comparison cannot drift apart; a hardcoded length silently truncates variable names.
+2. **Strip in the key dispatch, not in the line parser.** The first expansion pass scans for `path` alone to resolve the target's directory. A strip in the parser hands it a prefixed `path` instead, and the shim launches whatever that points at.
+3. **Share the value pipeline.** A default or forced value goes through the same expansion and unquoting as any other. A second code path for it will drift, and it will only ever fail for the new syntax.
+4. **The prefix guard must accept the prefix as the whole key.** A stricter guard makes the empty-name check unreachable, and `env:`/`env!:` then quietly defines a junk variable instead of saying anything.
+5. **A bare `env:`/`env!:` is not fatal.** It names no variable, so the line is reported and skipped and the target still starts. That is a different failure from a malformed line, and merging the two turns a typo into an outage.
 
 ### Expansion
 
-All `%VAR%` in a value expand when the file is read, against the environment the shim was started in. Every value therefore sees the same starting environment, which makes a shim file order-independent and means a value cannot reference a variable the shim itself defines. Expanding as each line was applied instead would make the file's meaning depend on line order. `args` is the exception and is passed through unexpanded, so the child can expand `%VAR%` itself against the environment it actually receives.
+All `%VAR%` in a value expand when the file is read, against the environment the shim was started in. Every value therefore sees the same starting environment, which makes a shim file order-independent and means a value cannot reference a variable the shim itself defines. Expanding as each line was applied instead would make the file's meaning depend on line order. `args` is the exception: `%VAR%` is passed through unexpanded, so the child can expand it against the environment it actually receives.
+
+`%~dp0` is separate from `%VAR%`: it is expanded in `args` as well as in `path`, `cwd`, and environment values. In `path` it is the shim's own directory; everywhere else it is the target's directory.
 
 ## Errors
 
-A syntax error in the shim file is fatal: the shim reports it, exits 1, and never starts the target. A problem with one line -- an undecodable line, an `env:` key with no name, a variable the platform refuses -- is reported and that line is skipped. Nothing else stops the launch. The error channel is allocation-free -- a diagnostic is what is left when something has already gone wrong -- and the cpp lane writes through a segmented fixed stack buffer, so no wide character is split.
+A syntax error in the shim file is fatal: the shim reports it, exits 1, and never starts the target. A problem with one line -- an undecodable line, an `env:`/`env!:` key with no name, a variable the platform refuses -- is reported and that line is skipped. Nothing else stops the launch. The error channel is allocation-free -- a diagnostic is what is left when something has already gone wrong -- and the cpp lane writes through a segmented fixed stack buffer, so no wide character is split.
+
+## Self-description
+
+[SPEC.md](SPEC.md) adds one branch, not a subsystem. It exists so Scoop can ask a shim what it is and which optional fields it implements before generating a `.shim` file.
+
+**Only the canonical, unpaired `shim.exe` answers.** A generated shim is renamed to the command it launches; its arguments belong to that command. Reserving `--version` on every shim would steal an argument from real targets. Reserving it only on `shim.exe` makes the one exception explicit. `shim.shim` still wins: a `.shim` file makes the executable a shim, so its arguments are the target's. The branch is therefore exactly: name `shim`, no `shim.shim`, and zero user arguments or one `--version`/`-v`.
+
+**Two lines, curl-style.** The first line identifies the binary and its version; the second lists optional features:
+
+```text
+shim <version> (<impl>)
+Features: cwd env env-force expand dp0 elevate
+```
+
+A single line would parse too, but the separate `Features:` line is easier to read and easier to extend without redefining the first line. It mirrors curl's `Features:` rather than inventing a compact grammar. The output is ASCII, one line per fact, stdout, exit 0.
+
+**Only optional features are advertised.** `utf8` and `exitcode` are required; child-lifetime behavior and `longpath` are SHOULD-level. None are feature branches. `path` and `args` are baseline. The feature list is the set of fields a producer could choose to emit: `cwd`, `env`, `env-force`, `expand`, `dp0`, `elevate`.
+
+`env:` is the default form: it fills an absent or empty value and leaves a user-provided value alone. `env!:` is the forced form. This lets a package manifest carry defaults without taking ownership of the user's environment.
+
+**The list is static and build-time.** Runtime probing would add code and could lie under a different environment. A shim advertises what it was built to implement.
+
+**No `--help` and no JSON.** Self-description is the one command Scoop needs. Adding more surface now would create compatibility obligations before the contract is settled.

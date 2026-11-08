@@ -1,8 +1,8 @@
 # Test Suite
 
-One suite, four implementations. Every test runs against all four lanes, which is what keeps them behaving identically.
+One suite, four implementations. This file is the conformance companion to [SPEC.md](../SPEC.md): it explains how the suite runs, what it covers, and what it cannot reach.
 
-Add a test in the same change as the behavior it covers, in every lane.
+Every test runs against all four lanes, which is what keeps them behaving identically. Add a test in the same change as the behavior it covers, in every lane.
 
 ## Running
 
@@ -12,13 +12,22 @@ pwsh -File test/run-tests.ps1 -ShimExe cpp/bin/x64/shim.exe
 
 From a lane directory the path is `..\test\run-tests.ps1`. CI runs the suite for x86 and x64 on every PR touching `<lang>/**` or `test/**`.
 
+## Conformance coverage
+
+The suite is the executable check of [SPEC.md](../SPEC.md). Its current coverage is:
+
+- Part 1: pairing, missing and malformed `.shim`, encoding, line syntax, required fields, launch, argument quoting, exit-code forwarding, and self-description through `--version`, `-v`, or no args (SPEC §2.6).
+- Part 2: the optional features `cwd`, `env`, `env-force`, `expand`, `dp0`, and `elevate`, and their advertisement through `Features:` (SPEC §4).
+
+When a required behavior is not testable, it must be listed below as a blind spot. A behavior that is neither tested nor listed is a gap, not a pass.
+
 ## Native probe
 
 `probe.c` exists because the things the suite needs cannot be done faithfully from PowerShell -- most of all, a native target reports exactly what a real `.exe` child receives, where a batch target only measures `cmd.exe`'s `%*` re-expansion and PowerShell 7 reverts to Legacy quoting for `.cmd`. Every test target is the probe, with two deliberate exceptions: a single test still points at a `.cmd` file, because that is the only thing guarding the shim's ability to launch a batch target at all, and Scoop never produces such a pairing; and the "Direct-child-only lifecycle" test points at `powershell.exe`, because observing whether the shim kills a child's descendants needs a child that spawns one. Each mode is documented in `probe.c` itself.
 
 `probe.exe` is built from `probe.c`, not tracked: a tracked binary can drift away from the source it came from, and every lane needs the same bytes. The suite builds it when it is missing or older than `probe.c`; CI builds it once and hands every lane the same file. `build-probe.ps1` is the single place the `zig cc` line lives:
 
-```
+```pwsh
 pwsh -File test\build-probe.ps1
 ```
 

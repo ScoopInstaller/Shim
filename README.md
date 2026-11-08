@@ -2,69 +2,11 @@
 
 ![C#](https://img.shields.io/badge/dynamic/regex?url=https://raw.githubusercontent.com/ScoopInstaller/Shim/refs/heads/main/cs/version&search=%5B%5Cd.%5D%2B&logo=dotnet&label=C#) ![C++](https://img.shields.io/badge/dynamic/regex?url=https://raw.githubusercontent.com/ScoopInstaller/Shim/refs/heads/main/cpp/version&search=%5B%5Cd.%5D%2B&logo=cplusplus&label=C++) ![Rust](https://img.shields.io/badge/dynamic/regex?url=https://raw.githubusercontent.com/ScoopInstaller/Shim/refs/heads/main/rust/version&search=%5B%5Cd.%5D%2B&logo=rust&label=Rust) ![Zig](https://img.shields.io/badge/dynamic/regex?url=https://raw.githubusercontent.com/ScoopInstaller/Shim/refs/heads/main/zig/version&search=%5B%5Cd.%5D%2B&logo=zig&label=Zig)
 
-A small program that launches the executable specified in its paired `<name>.shim` file. A helper for [Scoop](https://scoop.sh), the Windows command-line installer.
+A tiny, fast launcher for [Scoop](https://scoop.sh), the Windows command-line installer. It reads a small `.shim` file, starts the tool it points to, and stays out of the way.
 
-## Shim File Format
+Four independent implementations -- C#, C++, Rust, and Zig -- with identical behavior.
 
-```text
-path = <path to executable>
-args = <arguments>
-cwd = <working directory>
-elevate = true|false|1|0|yes|no
-NAME = <environment variable override>
-```
-
-### File Encoding
-
-The file is read as UTF-8, with or without a byte order mark; plain ASCII is fine. Line endings may be LF or CRLF.
-
-### Line Format
-
-A field is `key = value`, where the separator is the **first** `=` and spaces around it are optional -- `path = app.exe` and `path=app.exe` are the same field. The key is trimmed of surrounding whitespace, the value of leading whitespace. A line whose first non-whitespace characters are `#`, `;`, or `//` is a comment, and a blank line is ignored. Any other line is a broken shim: the shim reports it and exits with code 1 without starting the target.
-
-### Fields
-
-| Field               | Description                                             |
-| ------------------- | ------------------------------------------------------- |
-| `path`              | **(Required)** Path to the target executable            |
-| `args`              | Arguments passed to the target                          |
-| `cwd` (`workdir`)   | Working directory for the target process                |
-| `elevate` (`runas`) | Request UAC elevation. Truthy values: `true`, `1`, `yes` |
-| Any other name      | Environment variable set for the target process         |
-
-A `path` value is rooted when it starts with a drive letter and a colon; otherwise it is resolved against the shim's own directory. A leading `\` or `/` is rejected.
-
-### Value Quoting
-
-Values may be wrapped in double quotes (e.g. `path = "C:\Program Files\app.exe"`) or left unquoted. In `path`, `cwd` and environment overrides the wrapping quotes are stripped after expansion; in `args` there is no unquoting, because the value is parsed with command-line rules, so quotes group arguments and the backslash-before-quote rules apply.
-
-### Variable Expansion
-
-- `%ENV%` -- Expands environment variables in `path`, `cwd`, and environment override values; in `args` the value is passed through unchanged so the child process can expand `%VAR%` itself. Unknown variables (e.g. `%NONEXISTENT_VAR%`) are preserved as-is. Values are expanded when the shim file is read, so a value cannot reference a variable the shim itself defines.
-- `%~dp0` — In `path`, expands against the **shim's own directory** (the target is unknown at that point). In `args`, `cwd`, and environment override values, expands to the **directory containing the target executable** with a trailing backslash. All occurrences in a value are replaced.
-
-### Argument Parsing
-
-User-provided runtime arguments are appended after those defined in `args`. `args` is the only list-valued field: a repeated key appends in file order, while every repeated scalar key except `path` takes its last value (`path` is first-wins). An empty `args` value contributes nothing.
-
-### Environment Variables
-
-Any line whose key is not `path`, `args`, `cwd`, `workdir`, `elevate`, or `runas` is an environment variable override for the child process. To set one of those names as a variable rather than as the field, prefix the key with `env:`:
-
-```text
-path = %~dp0tool.exe
-env:PATH = %PATH%;%~dp0
-```
-
-The prefix is stripped case-insensitively and the remainder is the variable name verbatim. Duplicate names: the last definition wins.
-
-### Exit Codes
-
-The shim waits for the child process to finish and forwards its exit code, including large values (e.g. crash codes like `0xC0000005`) unmangled. If the shim fails internally, it exits with code 1.
-
-## Usage
-
-The `.shim` file is found next to the executable: take the executable's own path, replace the extension of the final path component with `.shim`, or append `.shim` if that component has no dot. A dot in a parent directory is not an extension. Copying a lane's `shim.exe` to `test.exe` therefore pairs it with `test.shim`.
+## Quick start
 
 ```pwsh
 New-Item -Path test.shim -Value 'path = C:\Windows\System32\calc.exe'
@@ -72,52 +14,71 @@ Copy-Item -Path .\cpp\bin\x64\shim.exe -Destination .\test.exe
 .\test.exe
 ```
 
+`test.exe` reads `test.shim` from the same directory. The file is found by replacing the executable's extension with `.shim`, or appending `.shim` when the name has none.
+
+## Shim file
+
+```text
+path = C:\Apps\tool.exe
+args = --quiet
+env:APP_CACHE_DIR = %~dp0cache
+env!:PATH = %PATH%;%~dp0
+```
+
+- `path` is required. `args`, `cwd`, and `elevate` are optional.
+- `env:NAME` sets a default; an external value wins.
+- `env!:NAME` forces a value. Use it for PATH changes or deliberate isolation.
+- `%~dp0` means the shim's directory in `path`, and the target's directory elsewhere.
+
+The shim waits for the child and forwards its exit code. See [SPEC.md](SPEC.md) for the full format and rules.
+
+## Self-description
+
+An unpaired `shim.exe` can report itself:
+
+```pwsh
+.\shim.exe --version
+```
+
+```text
+shim <version> (<impl>)
+Features: cwd env env-force expand dp0 elevate
+```
+
+Only the canonical, unpaired `shim.exe` answers. A shim with a `.shim` file passes its arguments to the target.
+
 ## Implementations
 
-- **C#** — .NET Framework 4.5 (CLR).
-- **C++** — Native executable with no runtime dependencies. Zig build (default).
-- **Rust** — Native executable using `windows-sys` raw FFI bindings. Cargo build.
-- **Zig** — Native executable using custom `wWinMainCRTStartup` entry. Zig build only.
+| Implementation | `impl` | Build Tool |      x86 |      x64 |    arm64 |
+| -------------- | ------ | ---------- | -------: | -------: | -------: |
+| C#             | `cs`   | dotnet     |  22.5 KB |  22.0 KB |  22.0 KB |
+| C++            | `cpp`  | Zig        | 121.0 KB | 145.5 KB | 137.0 KB |
+| C++            | `cpp`  | MSBuild    | 125.5 KB | 147.0 KB | 129.0 KB |
+| Rust           | `rust` | Cargo      | 115.5 KB | 133.0 KB | 128.5 KB |
+| Zig            | `zig`  | Zig        |  87.5 KB |  75.0 KB |  24.5 KB |
 
-## Binary Size
+`impl` is the token reported by self-description. Sizes are the current build output.
 
-| Implementation | Build Tool |      x86 |      x64 |    arm64 |
-| -------------- | ---------- | -------: | -------: | -------: |
-| C#             | dotnet     |  22.5 KB |  22.0 KB |  22.0 KB |
-| C++            | Zig        | 121.0 KB | 145.5 KB | 137.0 KB |
-| C++            | MSBuild    | 125.5 KB | 147.0 KB | 129.0 KB |
-| Rust           | Cargo      | 115.5 KB | 133.0 KB | 128.5 KB |
-| Zig            | Zig        |  87.5 KB |  75.0 KB |  24.5 KB |
+## Documentation
 
-## Development
-
-- C# developer guide: [`cs/README.md`](cs/README.md)
-- C++ developer guide: [`cpp/README.md`](cpp/README.md)
-- Rust developer guide: [`rust/README.md`](rust/README.md)
-- Zig developer guide: [`zig/README.md`](zig/README.md)
-- Design rationale: [`RATIONALE.md`](RATIONALE.md)
-- Agent conventions: [`AGENTS.md`](AGENTS.md)
-- Test suite: [`test/run-tests.ps1`](test/run-tests.ps1)
-- Test guide: [`test/README.md`](test/README.md)
-- Startup cost: [`benchmark/README.md`](benchmark/README.md)
-- Tag-based release routing:
-  - `cs/v<version>` → C# release lane
-  - `cpp/v<version>` → C++ release lane
-  - `rust/v<version>` → Rust release lane
-  - `zig/v<version>` → Zig release lane
-
-All `build.ps1` scripts accept `-Target x86|x64|arm64` and `-Configuration Debug|Release` (default Release). Output is written to `bin/{Target}/shim.exe`.
+- Specification: [SPEC.md](SPEC.md)
+- Design rationale: [RATIONALE.md](RATIONALE.md)
+- Agent workflow: [AGENTS.md](AGENTS.md)
+- C# developer guide: [cs/README.md](cs/README.md)
+- C++ developer guide: [cpp/README.md](cpp/README.md)
+- Rust developer guide: [rust/README.md](rust/README.md)
+- Zig developer guide: [zig/README.md](zig/README.md)
+- Test suite: [test/run-tests.ps1](test/run-tests.ps1)
+- Test guide: [test/README.md](test/README.md)
+- Startup cost: [benchmark/README.md](benchmark/README.md)
 
 ## Special Thanks
 
 This repository builds on these earlier implementations:
 
 - **[71/scoop-better-shimexe](https://github.com/71/scoop-better-shimexe)** -- C implementation that solved Ctrl+C passthrough and dropped the .NET startup cost.
-
 - **[kiennq/scoop-better-shimexe](https://github.com/kiennq/scoop-better-shimexe)** -- C++ fork of 71's, adding MSBuild support and the `cwd` field to the shim format.
-
 - **[zoritle/rshim](https://github.com/zoritle/rshim)** -- Rust implementation, memory safety and UTF-8 BOM handling.
-
 - **[svercl/zshim](https://github.com/svercl/zshim)** -- Zig port, showed a shim can be built with no runtime dependency.
 
 ## License
