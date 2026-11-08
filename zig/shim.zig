@@ -45,6 +45,12 @@ const ATTACH_PARENT_PROCESS = @as(i32, -1);
 
 const ERROR_ELEVATION_REQUIRED = 740;
 const ERROR_INVALID_FUNCTION = 1;
+const ERROR_FILE_NOT_FOUND = 2;
+const ERROR_PATH_NOT_FOUND = 3;
+
+const shim_version = std.mem.trim(u8, @embedFile("version"), " \t\r\n");
+const shim_impl = "zig";
+const shim_features = "cwd env expand dp0 elevate";
 
 const FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100;
 const FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;
@@ -217,6 +223,12 @@ fn writeError(msg: []const u8) void {
     const hErr = GetStdHandle(STD_ERROR_HANDLE) orelse return;
     var written: DWORD = 0;
     _ = WriteFile(hErr, msg.ptr, @intCast(msg.len), &written, null);
+}
+
+fn writeStdout(msg: []const u8) void {
+    const hOut = GetStdHandle(STD_OUTPUT_HANDLE) orelse return;
+    var written: DWORD = 0;
+    _ = WriteFile(hOut, msg.ptr, @intCast(msg.len), &written, null);
 }
 
 fn writeErrorDec(v: u32) void {
@@ -668,9 +680,7 @@ fn fallbackDir(allocator: std.mem.Allocator, toResolve: []const WCHAR, err: DWOR
     return try allocator.dupe(WCHAR, dir);
 }
 
-fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
-    var info = ShimInfo.init(allocator);
-
+fn getModulePath(allocator: std.mem.Allocator) ![]WCHAR {
     // Resolve the shim's own path with a growing buffer, capped at the path limit.
     const max_module_path_chars = 32768;
     var filename = try allocator.alloc(WCHAR, windows.MAX_PATH);
@@ -693,28 +703,73 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         }
         filename = try allocator.realloc(filename, filename_size + 1);
     }
+    return filename[0..filename_size];
+}
 
-    // Slack for the ".shim" suffix and its null terminator, written in place below.
-    filename = try allocator.realloc(filename, filename_size + 8);
+fn shimPathFromModule(allocator: std.mem.Allocator, module_path: []const WCHAR) ![:0]WCHAR {
+    const filename = try allocator.alloc(WCHAR, module_path.len + 8);
+    @memcpy(filename[0..module_path.len], module_path);
 
     // Only a '.' in the final path component is an extension.
-    const shim_name_len = blk: {
-        const comp_start = if (std.mem.lastIndexOfScalar(WCHAR, filename[0..filename_size], '\\')) |sep|
-            sep + 1
-        else if (std.mem.lastIndexOfScalar(WCHAR, filename[0..filename_size], '/')) |sep|
-            sep + 1
-        else
-            0;
-        if (std.mem.lastIndexOfScalar(WCHAR, filename[comp_start..filename_size], '.')) |dot| {
-            const abs_dot = comp_start + dot;
-            @memcpy(filename[abs_dot .. abs_dot + 5], w(".shim"));
-            filename[abs_dot + 5] = 0;
-            break :blk abs_dot + 5;
-        }
-        @memcpy(filename[filename_size .. filename_size + 5], w(".shim"));
-        filename[filename_size + 5] = 0;
-        break :blk filename_size + 5;
-    };
+    const comp_start = if (std.mem.lastIndexOfScalar(WCHAR, module_path, '\\')) |sep|
+        sep + 1
+    else if (std.mem.lastIndexOfScalar(WCHAR, module_path, '/')) |sep|
+        sep + 1
+    else
+        0;
+    if (std.mem.lastIndexOfScalar(WCHAR, module_path[comp_start..], '.')) |dot| {
+        const abs_dot = comp_start + dot;
+        @memcpy(filename[abs_dot .. abs_dot + 5], w(".shim"));
+        filename[abs_dot + 5] = 0;
+        return filename[0 .. abs_dot + 5 :0];
+    }
+    @memcpy(filename[module_path.len .. module_path.len + 5], w(".shim"));
+    filename[module_path.len + 5] = 0;
+    return filename[0 .. module_path.len + 5 :0];
+}
+
+fn tryPrintVersion(allocator: std.mem.Allocator, user_args: []const [:0]WCHAR) !bool {
+    if (user_args.len > 2) return false;
+    if (user_args.len == 2 and
+        !std.mem.eql(WCHAR, user_args[1], w("--version")) and
+        !std.mem.eql(WCHAR, user_args[1], w("-v"))) return false;
+
+    const module_path = try getModulePath(allocator);
+    const shim_path = try shimPathFromModule(allocator, module_path);
+    const comp_start = if (std.mem.lastIndexOfScalar(WCHAR, shim_path, '\\')) |sep|
+        sep + 1
+    else if (std.mem.lastIndexOfScalar(WCHAR, shim_path, '/')) |sep|
+        sep + 1
+    else
+        0;
+    if (!eqlIgnoreCase(shim_path[comp_start..], w("shim.shim"))) return false;
+
+    const h = CreateFileW(shim_path.ptr, .{ .GENERIC = .{ .READ = true } }, .{ .READ = true }, null, .OPEN_EXISTING, 0, null);
+    if (h != INVALID_HANDLE_VALUE) {
+        _ = windows.CloseHandle(h);
+        return false;
+    }
+
+    const err = GetLastError();
+    if (err != ERROR_FILE_NOT_FOUND and err != ERROR_PATH_NOT_FOUND) return false;
+
+    writeStdout("shim ");
+    writeStdout(shim_version);
+    writeStdout(" (");
+    writeStdout(shim_impl);
+    writeStdout(")\nFeatures: ");
+    writeStdout(shim_features);
+    writeStdout("\n");
+    return true;
+}
+
+fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
+    var info = ShimInfo.init(allocator);
+
+    const module_path = try getModulePath(allocator);
+    const filename = try shimPathFromModule(allocator, module_path);
+    const filename_size: DWORD = @intCast(filename.len);
+    const shim_name_len = filename.len;
 
     const file_handle = CreateFileW(
         filename[0..shim_name_len :0].ptr,
@@ -1043,26 +1098,26 @@ fn shimMain() !u32 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = arena.allocator();
 
+    var user_args: [][:0]WCHAR = try allocator.alloc([:0]WCHAR, 0);
+    const cmd = GetCommandLineW();
+    const cmd_len = std.mem.len(cmd);
+    if (cmd_len > 0) {
+        const cmd_copy = try allocator.alloc(WCHAR, cmd_len + 1);
+        @memcpy(cmd_copy[0..cmd_len], cmd[0..cmd_len]);
+        cmd_copy[cmd_len] = 0;
+        user_args = try parseArgsFromCmdLine(allocator, cmd_copy[0..cmd_len :0]);
+    }
+
+    if (try tryPrintVersion(allocator, user_args)) return 0;
+
     var info = try getShimInfo(allocator);
 
     if (info.path == null) {
         return 1;
     }
 
-    {
-        const cmd = GetCommandLineW();
-        const cmd_len = std.mem.len(cmd);
-        if (cmd_len > 0) {
-            const cmd_copy = try allocator.alloc(WCHAR, cmd_len + 1);
-            @memcpy(cmd_copy[0..cmd_len], cmd[0..cmd_len]);
-            cmd_copy[cmd_len] = 0;
-
-            const user_args = try parseArgsFromCmdLine(allocator, cmd_copy[0..cmd_len :0]);
-
-            if (user_args.len > 1) {
-                for (user_args[1..]) |arg| try info.args.append(allocator, arg);
-            }
-        }
+    if (user_args.len > 1) {
+        for (user_args[1..]) |arg| try info.args.append(allocator, arg);
     }
 
     // A GUI-subsystem shim would flash a console. With args it behaves as a CLI

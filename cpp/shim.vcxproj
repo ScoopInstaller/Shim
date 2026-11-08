@@ -98,6 +98,10 @@
     <GenerateManifest>false</GenerateManifest>
   </PropertyGroup>
 
+  <Target Name="RequireShimVersion" BeforeTargets="ClCompile" Condition="'$(ShimVersion)'==''">
+    <Error Text="ShimVersion is required; run build.ps1." />
+  </Target>
+
   <!-- Shared settings across all configurations -->
   <ItemDefinitionGroup>
     <ClCompile>
@@ -108,7 +112,7 @@
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <!-- Pure Win32: no C++ stdlib, no security cookies -->
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>SHIM_VERSION=L"$(ShimVersion)";WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <ControlFlowGuard>false</ControlFlowGuard>
       <FunctionLevelLinking>true</FunctionLevelLinking>

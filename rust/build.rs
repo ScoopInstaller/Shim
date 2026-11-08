@@ -11,6 +11,8 @@ fn main() {
         .trim()
         .to_string();
 
+    println!("cargo:rustc-env=SHIM_VERSION={ver}");
+
     if std::env::var_os("CARGO_CFG_TARGET_OS").as_deref() == Some(std::ffi::OsStr::new("windows")) {
         let mut res = winres::WindowsResource::new();
         // Pack FILEVERSION/PRODUCTVERSION from `version`; winres would default them to Cargo.toml's.

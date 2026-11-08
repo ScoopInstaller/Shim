@@ -1,11 +1,13 @@
 #Requires -Version 7
 
 # Functional tests for shim.exe
-# Usage: ./run-tests.ps1 -ShimExe <path-to-shim.exe>
+# Usage: ./run-tests.ps1 -ShimExe <path-to-shim.exe> [-ExpectedVersion <version>] [-ExpectedImpl <impl>]
 
 param(
     [Parameter(Mandatory=$true)]
-    [string]$ShimExe
+    [string]$ShimExe,
+    [string]$ExpectedVersion,
+    [string]$ExpectedImpl
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,7 +92,8 @@ function Invoke-ShimTest {
         [string[]]$RunArgs = @(),
         [Parameter(Mandatory=$true)][scriptblock]$Assert,
         [string]$PipeInput = $null,
-        [string[]]$CreatorArgs = @()
+        [string[]]$CreatorArgs = @(),
+        [string]$ExeName = "test"
     )
     $script:TestNumber++
     $num = $script:TestNumber
@@ -101,11 +104,11 @@ function Invoke-ShimTest {
         if ($CreatorArgs.Count -gt 0) {
             $creatorArgs = @($CreatorArgs)
             if ($PipeInput) { $creatorArgs += @('--stdin', $PipeInput) }
-            $output = & $probeExe create "$testDir\test.exe" @creatorArgs -- @RunArgs 2>&1 | Out-String
+            $output = & $probeExe create "$testDir\$ExeName.exe" @creatorArgs -- @RunArgs 2>&1 | Out-String
         } elseif ($PipeInput) {
-            $output = $PipeInput | & "$testDir\test.exe" @RunArgs 2>&1 | Out-String
+            $output = $PipeInput | & "$testDir\$ExeName.exe" @RunArgs 2>&1 | Out-String
         } else {
-            $output = & "$testDir\test.exe" @RunArgs 2>&1 | Out-String
+            $output = & "$testDir\$ExeName.exe" @RunArgs 2>&1 | Out-String
         }
         $sw.Stop()
         $result = @{ Output = $output; ExitCode = $LASTEXITCODE; TestDir = $testDir; Elapsed = $sw.Elapsed }
@@ -193,6 +196,28 @@ if (-not (Test-Path $probeExe) -or (Get-Item $probeExe).LastWriteTimeUtc -lt (Ge
     }
 }
 $probeExe = (Resolve-Path $probeExe).Path
+
+function Get-ShimLaneDir {
+    $dir = Split-Path $ShimExe -Parent
+    while ($dir -and -not (Test-Path (Join-Path $dir 'version'))) {
+        $dir = Split-Path $dir -Parent
+    }
+    return $dir
+}
+
+function Get-ShimVersion {
+    if ($ExpectedVersion) { return $ExpectedVersion }
+    $dir = Get-ShimLaneDir
+    if (-not $dir) { return $null }
+    return (Get-Content (Join-Path $dir 'version') -Raw).Trim()
+}
+
+function Get-ShimImpl {
+    if ($ExpectedImpl) { return $ExpectedImpl }
+    $dir = Get-ShimLaneDir
+    if (-not $dir) { return $null }
+    return Split-Path $dir -Leaf
+}
 
 # ============================================================================
 # Tests
@@ -885,6 +910,61 @@ if (([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object 
     # Counted as a pass as the suite always has (the summary counts failures only), without launching.
     Write-Host "  [SKIP] Test #$script:TestNumber elevation requires an elevated runner (UAC consent dialog cannot be automated); counting as pass" -ForegroundColor DarkYellow
     $script:TestsPassed++
+}
+
+# --- Self-description ----------------------------------------------------------
+
+$expectedVersion = Get-ShimVersion
+$expectedImpl = Get-ShimImpl
+$expectedFeatures = "cwd env expand dp0 elevate"
+
+function Invoke-SelfDescTest {
+    $script:TestNumber++
+    $num = $script:TestNumber
+    $dir = New-TestEnvironment
+    $p = $null
+    try {
+        $exe = Join-Path $dir 'shim.exe'
+        Copy-Item $ShimExe $exe
+        $expected = "shim $expectedVersion ($expectedImpl)`nFeatures: $expectedFeatures`n"
+        $failures = @()
+        foreach ($case in @('', '--version', '-v')) {
+            $label = if ($case) { $case } else { 'no args' }
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $exe
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            if ($case) { $psi.ArgumentList.Add($case) }
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $stdout = $p.StandardOutput.ReadToEnd()
+            $stderr = $p.StandardError.ReadToEnd()
+            $p.WaitForExit()
+            if ($p.ExitCode -ne 0 -or $stdout -cne $expected -or $stderr -ne '') {
+                $failures += "[$label] exit=$($p.ExitCode) stdout=[$stdout] stderr=[$stderr]"
+            }
+            $p.Dispose()
+            $p = $null
+        }
+        Write-TestResult "#$num Unpaired shim.exe reports version and features for no args, --version, and -v" ($failures.Count -eq 0) ($failures -join ' ; ')
+    } catch {
+        Write-TestResult "#$num Unpaired shim.exe reports version and features for no args, --version, and -v" $false $_.Exception.Message
+    } finally {
+        if ($p) { $p.Dispose() }
+        Remove-TestEnvironment $dir
+    }
+}
+
+Invoke-SelfDescTest
+
+Invoke-ShimTest "shim.shim wins over no-arg self-description" -ExeName "shim" -Setup {
+    param($d)
+    Copy-Item $ShimExe "$d\shim.exe"
+    Set-Content -Path "$d\shim.shim" -Value "path = $probeExe`nargs = echo TARGET_OK"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match "TARGET_OK") -and ($r.Output -notmatch "Features:")
+    @{ Pass = $pass; Message = "ExitCode: $($r.ExitCode), Output: $($r.Output)" }
 }
 
 # --- GUI subsystem -------------------------------------------------------------

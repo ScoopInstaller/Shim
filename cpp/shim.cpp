@@ -46,6 +46,8 @@ constexpr std::wstring_view c_elevatePrefix = L"elevate"sv;
 constexpr std::wstring_view c_runasPrefix = L"runas"sv;
 constexpr std::wstring_view c_envPrefix = L"env:"sv;
 constexpr wchar_t c_keyValueSeparator = L'=';
+constexpr const wchar_t* c_shimImpl = L"cpp";
+constexpr const wchar_t* c_shimFeatures = L"cwd env expand dp0 elevate";
 
 // iswspace() drags in the UCRT wide-ctype table (large under static CRT).
 
@@ -86,19 +88,18 @@ struct ProcessResult
 };
 
 // WriteConsoleW fails on redirected handles, so route by file type; stdio deliberately, see RATIONALE.md.
-inline void WriteErrorW(const wchar_t* msg) noexcept
+inline void WriteToHandle(HANDLE h, const wchar_t* msg) noexcept
 {
-    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-    if (hErr == nullptr || hErr == INVALID_HANDLE_VALUE)
+    if (h == nullptr || h == INVALID_HANDLE_VALUE)
     {
         return;
     }
 
     const size_t len = wcslen(msg);
-    if (GetFileType(hErr) == FILE_TYPE_CHAR)
+    if (GetFileType(h) == FILE_TYPE_CHAR)
     {
         DWORD written;
-        WriteConsoleW(hErr, msg, static_cast<DWORD>(len), &written, nullptr);
+        WriteConsoleW(h, msg, static_cast<DWORD>(len), &written, nullptr);
         return;
     }
 
@@ -117,10 +118,14 @@ inline void WriteErrorW(const wchar_t* msg) noexcept
             return;
 
         DWORD written;
-        WriteFile(hErr, utf8.data(), static_cast<DWORD>(cb), &written, nullptr);
+        WriteFile(h, utf8.data(), static_cast<DWORD>(cb), &written, nullptr);
         off += count;
     }
 }
+
+inline void WriteErrorW(const wchar_t* msg) noexcept { WriteToHandle(GetStdHandle(STD_ERROR_HANDLE), msg); }
+
+inline void WriteInfoW(const wchar_t* msg) noexcept { WriteToHandle(GetStdHandle(STD_OUTPUT_HANDLE), msg); }
 
 inline void WriteErrorSys(DWORD err)
 {
@@ -542,7 +547,7 @@ enum class LineKind
     return LineKind::Field;
 }
 
-[[nodiscard]] ShimInfo GetShimInfo()
+[[nodiscard]] std::optional<std::wstring> GetModulePath()
 {
     std::vector<wchar_t> filename(MAX_PATH + 2);
     DWORD capacity = static_cast<DWORD>(filename.size());
@@ -552,7 +557,7 @@ enum class LineKind
     {
         WriteErrorW(L"Shim: The filename of the program could not be determined");
         WriteErrorSys(GetLastError());
-        return {};
+        return std::nullopt;
     }
 
     // Truncation returns the required size: grow and retry, capped at the path limit.
@@ -562,15 +567,14 @@ enum class LineKind
         DWORD want = capacity * 4;
         if (want > maxModulePath)
             want = maxModulePath;
-        // Room for the ".exe" -> "shim" overwrite plus its null terminator.
-        filename.resize(want + 2);
+        filename.resize(want);
         capacity = want;
         filenameSize = GetModuleFileNameW(nullptr, filename.data(), capacity);
         if (filenameSize == 0) [[unlikely]]
         {
             WriteErrorW(L"Shim: The filename of the program could not be determined");
             WriteErrorSys(GetLastError());
-            return {};
+            return std::nullopt;
         }
     }
 
@@ -580,24 +584,69 @@ enum class LineKind
         msg += std::wstring_view(filename.data(), filenameSize);
         msg += L"'.\n";
         WriteErrorW(msg.c_str());
+        return std::nullopt;
+    }
+
+    return std::wstring(filename.data(), filenameSize);
+}
+
+// Only replace the extension of the file name, not a dot in a parent directory.
+[[nodiscard]] std::wstring ShimPathFor(std::wstring_view modulePath)
+{
+    std::wstring shimPath(modulePath);
+    size_t compStart = shimPath.find_last_of(L"\\/");
+    compStart = (compStart == std::wstring::npos) ? 0 : compStart + 1;
+    const size_t dot = shimPath.rfind(L'.');
+    if (dot != std::wstring::npos && dot >= compStart)
+        shimPath.replace(dot, std::wstring::npos, L".shim");
+    else
+        shimPath += L".shim";
+    return shimPath;
+}
+
+[[nodiscard]] bool TryPrintVersion(int argc, wchar_t* argv[]) noexcept
+{
+    if (argc > 2 || (argc == 2 && wcscmp(argv[1], L"--version") != 0 && wcscmp(argv[1], L"-v") != 0))
+        return false;
+
+    const auto modulePath = GetModulePath();
+    if (!modulePath)
+        return false;
+
+    const std::wstring shimPath = ShimPathFor(*modulePath);
+    const size_t compStart = shimPath.find_last_of(L"\\/");
+    const std::wstring_view shimName = std::wstring_view(shimPath).substr(compStart == std::wstring::npos ? 0 : compStart + 1);
+    if (!IEquals(shimName, L"shim.shim"sv))
+        return false;
+
+    UniqueHandle shimFile(CreateFileW(shimPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (shimFile.get() != INVALID_HANDLE_VALUE)
+        return false;
+
+    const DWORD err = GetLastError();
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+        return false;
+
+    WriteInfoW(L"shim ");
+    WriteInfoW(SHIM_VERSION);
+    WriteInfoW(L" (");
+    WriteInfoW(c_shimImpl);
+    WriteInfoW(L")\nFeatures: ");
+    WriteInfoW(c_shimFeatures);
+    WriteInfoW(L"\n");
+    return true;
+}
+
+[[nodiscard]] ShimInfo GetShimInfo()
+{
+    const auto modulePath = GetModulePath();
+    if (!modulePath)
         return {};
-    }
 
-    // Only replace the extension of the file name, not a dot in a parent directory.
-    {
-        std::wstring shimPath(filename.data(), filenameSize);
-        size_t compStart = shimPath.find_last_of(L"\\/");
-        compStart = (compStart == std::wstring::npos) ? 0 : compStart + 1;
-        const size_t dot = shimPath.rfind(L'.');
-        if (dot != std::wstring::npos && dot >= compStart)
-            shimPath.replace(dot, std::wstring::npos, L".shim");
-        else
-            shimPath += L".shim";
-
-        filenameSize = static_cast<DWORD>(shimPath.size());
-        filename.assign(shimPath.begin(), shimPath.end());
-        filename.push_back(L'\0');
-    }
+    const std::wstring shimPath = ShimPathFor(*modulePath);
+    std::vector<wchar_t> filename(shimPath.begin(), shimPath.end());
+    filename.push_back(L'\0');
+    DWORD filenameSize = static_cast<DWORD>(shimPath.size());
 
     // Raw ReadFile instead of stdio: the CRT's FILE machinery and ccs=UTF-8 decoder
     // are dead weight under a static CRT, and _wfopen_s reports errno instead of a
@@ -923,6 +972,9 @@ enum class LineKind
 
 int wmain(int argc, wchar_t* argv[])
 {
+    if (TryPrintVersion(argc, argv))
+        return 0;
+
     auto info = GetShimInfo();
 
     if (!info.path) [[unlikely]]

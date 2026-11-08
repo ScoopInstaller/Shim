@@ -45,6 +45,14 @@ using System.Reflection;
 [assembly: AssemblyProduct("Scoop Shim Ex")]
 [assembly: AssemblyCopyright("Copyright (c) 2013-present Scoop contributors")]
 
+namespace Scoop
+{
+    internal static class ShimBuildInfo
+    {
+        internal const string Version = "$ver";
+    }
+}
+
 "@
   Set-Content -Path $outFile -Value $content -Encoding ASCII
   Write-Host "Generated AssemblyInfo.cs (version $ver)" -ForegroundColor DarkGray

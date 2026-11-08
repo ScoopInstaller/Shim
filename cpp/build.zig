@@ -33,6 +33,8 @@ pub fn build(b: *std.Build) void {
         .abi = .msvc,
     } });
     const strip = b.option(bool, "strip", "Strip debug symbols from the executable") orelse false;
+    const version = b.option([]const u8, "version", "Shim version") orelse @panic("pass -Dversion=<version>; run build.ps1");
+    const version_flag = b.fmt("-DSHIM_VERSION=L\"{s}\"", .{version});
 
     if (target.result.os.tag != .windows) {
         std.log.err("Non-Windows target is not supported", .{});
@@ -51,7 +53,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addCSourceFiles(.{
         .root = b.path("."),
         .files = &.{"shim.cpp"},
-        .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-flto", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables" },
+        .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-flto", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", version_flag },
     });
     exe.root_module.addCSourceFiles(.{
         .root = b.path("."),

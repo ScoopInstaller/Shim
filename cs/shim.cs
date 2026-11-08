@@ -13,6 +13,10 @@ namespace Scoop
     {
         const int ERROR_ELEVATION_REQUIRED = 740;
         const int ERROR_READ_FAULT = 30;
+        const uint ERROR_FILE_NOT_FOUND = 2;
+        const uint ERROR_PATH_NOT_FOUND = 3;
+        const string SHIM_IMPL = "cs";
+        const string SHIM_FEATURES = "cwd env expand dp0 elevate";
 
         // --- P/Invoke: Process ---
 
@@ -281,17 +285,27 @@ namespace Scoop
         const uint STD_ERROR_HANDLE = 0xFFFFFFF4 - 0; // (DWORD)-12
         const uint FILE_TYPE_CHAR = 2;
 
-        static void WriteErrorW(string msg)
+        static void WriteToHandle(uint stdHandle, string msg)
         {
-            IntPtr hErr = GetStdHandle(STD_ERROR_HANDLE);
-            if (hErr == IntPtr.Zero || hErr == new IntPtr(-1)) return;
-            if (GetFileType(hErr) == FILE_TYPE_CHAR)
+            IntPtr h = GetStdHandle(stdHandle);
+            if (h == IntPtr.Zero || h == new IntPtr(-1)) return;
+            if (GetFileType(h) == FILE_TYPE_CHAR)
             {
-                WriteConsoleW(hErr, msg, (uint)msg.Length, out _, IntPtr.Zero);
+                WriteConsoleW(h, msg, (uint)msg.Length, out _, IntPtr.Zero);
                 return;
             }
             byte[] bytes = Encoding.UTF8.GetBytes(msg);
-            WriteFile(hErr, bytes, (uint)bytes.Length, out _, IntPtr.Zero);
+            WriteFile(h, bytes, (uint)bytes.Length, out _, IntPtr.Zero);
+        }
+
+        static void WriteErrorW(string msg)
+        {
+            WriteToHandle(STD_ERROR_HANDLE, msg);
+        }
+
+        static void WriteInfoW(string msg)
+        {
+            WriteToHandle(STD_OUTPUT_HANDLE, msg);
         }
 
         static void WriteErrorSys(uint err)
@@ -708,6 +722,39 @@ namespace Scoop
 
         // --- Config parsing ---
 
+        static string GetShimPath(string exePath)
+        {
+            // Only replace the extension of the file name, not a dot in a parent directory.
+            int nameStart = Math.Max(exePath.LastIndexOf('\\'), exePath.LastIndexOf('/')) + 1;
+            int dot = exePath.LastIndexOf('.');
+            return (dot >= nameStart ? exePath.Substring(0, dot) : exePath) + ".shim";
+        }
+
+        static bool TryPrintVersion(string[] args)
+        {
+            if (args.Length > 1 || (args.Length == 1 && args[0] != "--version" && args[0] != "-v")) return false;
+
+            var exePath = GetModulePath();
+            if (string.IsNullOrEmpty(exePath)) return false;
+
+            var configPath = GetShimPath(exePath);
+            if (!IsAsciiEqual(Path.GetFileName(configPath), "shim.shim")) return false;
+
+            var sa = new SECURITY_ATTRIBUTES();
+            IntPtr h = CreateFileW(configPath, GENERIC_READ, FILE_SHARE_READ, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (h != IntPtr.Zero && h != new IntPtr(-1))
+            {
+                CloseHandle(h);
+                return false;
+            }
+
+            uint err = (uint)Marshal.GetLastWin32Error();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) return false;
+
+            WriteInfoW($"shim {ShimBuildInfo.Version} ({SHIM_IMPL})\nFeatures: {SHIM_FEATURES}\n");
+            return true;
+        }
+
         static ShimInfo ParseShimInfo()
         {
             var exePath = GetModulePath();
@@ -716,10 +763,7 @@ namespace Scoop
             int sep = Math.Max(exePath.LastIndexOf('\\'), exePath.LastIndexOf('/'));
             if (sep >= 0) dir = exePath.Substring(0, sep);
 
-            // Only replace the extension of the file name, not a dot in a parent directory.
-            int nameStart = Math.Max(exePath.LastIndexOf('\\'), exePath.LastIndexOf('/')) + 1;
-            int dot = exePath.LastIndexOf('.');
-            var configPath = (dot >= nameStart ? exePath.Substring(0, dot) : exePath) + ".shim";
+            var configPath = GetShimPath(exePath);
 
             byte[] raw;
             FileStream file;
@@ -1004,6 +1048,8 @@ namespace Scoop
 
         static int Main(string[] args)
         {
+            if (TryPrintVersion(args)) return 0;
+
             var info = ParseShimInfo();
 
             if (string.IsNullOrEmpty(info.Path))

@@ -42,7 +42,13 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
+const SHIM_VERSION: &str = env!("SHIM_VERSION");
+const SHIM_IMPL: &str = "rust";
+const SHIM_FEATURES: &str = "cwd env expand dp0 elevate";
+
 const ERROR_ELEVATION_REQUIRED: u32 = 740;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
 const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D;
 const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550;
 const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
@@ -69,8 +75,7 @@ struct ShimInfo {
     elevate: bool,
 }
 
-unsafe fn write_error_bytes(msg: &[u8]) {
-    let h: HANDLE = GetStdHandle(STD_ERROR_HANDLE);
+unsafe fn write_bytes(h: HANDLE, msg: &[u8]) {
     if h != NULL_HANDLE && h != INVALID_HANDLE {
         let mut written: u32 = 0;
         WriteFile(
@@ -81,6 +86,14 @@ unsafe fn write_error_bytes(msg: &[u8]) {
             std::ptr::null_mut(),
         );
     }
+}
+
+unsafe fn write_error_bytes(msg: &[u8]) {
+    write_bytes(GetStdHandle(STD_ERROR_HANDLE), msg);
+}
+
+unsafe fn write_stdout_bytes(msg: &[u8]) {
+    write_bytes(GetStdHandle(STD_OUTPUT_HANDLE), msg);
 }
 
 // WriteConsoleW fails on redirected handles, so route by file type.
@@ -961,18 +974,58 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
     }
 }
 
+fn try_print_version(shim_path: &str, shim_wide: &[u16], user_args: &[OsString]) -> bool {
+    if user_args.len() > 2
+        || (user_args.len() == 2
+            && user_args[1].to_str() != Some("--version")
+            && user_args[1].to_str() != Some("-v"))
+    {
+        return false;
+    }
+    let name = shim_path.rsplit(['\\', '/']).next().unwrap_or(shim_path);
+    if !name.eq_ignore_ascii_case("shim.shim") {
+        return false;
+    }
+
+    let shim_os = OsString::from_wide(shim_wide);
+    match File::open(&shim_os) {
+        Ok(_) => return false,
+        Err(e) => {
+            let err = e.raw_os_error().unwrap_or(0) as u32;
+            if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
+                return false;
+            }
+        }
+    }
+
+    unsafe {
+        write_stdout_bytes(b"shim ");
+        write_stdout_bytes(SHIM_VERSION.as_bytes());
+        write_stdout_bytes(b" (");
+        write_stdout_bytes(SHIM_IMPL.as_bytes());
+        write_stdout_bytes(b")\nFeatures: ");
+        write_stdout_bytes(SHIM_FEATURES.as_bytes());
+        write_stdout_bytes(b"\n");
+    }
+    true
+}
+
 fn main() {
     let (cur_dir, shim_path, shim_wide) = match get_shim_paths() {
         Some(p) => p,
         None => std::process::exit(1),
     };
+    let user_args = parse_user_args_from_cmdline();
+    if try_print_version(&shim_path, &shim_wide, &user_args) {
+        return;
+    }
+
     let mut info = parse_shim_info(&cur_dir, &shim_path, &shim_wide);
 
     if info.path.is_none() {
         std::process::exit(1);
     }
 
-    let user_args = parse_user_args_from_cmdline();
     let has_user_args = user_args.len() > 1;
 
     for arg_str in user_args.into_iter().skip(1) {
