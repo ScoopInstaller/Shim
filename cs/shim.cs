@@ -16,7 +16,7 @@ namespace Scoop
         const uint ERROR_FILE_NOT_FOUND = 2;
         const uint ERROR_PATH_NOT_FOUND = 3;
         const string SHIM_IMPL = "cs";
-        const string SHIM_FEATURES = "cwd env expand dp0 elevate";
+        const string SHIM_FEATURES = "cwd env env-force expand dp0 elevate";
 
         // --- P/Invoke: Process ---
 
@@ -201,6 +201,9 @@ namespace Scoop
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool SetEnvironmentVariableW(string lpName, string lpValue);
 
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern uint GetEnvironmentVariableW(string lpName, StringBuilder? lpBuffer, uint nSize);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern IntPtr GetStdHandle(uint nStdHandle);
 
@@ -275,7 +278,21 @@ namespace Scoop
             public List<string> Args = new List<string>();
             public string? Cwd;
             public bool Elevate;
-            public Dictionary<string, string> EnvVars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            public List<EnvAssignment> Env = new List<EnvAssignment>();
+        }
+
+        struct EnvAssignment
+        {
+            public string Name;
+            public string Value;
+            public bool IsDefault;
+
+            public EnvAssignment(string name, string value, bool isDefault)
+            {
+                Name = name;
+                Value = value;
+                IsDefault = isDefault;
+            }
         }
 
         // --- Helpers ---
@@ -837,7 +854,7 @@ namespace Scoop
             }
 
             // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
-            // path to absolute so pass 2 can expand %~dp0 against the right base.
+            // the last path to absolute so pass 2 can expand %~dp0 against the right base.
             var targetDir = dir;
             foreach (var rawLine in lines)
             {
@@ -846,7 +863,6 @@ namespace Scoop
 
                 var expanded = ExpandAndUnquote(NormalizeArgs(value!, dir));
                 targetDir = ResolveAgainstBase(expanded, dir);
-                break;
             }
 
             var info = new ShimInfo();
@@ -857,11 +873,7 @@ namespace Scoop
 
                 if (IsKey(key, "path"))
                 {
-                    // First path line wins; an empty value still consumes the slot.
-                    if (info.Path == null)
-                    {
-                        info.Path = ExpandAndUnquote(NormalizeArgs(value!, dir));
-                    }
+                    info.Path = ExpandAndUnquote(NormalizeArgs(value!, dir));
                 }
                 else if (IsKey(key, "args"))
                 {
@@ -879,13 +891,26 @@ namespace Scoop
                 }
                 else
                 {
+                    var forceName = StripKeyPrefix(key!, "env!:");
+                    if (forceName != key)
+                    {
+                        if (forceName.Length == 0)
+                        {
+                            WriteErrorW("Shim: empty variable name after 'env!:' in shim file\n");
+                            continue;
+                        }
+                        info.Env.Add(new EnvAssignment(
+                            forceName, ExpandAndUnquote(NormalizeArgs(value!, targetDir)), false));
+                        continue;
+                    }
+
                     var name = StripKeyPrefix(key!, "env:");
                     if (name.Length == 0)
                     {
                         WriteErrorW("Shim: empty variable name after 'env:' in shim file\n");
                         continue;
                     }
-                    info.EnvVars[name] = ExpandAndUnquote(NormalizeArgs(value!, targetDir));
+                    info.Env.Add(new EnvAssignment(name, ExpandAndUnquote(NormalizeArgs(value!, targetDir)), true));
                 }
             }
 
@@ -899,14 +924,24 @@ namespace Scoop
 
             return info;
         }
+        static void SetEnv(string name, string value)
+        {
+            if (!SetEnvironmentVariableW(name, value))
+            {
+                ReportShimError($"Could not set environment variable '{name}'", (uint)Marshal.GetLastWin32Error());
+            }
+        }
+
         static int LaunchProcess(ShimInfo info, IntPtr jobHandle)
         {
-            foreach (var kv in info.EnvVars)
+            foreach (var env in info.Env)
             {
-                if (!SetEnvironmentVariableW(kv.Key, kv.Value))
+                if (env.IsDefault)
                 {
-                    ReportShimError($"Could not set environment variable '{kv.Key}'", (uint)Marshal.GetLastWin32Error());
+                    var existing = new StringBuilder(1);
+                    if (GetEnvironmentVariableW(env.Name, existing, 1) != 0) continue;
                 }
+                SetEnv(env.Name, env.Value);
             }
 
             string path = info.Path!;

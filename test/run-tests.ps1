@@ -357,7 +357,7 @@ Invoke-ShimTest "Env var value %~dp0 expansion (multiple occurrences)" -Setup {
     @{ Pass = $r.Output -match [regex]::Escape("MY_D=$expected"); Message = "Expected: MY_D=$expected, Output: $($r.Output)" }
 }
 
-# --- env: prefix (force a reserved key to be an environment variable) -----------
+# --- env: default and env!: force ---------------------------------------------
 
 Invoke-ShimTest "env: prefix does not hijack the shim path" -Setup {
     param($d)
@@ -371,9 +371,9 @@ Invoke-ShimTest "env: prefix does not hijack the shim path" -Setup {
     @{ Pass = $pass; Message = "Output: $($r.Output)" }
 }
 
-Invoke-ShimTest "env: prefix overrides a reserved key" -Setup {
+Invoke-ShimTest "env!: prefix overrides a reserved key" -Setup {
     param($d)
-    Write-Shim $d "test" "path = $probeExe`nargs = env PATH`nenv:PATH = %PATH%;ZZZ_ENV_APPENDED"
+    Write-Shim $d "test" "path = $probeExe`nargs = env PATH`nenv!:PATH = %PATH%;ZZZ_ENV_APPENDED"
 } -Assert {
     param($r)
     # The child's PATH keeps the inherited spelling ("Path"), so only the value is
@@ -386,15 +386,71 @@ Invoke-ShimTest "env: prefix overrides a reserved key" -Setup {
 
 # probe env dumps the child's own block, so the stored spelling is matched exactly;
 # a %VAR% lookup could not tell lowercase from mixed case.
-Invoke-ShimTest "env: prefix is case-insensitive and preserves the name" -Setup {
+Invoke-ShimTest "env!: prefix is case-insensitive and preserves the name" -Setup {
     param($d)
-    Write-Shim $d "test" "path = $probeExe`nargs = env`nenv:LOW = a`nEnv:MID = b`nENV:UP = c`neNv:MiXeD = d"
+    Write-Shim $d "test" "path = $probeExe`nargs = env`nenv!:LOW = a`nEnv!:MID = b`nENV!:UP = c`neNv!:MiXeD = d"
 } -Assert {
     param($r)
     $lines = $r.Output -split "`r?`n"
     $expected = @("LOW=a", "MID=b", "UP=c", "MiXeD=d")
     $missing = @($expected | Where-Object { $lines -cnotcontains $_ })
     @{ Pass = $missing.Count -eq 0; Message = "Missing from child env: $($missing -join ', ')" }
+}
+
+# --- env defaults -------------------------------------------------------------
+
+Invoke-ShimTest "env: keeps an external value" -Setup {
+    param($d)
+    $env:SHIM_DEFAULT_EXTERNAL = "external"
+    Write-Shim $d "test" "path = $probeExe`nargs = env SHIM_DEFAULT_EXTERNAL`nenv:SHIM_DEFAULT_EXTERNAL = shim"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match "SHIM_DEFAULT_EXTERNAL=external"; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "env: sets when the variable is absent" -Setup {
+    param($d)
+    Remove-Item Env:\SHIM_DEFAULT_ABSENT -ErrorAction SilentlyContinue
+    Write-Shim $d "test" "path = $probeExe`nargs = env SHIM_DEFAULT_ABSENT`nenv:SHIM_DEFAULT_ABSENT = shim"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match "SHIM_DEFAULT_ABSENT=shim"; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "env: treats an empty external value as unset" -Setup {
+    param($d)
+    $env:SHIM_DEFAULT_EMPTY = ""
+    Write-Shim $d "test" "path = $probeExe`nargs = env SHIM_DEFAULT_EMPTY`nenv:SHIM_DEFAULT_EMPTY = shim"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match "SHIM_DEFAULT_EMPTY=shim"; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "env!: force wins over env:" -Setup {
+    param($d)
+    $env:SHIM_DEFAULT_FORCE = "external"
+    Write-Shim $d "test" "path = $probeExe`nargs = env SHIM_DEFAULT_FORCE`nenv:SHIM_DEFAULT_FORCE = default`nenv!:SHIM_DEFAULT_FORCE = force"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match "SHIM_DEFAULT_FORCE=force"; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "env: before an explicit empty env!: leaves the value empty" -Setup {
+    param($d)
+    Remove-Item Env:\SHIM_DEFAULT_CLEARED -ErrorAction SilentlyContinue
+    Write-Shim $d "test" "path = $probeExe`nargs = env SHIM_DEFAULT_CLEARED`nenv:SHIM_DEFAULT_CLEARED = fallback`nenv!:SHIM_DEFAULT_CLEARED ="
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match '(?m)^SHIM_DEFAULT_CLEARED=\r?$'; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "duplicate env: keeps the first non-empty value" -Setup {
+    param($d)
+    Remove-Item Env:\SHIM_DEFAULT_DUPLICATE -ErrorAction SilentlyContinue
+    Write-Shim $d "test" "path = $probeExe`nargs = env SHIM_DEFAULT_DUPLICATE`nenv:SHIM_DEFAULT_DUPLICATE = first`nenv:SHIM_DEFAULT_DUPLICATE = second"
+} -Assert {
+    param($r)
+    @{ Pass = $r.Output -match "SHIM_DEFAULT_DUPLICATE=first"; Message = "Output: $($r.Output)" }
 }
 
 # --- Line grammar --------------------------------------------------------------
@@ -409,11 +465,11 @@ Invoke-ShimTest "Key/value separator accepts no spaces" -Setup {
     @{ Pass = $pass; Message = "Expected 'Arg 0 is <fromfile>' and 'Arg 1 is <fromuser>', Output: $($r.Output)" }
 }
 
-Invoke-ShimTest "Case-variant env names keep the first spelling, last value" -Setup {
+Invoke-ShimTest "env!: case-variant names keep the first spelling, last value" -Setup {
     param($d)
     # The full environment-block dump is matched case-sensitively: a %VAR% lookup
     # cannot tell spellings apart, because Windows resolves names case-insensitively.
-    Write-Shim $d "test" "path = $probeExe`nargs = env`nenv:MARK = one`nenv:mark = two"
+    Write-Shim $d "test" "path = $probeExe`nargs = env`nenv!:MARK = one`nenv!:mark = two"
 } -Assert {
     param($r)
     $lines = $r.Output -split "`r?`n"
@@ -693,16 +749,14 @@ Invoke-ShimTest "Missing path key reports shim file" -Setup {
     @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
-Invoke-ShimTest "First path line wins" -Setup {
+Invoke-ShimTest "Last path line wins" -Setup {
     param($d)
-    # The first path is the probe; the second points at a missing exe. If the shim
-    # preferred the last path line the launch would fail and FIRST_PATH would never
-    # print. The not-match on SECOND_PATH is a literal guard (nothing prints it).
-    Write-Shim $d "test" "path = $probeExe`nargs = echo FIRST_PATH`npath = $d\does-not-exist.exe"
+    # The last path is the probe; the first points at a missing exe.
+    Write-Shim $d "test" "path = $d\does-not-exist.exe`nargs = echo LAST_PATH`npath = $probeExe"
 } -Assert {
     param($r)
-    $pass = ($r.Output -match "FIRST_PATH") -and ($r.Output -notmatch "SECOND_PATH")
-    @{ Pass = $pass; Message = "Output: $($r.Output)" }
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match "LAST_PATH")
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
 Invoke-ShimTest "Empty path value treated as missing" -Setup {
@@ -714,14 +768,21 @@ Invoke-ShimTest "Empty path value treated as missing" -Setup {
     @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
-Invoke-ShimTest "Empty path value consumes the first-wins slot" -Setup {
+Invoke-ShimTest "Empty first path is overridden by a later path" -Setup {
     param($d)
-    # The empty path comes first, so it wins the slot and the later line cannot
-    # resurrect the field; EMPTY_PATH_OK must never print.
-    Write-Shim $d "test" "path =`npath = $probeExe`nargs = echo EMPTY_PATH_OK"
+    Write-Shim $d "test" "path =`npath = $probeExe`nargs = echo EMPTY_FIRST_OK"
 } -Assert {
     param($r)
-    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "'path' not found in shim file") -and ($r.Output -notmatch "EMPTY_PATH_OK")
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match "EMPTY_FIRST_OK")
+    @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
+
+Invoke-ShimTest "Empty last path overrides an earlier path" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = echo EMPTY_LAST_OK`npath ="
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "'path' not found in shim file") -and ($r.Output -notmatch "EMPTY_LAST_OK")
     @{ Pass = $pass; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
@@ -916,7 +977,7 @@ if (([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object 
 
 $expectedVersion = Get-ShimVersion
 $expectedImpl = Get-ShimImpl
-$expectedFeatures = "cwd env expand dp0 elevate"
+$expectedFeatures = "cwd env env-force expand dp0 elevate"
 
 function Invoke-SelfDescTest {
     $script:TestNumber++

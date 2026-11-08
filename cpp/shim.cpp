@@ -47,7 +47,7 @@ constexpr std::wstring_view c_runasPrefix = L"runas"sv;
 constexpr std::wstring_view c_envPrefix = L"env:"sv;
 constexpr wchar_t c_keyValueSeparator = L'=';
 constexpr const wchar_t* c_shimImpl = L"cpp";
-constexpr const wchar_t* c_shimFeatures = L"cwd env expand dp0 elevate";
+constexpr const wchar_t* c_shimFeatures = L"cwd env env-force expand dp0 elevate";
 
 // iswspace() drags in the UCRT wide-ctype table (large under static CRT).
 
@@ -57,7 +57,13 @@ constexpr const wchar_t* c_shimFeatures = L"cwd env expand dp0 elevate";
            (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 }
 
-using EnvVarList = std::vector<std::pair<std::wstring, std::wstring>>;
+struct EnvAssignment
+{
+    std::wstring name;
+    std::wstring value;
+    bool isDefault;
+};
+using EnvAssignmentList = std::vector<EnvAssignment>;
 
 struct HandleDeleter
 {
@@ -77,7 +83,7 @@ struct ShimInfo
     std::optional<std::wstring> path;
     std::vector<std::wstring> args;
     std::optional<std::wstring> cwd;
-    EnvVarList envVars;
+    EnvAssignmentList env;
     bool elevate = false;
 };
 
@@ -738,8 +744,8 @@ enum class LineKind
     const std::wstring_view curDir = GetDirectory({filename.data(), filenameSize});
 
     // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
-    // path to absolute so pass 2 can expand %~dp0 against the right base. A path
-    // value may itself use %~dp0, which there refers to the shim's own directory.
+    // the last path to absolute so pass 2 can expand %~dp0 against the right base.
+    // A path value may itself use %~dp0, which there refers to the shim's own directory.
     std::wstring targetDir {curDir};
     for (const auto& rawLine : decoded)
     {
@@ -751,7 +757,6 @@ enum class LineKind
         NormalizeArgsInPlace(pathVal, curDir);
         std::wstring expanded = ExpandAndUnquote(pathVal);
         targetDir = ResolveAgainstBase(expanded, curDir);
-        break;
     }
 
     ShimInfo info;
@@ -765,12 +770,9 @@ enum class LineKind
 
         if (IEquals(name, c_pathPrefix))
         {
-            if (!info.path)
-            {
-                std::wstring pathVal(value);
-                NormalizeArgsInPlace(pathVal, curDir);
-                info.path = ExpandAndUnquote(pathVal);
-            }
+            std::wstring pathVal(value);
+            NormalizeArgsInPlace(pathVal, curDir);
+            info.path = ExpandAndUnquote(pathVal);
         }
         else if (IEquals(name, c_argsPrefix))
         {
@@ -803,6 +805,21 @@ enum class LineKind
         }
         else
         {
+            std::wstring_view forceName = name;
+            StripPrefixIgnoreCase(forceName, L"env!:"sv);
+            if (forceName.size() != name.size())
+            {
+                if (forceName.empty())
+                {
+                    WriteErrorW(L"Shim: empty variable name after 'env!:' in shim file\n");
+                    continue;
+                }
+
+                std::wstring envVal(value);
+                NormalizeArgsInPlace(envVal, targetDir);
+                info.env.push_back({std::wstring(forceName), ExpandAndUnquote(envVal), false});
+                continue;
+            }
 
             std::wstring_view envName = name;
             StripPrefixIgnoreCase(envName, c_envPrefix);
@@ -814,7 +831,7 @@ enum class LineKind
 
             std::wstring envVal(value);
             NormalizeArgsInPlace(envVal, targetDir);
-            info.envVars.emplace_back(std::wstring(envName), ExpandAndUnquote(envVal));
+            info.env.push_back({std::wstring(envName), ExpandAndUnquote(envVal), true});
         }
     }
 
@@ -883,8 +900,7 @@ enum class LineKind
         return result;
 
     // Child inherits the updated environment block, hence before CreateProcessW.
-    for (const auto& [name, value] : info.envVars)
-    {
+    auto setEnv = [](const std::wstring& name, const std::wstring& value) {
         if (!SetEnvironmentVariableW(name.c_str(), value.c_str())) [[unlikely]]
         {
             std::wstring msg = L"Shim: Could not set environment variable '";
@@ -893,6 +909,17 @@ enum class LineKind
             WriteErrorW(msg.c_str());
             WriteErrorSys(GetLastError());
         }
+    };
+
+    for (const auto& env : info.env)
+    {
+        if (env.isDefault)
+        {
+            wchar_t existing;
+            if (GetEnvironmentVariableW(env.name.c_str(), &existing, 1) != 0)
+                continue;
+        }
+        setEnv(env.name, env.value);
     }
 
     const auto& path = *info.path;

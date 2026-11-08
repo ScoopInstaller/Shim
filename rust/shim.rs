@@ -24,7 +24,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
 };
 use windows_sys::Win32::System::Environment::{
-    ExpandEnvironmentStringsW, GetCommandLineW, SetEnvironmentVariableW,
+    ExpandEnvironmentStringsW, GetCommandLineW, GetEnvironmentVariableW, SetEnvironmentVariableW,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
 const SHIM_VERSION: &str = env!("SHIM_VERSION");
 const SHIM_IMPL: &str = "rust";
-const SHIM_FEATURES: &str = "cwd env expand dp0 elevate";
+const SHIM_FEATURES: &str = "cwd env env-force expand dp0 elevate";
 
 const ERROR_ELEVATION_REQUIRED: u32 = 740;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -71,7 +71,7 @@ struct ShimInfo {
     path: Option<String>,
     args: Vec<OsString>,
     cwd: Option<String>,
-    env_vars: Vec<(String, String)>,
+    env: Vec<(String, String, bool)>,
     elevate: bool,
 }
 
@@ -692,8 +692,8 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
     }
 
     // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
-    // path to absolute so pass 2 can expand %~dp0 against the right base. A path
-    // value may itself use %~dp0, which there refers to the shim's own directory.
+    // the last path to absolute so pass 2 can expand %~dp0 against the right base.
+    // A path value may itself use %~dp0, which there refers to the shim's own directory.
     let mut target_dir = cur_dir.to_string();
     for line in &all_lines {
         let Ok(Some((key, value))) = parse_shim_line(line) else {
@@ -706,7 +706,6 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
         normalize_args_str(&mut path_val, cur_dir);
         let expanded = expand_and_strip_quotes(&path_val);
         target_dir = resolve_against_base(&expanded, cur_dir);
-        break;
     }
 
     for line in &all_lines {
@@ -715,11 +714,9 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
         };
 
         if key.eq_ignore_ascii_case("path") {
-            if info.path.is_none() {
-                let mut path_val = value.to_string();
-                normalize_args_str(&mut path_val, cur_dir);
-                info.path = Some(expand_and_strip_quotes(&path_val));
-            }
+            let mut path_val = value.to_string();
+            normalize_args_str(&mut path_val, cur_dir);
+            info.path = Some(expand_and_strip_quotes(&path_val));
         } else if key.eq_ignore_ascii_case("args") {
             let mut args_str = value.to_string();
             normalize_args_str(&mut args_str, &target_dir);
@@ -733,6 +730,27 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
         } else if key.eq_ignore_ascii_case("elevate") || key.eq_ignore_ascii_case("runas") {
             info.elevate = parse_bool(value);
         } else {
+            const ENV_FORCE_PREFIX: &str = "env!:";
+            let force_name = key
+                .get(..ENV_FORCE_PREFIX.len())
+                .filter(|head| head.eq_ignore_ascii_case(ENV_FORCE_PREFIX))
+                .and_then(|_| key.get(ENV_FORCE_PREFIX.len()..));
+            if let Some(name) = force_name {
+                if name.is_empty() {
+                    unsafe {
+                        write_error_wide(&to_wide(
+                            "Shim: empty variable name after 'env!:' in shim file\n",
+                        ))
+                    };
+                    continue;
+                }
+                let mut env_val = value.to_string();
+                normalize_args_str(&mut env_val, &target_dir);
+                info.env
+                    .push((name.to_string(), expand_and_strip_quotes(&env_val), false));
+                continue;
+            }
+
             const ENV_PREFIX: &str = "env:";
             let name = key
                 .get(..ENV_PREFIX.len())
@@ -749,8 +767,8 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
             }
             let mut env_val = value.to_string();
             normalize_args_str(&mut env_val, &target_dir);
-            info.env_vars
-                .push((name.to_string(), expand_and_strip_quotes(&env_val)));
+            info.env
+                .push((name.to_string(), expand_and_strip_quotes(&env_val), true));
         }
     }
 
@@ -840,6 +858,18 @@ unsafe fn launch_elevated(
     (proc_handle, NULL_HANDLE)
 }
 
+unsafe fn set_env(key: &str, value: &str) {
+    let key_w = to_wide_null(key);
+    let value_w = to_wide_null(value);
+    if SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) == 0 {
+        let err = GetLastError();
+        write_error_wide(&to_wide("Shim: Could not set environment variable '"));
+        write_error_wide(&to_wide(key));
+        write_error_wide(&to_wide("'"));
+        write_error_sys(err);
+    }
+}
+
 fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     let path = match &info.path {
         Some(p) => p,
@@ -847,19 +877,15 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     };
 
     // Child inherits the updated environment block, hence before CreateProcessW.
-    for (key, value) in &info.env_vars {
-        let key_w = to_wide_null(key);
-        let value_w = to_wide_null(value);
-        let ok = unsafe { SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) };
-        if ok == 0 {
-            let err = unsafe { GetLastError() };
-            unsafe {
-                write_error_wide(&to_wide("Shim: Could not set environment variable '"));
-                write_error_wide(&to_wide(key));
-                write_error_wide(&to_wide("'"));
-                write_error_sys(err);
+    for (key, value, is_default) in &info.env {
+        if *is_default {
+            let key_w = to_wide_null(key);
+            let mut existing = [0u16; 1];
+            if unsafe { GetEnvironmentVariableW(key_w.as_ptr(), existing.as_mut_ptr(), 1) } != 0 {
+                continue;
             }
         }
+        unsafe { set_env(key, value) };
     }
 
     // Keep the command line in UTF-16 end to end: quote_arg already preserves

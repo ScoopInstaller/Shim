@@ -50,7 +50,7 @@ const ERROR_PATH_NOT_FOUND = 3;
 
 const shim_version = std.mem.trim(u8, @embedFile("version"), " \t\r\n");
 const shim_impl = "zig";
-const shim_features = "cwd env expand dp0 elevate";
+const shim_features = "cwd env env-force expand dp0 elevate";
 
 const FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100;
 const FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;
@@ -69,6 +69,7 @@ const CTRL_SHUTDOWN_EVENT = 6;
 const w = std.unicode.utf8ToUtf16LeStringLiteral;
 
 const env_prefix = w("env:");
+const env_force_prefix = w("env!:");
 
 extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) ?HANDLE;
 extern "kernel32" fn WriteFile(
@@ -126,6 +127,7 @@ extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv
 extern "kernel32" fn ExitProcess(exitCode: u32) callconv(.winapi) void;
 extern "shell32" fn ShellExecuteExW(lpExecInfo: *SHELLEXECUTEINFOW) callconv(.winapi) BOOL;
 extern "kernel32" fn SetEnvironmentVariableW(lpName: [*:0]const WCHAR, lpValue: ?[*:0]const WCHAR) callconv(.winapi) BOOL;
+extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const WCHAR, lpBuffer: ?[*]WCHAR, nSize: DWORD) callconv(.winapi) DWORD;
 extern "shell32" fn CommandLineToArgvW(lpCmdLine: [*:0]const WCHAR, pNumArgs: *i32) callconv(.winapi) ?[*]const [*:0]const WCHAR;
 extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn FormatMessageW(
@@ -579,7 +581,7 @@ const ShimInfo = struct {
     args: std.ArrayListUnmanaged([]const WCHAR) = .empty,
     cwd: ?[:0]WCHAR = null,
     elevate: bool = false,
-    env_vars: std.ArrayListUnmanaged(struct { name: []WCHAR, value: [:0]WCHAR }) = .empty,
+    env: std.ArrayListUnmanaged(struct { name: []WCHAR, value: [:0]WCHAR, is_default: bool }) = .empty,
     allocator: std.mem.Allocator = undefined,
 
     fn init(allocator: std.mem.Allocator) ShimInfo {
@@ -859,7 +861,7 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         }
     }
 
-    // %~dp0 in other fields means the *target* exe directory; resolve the first
+    // %~dp0 in other fields means the *target* exe directory; resolve the last
     // `path` to absolute first so later fields expand against the right base.
     var targetDir: []const WCHAR = cur_dir;
     for (lines.items) |l| {
@@ -867,7 +869,6 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         const ex = try expandPlaceholder(allocator, l.value, cur_dir);
         const ex2 = try expandEnvVarsAndUnquote(allocator, ex);
         targetDir = try resolveAgainstBase(allocator, ex2, cur_dir);
-        break;
     }
 
     for (lines.items) |l| {
@@ -875,10 +876,8 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         const value = l.value;
 
         if (eqlIgnoreCase(name, w("path"))) {
-            if (info.path == null) {
-                const ex2 = try expandPlaceholder(allocator, value, cur_dir);
-                info.path = try expandEnvVarsAndUnquote(allocator, ex2);
-            }
+            const ex2 = try expandPlaceholder(allocator, value, cur_dir);
+            info.path = try expandEnvVarsAndUnquote(allocator, ex2);
         } else if (eqlIgnoreCase(name, w("args"))) {
             const expanded = try expandPlaceholder(allocator, value, targetDir);
             if (expanded.len > 0) {
@@ -900,13 +899,24 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
         {
             info.elevate = parseBool(value);
         } else {
+            const force_name = stripPrefixIgnoreCase(name, env_force_prefix);
+            if (force_name.len != name.len) {
+                if (force_name.len == 0) {
+                    writeError("Shim: empty variable name after 'env!:' in shim file\n");
+                    continue;
+                }
+                const expanded = try expandPlaceholder(allocator, value, targetDir);
+                try info.env.append(allocator, .{ .name = try allocator.dupe(WCHAR, force_name), .value = try expandEnvVarsAndUnquote(allocator, expanded), .is_default = false });
+                continue;
+            }
+
             const env_name = stripPrefixIgnoreCase(name, env_prefix);
             if (env_name.len == 0) {
                 writeError("Shim: empty variable name after 'env:' in shim file\n");
                 continue;
             }
             const expanded = try expandPlaceholder(allocator, value, targetDir);
-            try info.env_vars.append(allocator, .{ .name = try allocator.dupe(WCHAR, env_name), .value = try expandEnvVarsAndUnquote(allocator, expanded) });
+            try info.env.append(allocator, .{ .name = try allocator.dupe(WCHAR, env_name), .value = try expandEnvVarsAndUnquote(allocator, expanded), .is_default = true });
         }
     }
 
@@ -979,6 +989,15 @@ fn launchElevated(
     return sei.hProcess;
 }
 
+fn setEnvValue(name_z: [:0]const WCHAR, name: []const WCHAR, value: [:0]const WCHAR) void {
+    if (!SetEnvironmentVariableW(name_z.ptr, value.ptr).toBool()) {
+        writeError("Shim: Could not set environment variable '");
+        writeErrorUtf8(name);
+        writeError("'");
+        writeErrorSys(GetLastError());
+    }
+}
+
 fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: ?HANDLE) !ProcessResult {
     var result = ProcessResult{};
 
@@ -987,17 +1006,16 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     const cwd = if (info.cwd) |c| c else null;
 
     // Child inherits the updated environment block, hence before CreateProcessW.
-    for (info.env_vars.items) |ev| {
+    for (info.env.items) |ev| {
         const name_z = try allocator.alloc(WCHAR, ev.name.len + 1);
         @memcpy(name_z[0..ev.name.len], ev.name);
         name_z[ev.name.len] = 0;
 
-        if (!SetEnvironmentVariableW(name_z[0..ev.name.len :0].ptr, ev.value.ptr).toBool()) {
-            writeError("Shim: Could not set environment variable '");
-            writeErrorUtf8(ev.name);
-            writeError("'");
-            writeErrorSys(GetLastError());
+        if (ev.is_default) {
+            var existing: [1]WCHAR = undefined;
+            if (GetEnvironmentVariableW(name_z[0..ev.name.len :0].ptr, existing[0..].ptr, 1) != 0) continue;
         }
+        setEnvValue(name_z[0..ev.name.len :0], ev.name, ev.value);
     }
 
     var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
