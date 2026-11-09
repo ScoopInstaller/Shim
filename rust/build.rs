@@ -6,12 +6,24 @@ fn main() {
 
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let ver_path = dir.join("version");
-    let ver = std::fs::read_to_string(&ver_path)
-        .unwrap_or_else(|e| panic!("failed to read version file {}: {e}", ver_path.display()))
-        .trim()
-        .to_string();
+    let lane = std::fs::read_to_string(&ver_path)
+        .unwrap_or_else(|e| panic!("failed to read version file {}: {e}", ver_path.display()));
+    let mut lines = lane.lines().map(str::trim).filter(|line| !line.is_empty());
+    let ver = lines
+        .next()
+        .unwrap_or_else(|| panic!("version file {} has no version line", ver_path.display()));
+    let features = lines
+        .next()
+        .unwrap_or_else(|| panic!("version file {} has no feature line", ver_path.display()));
+    if lines.next().is_some() {
+        panic!(
+            "version file {} has more than two lines",
+            ver_path.display()
+        );
+    }
 
     println!("cargo:rustc-env=SHIM_VERSION={ver}");
+    println!("cargo:rustc-env=SHIM_FEATURES={features}");
 
     if std::env::var_os("CARGO_CFG_TARGET_OS").as_deref() == Some(std::ffi::OsStr::new("windows")) {
         let mut res = winres::WindowsResource::new();
@@ -34,6 +46,7 @@ fn main() {
             "LegalCopyright",
             "Copyright (c) 2013-present Scoop contributors",
         );
+        res.set("Comments", &format!("Features: {features}"));
         res.set("OriginalFilename", "shim.exe");
         res.set_manifest_file("../shim.manifest");
         res.compile().expect("failed to compile Windows resource");

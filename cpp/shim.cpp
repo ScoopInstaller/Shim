@@ -47,7 +47,7 @@ constexpr std::wstring_view c_runasPrefix = L"runas"sv;
 constexpr std::wstring_view c_envPrefix = L"env:"sv;
 constexpr wchar_t c_keyValueSeparator = L'=';
 constexpr const wchar_t* c_shimImpl = L"cpp";
-constexpr const wchar_t* c_shimFeatures = L"cwd env env-force expand dp0 elevate";
+constexpr const wchar_t* c_shimFeatures = SHIM_FEATURES;
 
 // iswspace() drags in the UCRT wide-ctype table (large under static CRT).
 

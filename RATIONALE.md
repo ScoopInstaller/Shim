@@ -138,4 +138,6 @@ A single line would parse too, but the separate `Features:` line is easier to re
 
 **The list is static and build-time.** Runtime probing would add code and could lie under a different environment. A shim advertises what it was built to implement.
 
+**The same facts travel in the version resource.** An installed shim is named after its target, so `--version` belongs to the target there; its PE metadata is the only way to ask a deployed copy what it is without running it. `Comments` carries the `Features:` line because `FileVersionInfo` reads it with no P/Invoke. The requirement is SHOULD: the resource is a binary-layout detail, and a conforming shim need not be a PE. The compiler and the resource generator read the same `version` file -- version on line 1, feature list on line 2 -- and the suite compares the resource against `--version`.
+
 **No `--help` and no JSON.** Self-description is the one command Scoop needs. Adding more surface now would create compatibility obligations before the contract is settled.

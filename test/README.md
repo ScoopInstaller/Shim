@@ -18,6 +18,7 @@ The suite is the executable check of [SPEC.md](../SPEC.md). Its current coverage
 
 - Part 1: pairing, missing and malformed `.shim`, encoding, line syntax, required fields, launch, argument quoting, exit-code forwarding, and self-description through `--version`, `-v`, or no args (SPEC §2.6).
 - Part 2: the optional features `cwd`, `env`, `env-force`, `expand`, `dp0`, and `elevate`, and their advertisement through `Features:` (SPEC §4).
+- Diagnostic metadata: `ProductVersion` and the `Comments` feature line in the version resource (SPEC §6).
 
 When a required behavior is not testable, it must be listed below as a blind spot. A behavior that is neither tested nor listed is a gap, not a pass.
 

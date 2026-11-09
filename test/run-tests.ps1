@@ -209,7 +209,7 @@ function Get-ShimVersion {
     if ($ExpectedVersion) { return $ExpectedVersion }
     $dir = Get-ShimLaneDir
     if (-not $dir) { return $null }
-    return (Get-Content (Join-Path $dir 'version') -Raw).Trim()
+    return (Get-Content (Join-Path $dir 'version') -TotalCount 1).Trim()
 }
 
 function Get-ShimImpl {
@@ -1017,6 +1017,22 @@ function Invoke-SelfDescTest {
 }
 
 Invoke-SelfDescTest
+
+function Invoke-MetadataTest {
+    $script:TestNumber++
+    $num = $script:TestNumber
+    try {
+        $vi = (Get-Item $ShimExe).VersionInfo
+        $failures = @()
+        if ($vi.ProductVersion -cne $expectedVersion) { $failures += "ProductVersion=[$($vi.ProductVersion)] expected [$expectedVersion]" }
+        if ($vi.Comments -cne "Features: $expectedFeatures") { $failures += "Comments=[$($vi.Comments)] expected [Features: $expectedFeatures]" }
+        Write-TestResult "#$num Version resource carries the version and the feature set" ($failures.Count -eq 0) ($failures -join ' ; ')
+    } catch {
+        Write-TestResult "#$num Version resource carries the version and the feature set" $false $_.Exception.Message
+    }
+}
+
+Invoke-MetadataTest
 
 Invoke-ShimTest "shim.shim wins over no-arg self-description" -ExeName "shim" -Setup {
     param($d)

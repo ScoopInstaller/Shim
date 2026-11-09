@@ -23,9 +23,17 @@ $zigArchMap = @{ 'x86' = 'x86-windows-msvc'; 'x64' = 'x86_64-windows-msvc'; 'arm
 function New-ShimResourceFile {
   $verFile = Join-Path $PSScriptRoot 'version'
   $rcFile  = Join-Path $PSScriptRoot 'shim.rc'
-  $ver     = (Get-Content $verFile -Raw).Trim()
+  $lines = @((Get-Content $verFile -Raw) -split "`r?`n" | Where-Object { $_.Trim() })
+  if ($lines.Count -ne 2) {
+    throw "Invalid '$verFile' (expected a version line and a feature line)"
+  }
+  $ver      = $lines[0].Trim()
+  $features = $lines[1].Trim()
   if ($ver -notmatch '^\d+(\.\d+){0,3}$') {
     throw "Invalid version '$ver' in $verFile (expected N[.N[.N[.N]]])"
+  }
+  if ($features -notmatch '^[a-z][a-z0-9-]*( [a-z][a-z0-9-]*)*$') {
+    throw "Invalid feature list '$features' in $verFile (expected space-separated tokens)"
   }
   $parts = @($ver.Split('.'))
   while ($parts.Count -lt 4) { $parts += '0' }
@@ -56,6 +64,7 @@ BEGIN
       VALUE "ProductName",      "Scoop Shim Ex"
       VALUE "CompanyName",      "Scoop contributors"
       VALUE "LegalCopyright",   "Copyright (c) 2013-present Scoop contributors"
+      VALUE "Comments",         "Features: $features"
       VALUE "OriginalFilename", "shim.exe"
     END
   END

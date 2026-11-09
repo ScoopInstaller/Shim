@@ -47,11 +47,17 @@ Features: cwd env env-force expand dp0 elevate
 
 Only the canonical, unpaired `shim.exe` answers. A shim with a `.shim` file passes its arguments to the target.
 
+An installed copy carries the same facts in its version resource, so it can be read without running the target:
+
+```pwsh
+(Get-Item .\foo.exe).VersionInfo | Select-Object ProductVersion, Comments
+```
+
 ## Implementations
 
 | Implementation | `impl` | Build Tool |      x86 |      x64 |    arm64 |
 | -------------- | ------ | ---------- | -------: | -------: | -------: |
-| C#             | `cs`   | dotnet     |  22.5 KB |  22.0 KB |  22.0 KB |
+| C#             | `cs`   | dotnet     |  23.0 KB |  22.5 KB |  22.5 KB |
 | C++            | `cpp`  | Zig        | 121.0 KB | 145.5 KB | 137.0 KB |
 | C++            | `cpp`  | MSBuild    | 125.5 KB | 147.0 KB | 129.0 KB |
 | Rust           | `rust` | Cargo      | 115.5 KB | 133.0 KB | 128.5 KB |

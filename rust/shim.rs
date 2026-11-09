@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
 const SHIM_VERSION: &str = env!("SHIM_VERSION");
 const SHIM_IMPL: &str = "rust";
-const SHIM_FEATURES: &str = "cwd env env-force expand dp0 elevate";
+const SHIM_FEATURES: &str = env!("SHIM_FEATURES");
 
 const ERROR_ELEVATION_REQUIRED: u32 = 740;
 const ERROR_FILE_NOT_FOUND: u32 = 2;

@@ -34,7 +34,9 @@ pub fn build(b: *std.Build) void {
     } });
     const strip = b.option(bool, "strip", "Strip debug symbols from the executable") orelse false;
     const version = b.option([]const u8, "version", "Shim version") orelse @panic("pass -Dversion=<version>; run build.ps1");
+    const features = b.option([]const u8, "features", "Shim feature list") orelse @panic("pass -Dfeatures=<list>; run build.ps1");
     const version_flag = b.fmt("-DSHIM_VERSION=L\"{s}\"", .{version});
+    const features_flag = b.fmt("-DSHIM_FEATURES=L\"{s}\"", .{features});
 
     if (target.result.os.tag != .windows) {
         std.log.err("Non-Windows target is not supported", .{});
@@ -53,7 +55,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addCSourceFiles(.{
         .root = b.path("."),
         .files = &.{"shim.cpp"},
-        .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-flto", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", version_flag },
+        .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-flto", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", version_flag, features_flag },
     });
     exe.root_module.addCSourceFiles(.{
         .root = b.path("."),

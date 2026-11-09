@@ -26,14 +26,23 @@ $ErrorActionPreference = 'Stop'
 function New-ShimResourceFile {
   $verFile = Join-Path $PSScriptRoot 'version'
   $rcFile  = Join-Path $PSScriptRoot 'shim.rc'
-  $ver     = (Get-Content $verFile -Raw).Trim()
+  $lines = @((Get-Content $verFile -Raw) -split "`r?`n" | Where-Object { $_.Trim() })
+  if ($lines.Count -ne 2) {
+    throw "Invalid '$verFile' (expected a version line and a feature line)"
+  }
+  $ver      = $lines[0].Trim()
+  $features = $lines[1].Trim()
   if ($ver -notmatch '^\d+(\.\d+){0,3}$') {
     throw "Invalid version '$ver' in $verFile (expected N[.N[.N[.N]]])"
+  }
+  if ($features -notmatch '^[a-z][a-z0-9-]*( [a-z][a-z0-9-]*)*$') {
+    throw "Invalid feature list '$features' in $verFile (expected space-separated tokens)"
   }
   $parts = @($ver.Split('.'))
   while ($parts.Count -lt 4) { $parts += '0' }
   $v1 = $parts[0]; $v2 = $parts[1]; $v3 = $parts[2]; $v4 = $parts[3]
   $script:ShimVersion = $ver
+  $script:ShimFeatures = $features
 
   $rc = @"
 #define VS_VERSION_INFO     1
@@ -60,6 +69,7 @@ BEGIN
       VALUE "ProductName",      "Scoop Shim Ex"
       VALUE "CompanyName",      "Scoop contributors"
       VALUE "LegalCopyright",   "Copyright (c) 2013-present Scoop contributors"
+      VALUE "Comments",         "Features: $features"
       VALUE "OriginalFilename", "shim.exe"
     END
   END
@@ -91,7 +101,7 @@ function Invoke-ZigBuild {
   Write-Host "Zig: $zigTarget ($opt)" -ForegroundColor Cyan
   Push-Location $PSScriptRoot
   try {
-    $a = @('build', "-Dtarget=$zigTarget", "-Doptimize=$opt", "-Dversion=$script:ShimVersion", '--prefix', "bin/$Target")
+    $a = @('build', "-Dtarget=$zigTarget", "-Doptimize=$opt", "-Dversion=$script:ShimVersion", "-Dfeatures=$script:ShimFeatures", '--prefix', "bin/$Target")
     if ($Configuration -eq 'Release') { $a += '-Dstrip=true' }
     # Native stderr on the zig call terminates under EAP=Stop before the exit-code check.
     $ErrorActionPreference = 'Continue'
@@ -115,7 +125,7 @@ function Invoke-MSBuild {
     $ErrorActionPreference = 'Continue'
     # OutDir quoted for cmd.exe (spaces/metacharacters); trailing \\ is the value's own escaping.
     $outDir = "$PSScriptRoot\bin\$Target\\"
-    $r = cmd.exe /c "`"$devCmd`" -arch=$msHostArch -host_arch=amd64 -no_logo > nul 2>&1 && msbuild shim.vcxproj /p:Configuration=$Configuration /p:Platform=$msPlatform /p:OutDir=`"$outDir`" /p:ShimVersion=$script:ShimVersion /t:Build /v:q /nologo" 2>&1
+    $r = cmd.exe /c "`"$devCmd`" -arch=$msHostArch -host_arch=amd64 -no_logo > nul 2>&1 && msbuild shim.vcxproj /p:Configuration=$Configuration /p:Platform=$msPlatform /p:OutDir=`"$outDir`" /p:ShimVersion=$script:ShimVersion /p:ShimFeatures=`"$script:ShimFeatures`" /t:Build /v:q /nologo" 2>&1
     if ($LASTEXITCODE -ne 0) { $r | ForEach-Object { Write-Host $_ -ForegroundColor Red }; throw "MSBuild failed" }
     # /v:q leaves the success path otherwise silent, so anything captured here is a warning.
     $r | Where-Object { $_ } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }

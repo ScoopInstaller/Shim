@@ -1,7 +1,7 @@
 # Scoop Shim Specification
 
 **Status:** Normative.
-**Spec-Version:** 1.0
+**Spec-Version:** 1.1
 **Normative language:** The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be interpreted as described in RFC 2119.
 
 ## 1. Scope
@@ -220,3 +220,14 @@ Features: <feature> [<feature> ...]
 A shim conforms when it satisfies Part 1 and its `Features:` line accurately reflects Part 2.
 
 The repository test suite is one executable check of this specification. See [test/README.md](test/README.md) for how to run it and for the behaviors it cannot reach. A shim may conform without using this suite if it satisfies the normative requirements.
+
+## 6. Diagnostic metadata
+
+A shim SHOULD carry a Windows `VERSIONINFO` resource, so a copy already installed under a name other than `shim` can be inspected without executing it.
+
+When the resource is present:
+
+- `ProductVersion` MUST equal the `<version>` of §2.6. `FileVersion` MAY pad it to four numeric parts.
+- `Comments` MUST equal the §2.6 `Features:` line verbatim, including the `Features:` prefix.
+
+A consumer MAY read this metadata instead of running the shim; the §2.6 output remains authoritative. A shim that omits the resource still conforms. A shim whose resource disagrees with its self-description does not.

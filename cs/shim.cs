@@ -16,7 +16,6 @@ namespace Scoop
         const uint ERROR_FILE_NOT_FOUND = 2;
         const uint ERROR_PATH_NOT_FOUND = 3;
         const string SHIM_IMPL = "cs";
-        const string SHIM_FEATURES = "cwd env env-force expand dp0 elevate";
 
         // --- P/Invoke: Process ---
 
@@ -768,7 +767,7 @@ namespace Scoop
             uint err = (uint)Marshal.GetLastWin32Error();
             if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) return false;
 
-            WriteInfoW($"shim {ShimBuildInfo.Version} ({SHIM_IMPL})\nFeatures: {SHIM_FEATURES}\n");
+            WriteInfoW($"shim {ShimBuildInfo.Version} ({SHIM_IMPL})\nFeatures: {ShimBuildInfo.Features}\n");
             return true;
         }
 

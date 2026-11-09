@@ -48,9 +48,12 @@ const ERROR_INVALID_FUNCTION = 1;
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_PATH_NOT_FOUND = 3;
 
-const shim_version = std.mem.trim(u8, @embedFile("version"), " \t\r\n");
+const lane_info = @embedFile("version");
+const lane_nl = std.mem.indexOfScalar(u8, lane_info, '\n') orelse
+    @compileError("version file needs a version line and a feature line");
+const shim_version = std.mem.trim(u8, lane_info[0..lane_nl], " \t\r");
 const shim_impl = "zig";
-const shim_features = "cwd env env-force expand dp0 elevate";
+const shim_features = std.mem.trim(u8, lane_info[lane_nl + 1 ..], " \t\r\n");
 
 const FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100;
 const FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;

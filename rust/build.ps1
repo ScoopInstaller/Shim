@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 
 # The version file is the source of truth; Cargo.toml stores the package version separately.
 $verFile = Join-Path $PSScriptRoot 'version'
-$ver = (Get-Content $verFile -Raw).Trim()
+$ver = (Get-Content $verFile -TotalCount 1).Trim()
 if ($ver -notmatch '^\d+(\.\d+){0,3}$') {
   throw "Invalid version '$ver' in $verFile (expected N[.N[.N[.N]]])"
 }
