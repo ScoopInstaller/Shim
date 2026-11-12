@@ -822,10 +822,12 @@ enum class LineKind
             }
 
             std::wstring_view envName = name;
-            StripPrefixIgnoreCase(envName, c_envPrefix);
+            StripPrefixIgnoreCase(envName, L"env?:"sv);
+            if (envName.size() == name.size())
+                StripPrefixIgnoreCase(envName, c_envPrefix);
             if (envName.empty())
             {
-                WriteErrorW(L"Shim: empty variable name after 'env:' in shim file\n");
+                WriteErrorW(L"Shim: empty variable name after 'env:' or 'env?:' in shim file\n");
                 continue;
             }
 

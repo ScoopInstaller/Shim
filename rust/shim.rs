@@ -751,16 +751,19 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
                 continue;
             }
 
-            const ENV_PREFIX: &str = "env:";
-            let name = key
-                .get(..ENV_PREFIX.len())
-                .filter(|head| head.eq_ignore_ascii_case(ENV_PREFIX))
-                .and_then(|_| key.get(ENV_PREFIX.len()..))
+            let name = ["env?:", "env:"]
+                .iter()
+                .copied()
+                .find_map(|p| {
+                    key.get(..p.len())
+                        .filter(|h| h.eq_ignore_ascii_case(p))
+                        .map(|_| &key[p.len()..])
+                })
                 .unwrap_or(key);
             if name.is_empty() {
                 unsafe {
                     write_error_wide(&to_wide(
-                        "Shim: empty variable name after 'env:' in shim file\n",
+                        "Shim: empty variable name after 'env:' or 'env?:' in shim file\n",
                     ))
                 };
                 continue;

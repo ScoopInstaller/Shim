@@ -913,9 +913,10 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
                 continue;
             }
 
-            const env_name = stripPrefixIgnoreCase(name, env_prefix);
+            var env_name = stripPrefixIgnoreCase(name, w("env?:"));
+            if (env_name.len == name.len) env_name = stripPrefixIgnoreCase(name, env_prefix);
             if (env_name.len == 0) {
-                writeError("Shim: empty variable name after 'env:' in shim file\n");
+                writeError("Shim: empty variable name after 'env:' or 'env?:' in shim file\n");
                 continue;
             }
             const expanded = try expandPlaceholder(allocator, value, targetDir);

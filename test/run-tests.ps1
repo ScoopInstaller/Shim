@@ -364,7 +364,7 @@ Invoke-ShimTest "env: prefix does not hijack the shim path" -Setup {
     # env:path comes first on purpose: a strip done inside the line parser would
     # make it the target path and the shim would fail to launch. A bare "env:" has
     # no name, so it is reported and skipped rather than defining a junk variable.
-    Write-Shim $d "test" "env:path = C:\nonexistent\fake.exe`nenv: = noname`npath = $probeExe`nargs = echo TARGET_OK"
+    Write-Shim $d "test" "env:path = C:\nonexistent\fake.exe`nenv: = noname`nenv?: = noname`npath = $probeExe`nargs = echo TARGET_OK"
 } -Assert {
     param($r)
     $pass = ($r.Output -match "TARGET_OK") -and ($r.Output -match "empty variable name after 'env:'")
@@ -424,6 +424,17 @@ Invoke-ShimTest "env: treats an empty external value as unset" -Setup {
 } -Assert {
     param($r)
     @{ Pass = $r.Output -match "SHIM_DEFAULT_EMPTY=shim"; Message = "Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "env?: is the same default form as env:" -Setup {
+    param($d)
+    $env:SHIM_OPT_EXTERNAL = "external"
+    Remove-Item Env:\SHIM_OPT_ABSENT -ErrorAction SilentlyContinue
+    Write-Shim $d "test" "path = $probeExe`nargs = env SHIM_OPT_EXTERNAL SHIM_OPT_ABSENT`nenv?:SHIM_OPT_EXTERNAL = shim`nenv?:SHIM_OPT_ABSENT = shim"
+} -Assert {
+    param($r)
+    $pass = ($r.Output -match "SHIM_OPT_EXTERNAL=external") -and ($r.Output -match "SHIM_OPT_ABSENT=shim")
+    @{ Pass = $pass; Message = "Output: $($r.Output)" }
 }
 
 Invoke-ShimTest "env!: force wins over env:" -Setup {

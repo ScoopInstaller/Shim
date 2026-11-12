@@ -52,7 +52,7 @@ The line is right-trimmed before it is split, so a value cannot end in whitespac
 
 A field line with no key (`= value`) is malformed. A malformed line is fatal: the shim MUST report it, exit 1, and MUST NOT start the target.
 
-A non-fatal line error -- invalid UTF-8, a bare `env:`/`env!:` when the feature is advertised, or a platform-rejected variable -- MUST be reported and that line skipped; the rest of the file loads and the target still starts.
+A non-fatal line error -- invalid UTF-8, a bare `env:`/`env?:`/`env!:` when the feature is advertised, or a platform-rejected variable -- MUST be reported and that line skipped; the rest of the file loads and the target still starts.
 
 Field names are matched ASCII case-insensitively. `args` appends in file order; every scalar key takes its last value.
 
@@ -147,9 +147,9 @@ The value sets the target's working directory. Wrapping double quotes are stripp
 
 **Token:** `env`
 
-**Fields:** any key that is not one of `path`, `args`, `cwd`, `workdir`, `elevate`, `runas`, and is not prefixed with `env!:`. An optional `env:` prefix is matched ASCII case-insensitively and stripped; the remainder is the variable name.
+**Fields:** any key that is not one of `path`, `args`, `cwd`, `workdir`, `elevate`, `runas`, and is not prefixed with `env!:`. An optional `env:` or `env?:` prefix is matched ASCII case-insensitively and stripped; the remainder is the variable name.
 
-The key names an environment variable and the value is its default. A default is applied only when the variable has no value at the time the line is applied. An external value or an earlier assignment counts; an absent or empty value counts as unset. Wrapping double quotes are stripped. A bare `env:` names no variable: it MUST be reported and skipped.
+The key names an environment variable and the value is its default. A default is applied only when the variable has no value at the time the line is applied. An external value or an earlier assignment counts; an absent or empty value counts as unset. Wrapping double quotes are stripped. A bare `env:` or `env?:` names no variable: it MUST be reported and skipped.
 
 Environment assignments are applied in file order; a later line observes the value set by an earlier line.
 
@@ -223,11 +223,9 @@ The repository test suite is one executable check of this specification. See [te
 
 ## 6. Diagnostic metadata
 
-A shim SHOULD carry a Windows `VERSIONINFO` resource, so a copy already installed under a name other than `shim` can be inspected without executing it.
+A shim SHOULD carry a `VERSIONINFO` resource so an installed copy can be inspected without running it. When present:
 
-When the resource is present:
+- `ProductVersion` MUST equal the `<version>` of §2.6; `FileVersion` MAY pad it to four parts.
+- `Comments` MUST equal the `Features:` line of §2.6 verbatim.
 
-- `ProductVersion` MUST equal the `<version>` of §2.6. `FileVersion` MAY pad it to four numeric parts.
-- `Comments` MUST equal the §2.6 `Features:` line verbatim, including the `Features:` prefix.
-
-A consumer MAY read this metadata instead of running the shim; the §2.6 output remains authoritative. A shim that omits the resource still conforms. A shim whose resource disagrees with its self-description does not.
+A consumer MAY read the resource instead of running the shim. Omitting it still conforms; disagreeing with §2.6 does not.

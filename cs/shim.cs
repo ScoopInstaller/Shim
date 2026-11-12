@@ -903,10 +903,11 @@ namespace Scoop
                         continue;
                     }
 
-                    var name = StripKeyPrefix(key!, "env:");
+                    var name = StripKeyPrefix(key!, "env?:");
+                    if (name == key) name = StripKeyPrefix(key!, "env:");
                     if (name.Length == 0)
                     {
-                        WriteErrorW("Shim: empty variable name after 'env:' in shim file\n");
+                        WriteErrorW("Shim: empty variable name after 'env:' or 'env?:' in shim file\n");
                         continue;
                     }
                     info.Env.Add(new EnvAssignment(name, ExpandAndUnquote(NormalizeArgs(value!, targetDir)), true));

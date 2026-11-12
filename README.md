@@ -26,7 +26,7 @@ env!:PATH = %PATH%;%~dp0
 ```
 
 - `path` is required. `args`, `cwd`, and `elevate` are optional.
-- `env:NAME` sets a default; an external value wins.
+- `env:NAME` sets a default; an external value wins. `env?:NAME` is the same form.
 - `env!:NAME` forces a value. Use it for PATH changes or deliberate isolation.
 - `%~dp0` means the shim's directory in `path`, and the target's directory elsewhere.
 
@@ -58,9 +58,9 @@ An installed copy carries the same facts in its version resource, so it can be r
 | Implementation | `impl` | Build Tool |      x86 |      x64 |    arm64 |
 | -------------- | ------ | ---------- | -------: | -------: | -------: |
 | C#             | `cs`   | dotnet     |  23.0 KB |  22.5 KB |  22.5 KB |
-| C++            | `cpp`  | Zig        | 121.0 KB | 145.5 KB | 137.0 KB |
-| C++            | `cpp`  | MSBuild    | 125.5 KB | 147.0 KB | 129.0 KB |
-| Rust           | `rust` | Cargo      | 115.5 KB | 133.0 KB | 128.5 KB |
+| C++            | `cpp`  | Zig        | 121.0 KB | 145.5 KB | 137.5 KB |
+| C++            | `cpp`  | MSBuild    | 125.5 KB | 147.5 KB | 129.0 KB |
+| Rust           | `rust` | Cargo      | 115.5 KB | 133.5 KB | 129.0 KB |
 | Zig            | `zig`  | Zig        |  87.5 KB |  75.0 KB |  24.5 KB |
 
 `impl` is the token reported by self-description. Sizes are the current build output.
