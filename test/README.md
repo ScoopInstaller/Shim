@@ -16,7 +16,7 @@ From a lane directory the path is `..\test\run-tests.ps1`. CI runs the suite for
 
 The suite is the executable check of [SPEC.md](../SPEC.md). Its current coverage is:
 
-- Part 1: pairing, missing and malformed `.shim`, encoding, line syntax, required fields, launch, argument quoting, exit-code forwarding, and self-description through `--version`, `-v`, or no args (SPEC §2.6).
+- Part 1: pairing, missing and malformed `.shim`, encoding, line syntax, required fields (including bare-name resolution against the current directory and `PATH`), launch, argument quoting, exit-code forwarding, and self-description through `--version`, `-v`, or no args (SPEC §2.6).
 - Part 2: the optional features `cwd`, `env`, `env-force`, `expand`, `dp0`, and `elevate`, and their advertisement through `Features:` (SPEC §4).
 - Diagnostic metadata: `ProductVersion` and the `Comments` feature line in the version resource (SPEC §6).
 
@@ -38,6 +38,7 @@ It is x86 on purpose: it runs on x86, x64 and arm64 Windows and can create an x6
 
 The suite is the only check that the four lanes agree, so its blind spots are worth naming:
 
+- **A bare name that is only a `.bat`, `.cmd`, or another `PATHEXT` entry.** The shim searches `.com` and `.exe` only, so anything else is out of scope by design, and a test would assert behavior no lane implements. The shim's own directory being absent from the search is in the same place: Scoop puts the shims directory on `PATH`, so a test cannot tell the two apart without a layout no producer makes. The registry switch `SafeProcessSearchMode` is likewise not observable from the suite; the bare-name tests pin the shim's own order instead.
 - **A failed `ResumeThread`.** Nothing can make the shim's resume fail on demand, so a lane that discards the return value still passes everything and one that does not handle it hangs instead of exiting. The branch also terminates the child directly when `CreateJobObjectW` failed earlier, where there is no job to end. All of it is by inspection rather than by test.
 - **Every other post-spawn Win32 failure.** `CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `WaitForSingleObject` and `GetExitCodeProcess` cannot be made to fail on demand. All four lanes report the three job failures and run ungoverned, and force exit 1 on a failed wait or exit-code query -- by inspection, so a lane that skips a check reports nothing or a wrong code.
 - **Degenerate input to the Win32 readers.** A negative `argc` from `CommandLineToArgvW` (trusted for a capacity or a loop bound) and an `e_lfanew` outside the module's first page are both rejected in all four lanes, though no input can produce either. Defense in depth, verified by review.

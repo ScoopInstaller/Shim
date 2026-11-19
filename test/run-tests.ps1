@@ -197,6 +197,27 @@ if (-not (Test-Path $probeExe) -or (Get-Item $probeExe).LastWriteTimeUtc -lt (Ge
 }
 $probeExe = (Resolve-Path $probeExe).Path
 
+# Runs a shim with a chosen working directory and environment. Invoke-ShimTest
+# sets neither, and bare-name resolution depends on both.
+function Invoke-ShimInContext {
+    param(
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$WorkingDirectory,
+        [hashtable]$SetEnv = @{}
+    )
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($ExePath)
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    foreach ($key in $SetEnv.Keys) { $psi.Environment[$key] = $SetEnv[$key] }
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    return @{ Output = $stdout + $stderr; ExitCode = $proc.ExitCode }
+}
+
 function Get-ShimLaneDir {
     $dir = Split-Path $ShimExe -Parent
     while ($dir -and -not (Test-Path (Join-Path $dir 'version'))) {
@@ -848,6 +869,73 @@ Invoke-ShimTest "path longer than MAX_PATH fails cleanly" -Setup {
     param($r)
     $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "Could not create process with command '") -and ($r.Output -match "\(error \d+")
     @{ Pass = $pass; Message = "Expected exit 1 and a create-process error, Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
+# --- Bare-name resolution -----------------------------------------------------
+
+# #22: `path = where` must run the copy on PATH, not System32's. The two are told
+# apart by output: the probe prints PROBE_ARGS, System32's where prints its usage.
+Invoke-ShimTest "Bare path name resolves through PATH before the system directory" -Setup {
+    param($d)
+    New-Item -ItemType Directory -Path "$d\pathdir" -Force | Out-Null
+    Copy-Item $probeExe "$d\pathdir\where.exe"
+    Write-Shim $d "test" "path = where`nargs = args`nenv!:PATH = $d\pathdir"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match '(?m)^PROBE_ARGS\r?$')
+    @{ Pass = $pass; Message = "Expected the PATH copy, not System32's where. Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "Bare path name tries the .com extension" -Setup {
+    param($d)
+    New-Item -ItemType Directory -Path "$d\pathdir" -Force | Out-Null
+    Copy-Item $probeExe "$d\pathdir\picker.com"
+    Write-Shim $d "test" "path = picker`nargs = args`nenv!:PATH = $d\pathdir"
+} -Assert {
+    param($r)
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match '(?m)^PROBE_ARGS\r?$')
+    @{ Pass = $pass; Message = "Expected picker.com to launch. Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
+Invoke-ShimTest "Bare path name that is not found does not fall back to the system directory" -Setup {
+    param($d)
+    New-Item -ItemType Directory -Path "$d\empty" -Force | Out-Null
+    Write-Shim $d "test" "path = where`nenv!:PATH = $d\empty"
+} -Assert {
+    param($r)
+    # System32 holds where.exe: a fallback would print its usage text instead of failing.
+    $pass = ($r.ExitCode -eq 1) -and ($r.Output -match "Could not create process with command 'where'") -and
+            ($r.Output -notmatch 'WHERE \[/R')
+    @{ Pass = $pass; Message = "Expected a launch failure without System32's where.exe. Exit: $($r.ExitCode), Output: $($r.Output)" }
+}
+
+# The PATH copy is a shim that echoes a marker, so the candidates differ by output.
+$script:TestNumber++
+$num = $script:TestNumber
+$testDir = New-TestEnvironment
+try {
+    $cwdDir = Join-Path $testDir 'cwdhit'
+    $pathDir = Join-Path $testDir 'pathdir'
+    New-Item -ItemType Directory -Path $cwdDir,$pathDir -Force | Out-Null
+    Copy-Item $probeExe (Join-Path $cwdDir 'where.exe')
+    Copy-Item $ShimExe (Join-Path $pathDir 'where.exe')
+    Set-Content -Path (Join-Path $pathDir 'where.shim') -Value "path = cmd.exe`nargs = /c echo PATH_HIT"
+    Copy-Item $ShimExe "$testDir\test.exe"
+    Set-Content -Path "$testDir\test.shim" -Value "path = where`nargs = args"
+
+    $basePath = $pathDir + ';' + $env:PATH
+    $fromCwd = Invoke-ShimInContext "$testDir\test.exe" $cwdDir @{ PATH = $basePath }
+    $pass = ($fromCwd.ExitCode -eq 0) -and ($fromCwd.Output -match 'PROBE_ARGS') -and ($fromCwd.Output -notmatch 'PATH_HIT')
+    Write-TestResult "#$num Bare path name resolves from the current directory first" $pass "Exit: $($fromCwd.ExitCode), Output: $($fromCwd.Output)"
+
+    $script:TestNumber++
+    $num = $script:TestNumber
+    $skipCwd = Invoke-ShimInContext "$testDir\test.exe" $cwdDir @{ PATH = $basePath; NoDefaultCurrentDirectoryInExePath = '1' }
+    $pass = ($skipCwd.ExitCode -eq 0) -and ($skipCwd.Output -match 'PATH_HIT')
+    Write-TestResult "#$num NoDefaultCurrentDirectoryInExePath skips the current directory" $pass "Exit: $($skipCwd.ExitCode), Output: $($skipCwd.Output)"
+}
+finally {
+    Remove-TestEnvironment $testDir
 }
 
 # --- cwd configuration --------------------------------------------------------

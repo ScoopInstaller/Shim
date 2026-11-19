@@ -1,7 +1,7 @@
 # Scoop Shim Specification
 
 **Status:** Normative.
-**Spec-Version:** 1.1
+**Spec-Version:** 1.2
 **Normative language:** The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be interpreted as described in RFC 2119.
 
 ## 1. Scope
@@ -65,7 +65,13 @@ Field names are matched ASCII case-insensitively. `args` appends in file order; 
 - Wrapping double quotes are stripped after expansion.
 - A value beginning with `\` or `/` MUST be rejected.
 - A value whose first two characters are an ASCII drive letter and `:` is passed to the platform as written.
-- A relative value is passed to the platform as written; the platform's executable search order applies. The shim MUST NOT prepend its own directory. The search starts with the shim's own directory and includes the current directory; a bare name also searches `PATH`.
+- A relative value that contains a separator is resolved against the shim's current directory; that absolute path is launched.
+- A bare name -- a relative value with no separator -- is resolved by the shim, and the first match is launched:
+  1. the shim's current directory, unless `NoDefaultCurrentDirectoryInExePath` is set to a non-empty value;
+  2. each `PATH` directory, in order; empty entries are skipped and one pair of wrapping quotes is stripped.
+  Within a directory, `<name>.com` is tried before `<name>.exe`; a name whose final component contains a dot is tried as written. Only an existing file matches.
+  Both variables are read as the shim was started: `env:` overrides (§3.2) shape the target's environment, not this search.
+- The system and Windows directories, `PATHEXT`, and the shim's own directory are not searched. A bare name that is not found MUST be reported and exit 1; the shim MUST NOT fall back to a wider search.
 - An empty `path` is equivalent to a missing `path`.
 
 A `.shim` file with no `path` MUST be rejected with a diagnostic and exit 1.

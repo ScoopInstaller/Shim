@@ -12,8 +12,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_MODE, FILE_TYPE_CHAR, GetFileType, GetFullPathNameW, OPEN_EXISTING,
-    WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_MODE, FILE_TYPE_CHAR, GetFileAttributesW,
+    GetFileType, GetFullPathNameW, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
     AttachConsole, FreeConsole, GetConsoleProcessList, GetStdHandle, STD_ERROR_HANDLE,
@@ -464,7 +464,148 @@ fn resolve_failed_dir(to_resolve: &[u16], err: u32) -> String {
     dir
 }
 
-// Returns the directory portion (trailing backslash) of the absolute form of `path`.
+/// True when `wide` is null-terminated and names a file rather than a directory.
+fn is_file(wide: &[u16]) -> bool {
+    let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_DIRECTORY == 0
+}
+
+/// Value of `name` as UTF-16; None when unset or empty.
+fn env_wide(name: &str) -> Option<Vec<u16>> {
+    let name_w = to_wide_null(name);
+    unsafe {
+        let mut stack = [0u16; 512];
+        let len = GetEnvironmentVariableW(name_w.as_ptr(), stack.as_mut_ptr(), stack.len() as u32);
+        if len == 0 {
+            return None;
+        }
+        if (len as usize) < stack.len() {
+            return Some(stack[..len as usize].to_vec());
+        }
+        // Overflow: len is the required size, including the null terminator.
+        let mut buf = vec![0u16; len as usize];
+        let written = GetEnvironmentVariableW(name_w.as_ptr(), buf.as_mut_ptr(), len);
+        if written == 0 || written > len {
+            return None;
+        }
+        Some(buf[..written as usize].to_vec())
+    }
+}
+
+/// Absolute form of `wide`; a value the platform cannot resolve comes back as written.
+fn absolute(wide: &[u16]) -> Vec<u16> {
+    let mut terminated = Vec::with_capacity(wide.len() + 1);
+    terminated.extend_from_slice(wide);
+    terminated.push(0);
+    unsafe {
+        let mut stack = [0u16; 261];
+        let mut len = GetFullPathNameW(
+            terminated.as_ptr(),
+            stack.len() as u32,
+            stack.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if len == 0 {
+            return wide.to_vec();
+        }
+        if (len as usize) < stack.len() {
+            return stack[..len as usize].to_vec();
+        }
+        // Overflow: len is the required size, including the null terminator.
+        let required = len as usize + 1;
+        let mut big = vec![0u16; required];
+        len = GetFullPathNameW(
+            terminated.as_ptr(),
+            required as u32,
+            big.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if len == 0 || len as usize >= required {
+            return wide.to_vec();
+        }
+        big[..len as usize].to_vec()
+    }
+}
+
+/// One pair of wrapping double quotes stripped, as the platform does for PATH entries.
+fn unquote(wide: &[u16]) -> &[u16] {
+    let quote = b'"' as u16;
+    if wide.len() >= 2 && wide[0] == quote && wide[wide.len() - 1] == quote {
+        return &wide[1..wide.len() - 1];
+    }
+    wide
+}
+
+fn find_in_dir(dir: &[u16], name: &str, extensions: &[&str]) -> Option<String> {
+    let name_w = to_wide(name);
+    for ext in extensions {
+        let mut candidate = Vec::with_capacity(dir.len() + name_w.len() + 6);
+        candidate.extend_from_slice(dir);
+        let sep = dir
+            .last()
+            .is_some_and(|c| *c == b'\\' as u16 || *c == b'/' as u16);
+        if !dir.is_empty() && !sep {
+            candidate.push(b'\\' as u16);
+        }
+        candidate.extend_from_slice(&name_w);
+        candidate.extend_from_slice(&to_wide(ext));
+        candidate.push(0);
+        if is_file(&candidate) {
+            return Some(String::from_utf16_lossy(&absolute(
+                &candidate[..candidate.len() - 1],
+            )));
+        }
+    }
+    None
+}
+
+/// Resolve `path` the way the shell does: a bare name is searched in the current
+/// directory and then PATH. CreateProcessW's own order puts the system directories
+/// ahead of PATH, which silently changes the target the caller asked for.
+fn resolve_target(path: &str) -> Option<String> {
+    let mut chars = path.chars();
+    let _ = chars.next();
+    if chars.next() == Some(':') {
+        return Some(path.to_string());
+    }
+
+    if path.contains(['\\', '/']) {
+        return Some(String::from_utf16_lossy(&absolute(&to_wide(path))));
+    }
+
+    // A name that already carries an extension is used as written, as cmd does.
+    let extensions: &[&str] = if path.contains('.') {
+        &[""]
+    } else {
+        &[".com", ".exe"]
+    };
+
+    // The variable counts only when it has a value, as in the other lanes.
+    if env_wide("NoDefaultCurrentDirectoryInExePath").is_none() {
+        // "." absolutised is the working directory, so no second API is needed.
+        let cwd = absolute(&to_wide("."));
+        if let Some(hit) = find_in_dir(&cwd, path, extensions) {
+            return Some(hit);
+        }
+    }
+
+    if let Some(path_value) = env_wide("PATH") {
+        for entry in path_value.split(|c| *c == b';' as u16) {
+            // An empty entry would join to the bare name and match the current directory,
+            // bypassing the step above; SPEC skips it.
+            let dir = unquote(entry);
+            if dir.is_empty() {
+                continue;
+            }
+            if let Some(hit) = find_in_dir(dir, path, extensions) {
+                return Some(hit);
+            }
+        }
+    }
+
+    None
+}
+
 fn resolve_against_base(path: &str, base_dir: &str) -> String {
     let wide_path = to_wide_null(path);
     let wide_base = to_wide_null(base_dir);
@@ -879,7 +1020,7 @@ fn set_env(key: &str, value: &str) {
 }
 
 fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
-    let path = match &info.path {
+    let raw_path = match &info.path {
         Some(p) => p,
         None => return (NULL_HANDLE, NULL_HANDLE),
     };
@@ -896,6 +1037,10 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         set_env(key, value);
     }
 
+    // Resolved last: a bare name sees the PATH this process is about to hand the child.
+    let resolved = resolve_target(raw_path);
+    let path: &str = resolved.as_deref().unwrap_or(raw_path);
+
     // Keep the command line in UTF-16 end to end: quote_arg already preserves
     // unpaired surrogates, so a lossy round-trip here would destroy them.
     let mut cmd = {
@@ -908,6 +1053,15 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         c
     };
     let path_w = to_wide_null(path);
+
+    // A bare name that was not found is a launch failure, not a wider search.
+    if resolved.is_none() {
+        write_error_wide(&to_wide("Shim: Could not create process with command '"));
+        write_error_wide(&to_wide(&String::from_utf16_lossy(&cmd[..cmd.len() - 1])));
+        write_error_wide(&to_wide("'"));
+        write_error_sys(ERROR_FILE_NOT_FOUND);
+        return (NULL_HANDLE, NULL_HANDLE);
+    }
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;

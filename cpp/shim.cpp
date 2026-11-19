@@ -506,6 +506,131 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return resolvedStr.substr(0, dirLen) + L'\\';
 }
 
+constexpr DWORD c_invalidFileAttributes = 0xFFFFFFFF;
+
+/// A variable that is absent or empty yields nothing: the shim treats both as unset.
+[[nodiscard]] std::optional<std::wstring> EnvValue(const wchar_t* name)
+{
+    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0)
+        return std::nullopt;
+
+    std::wstring value(required, L'\0'); // required includes the terminating null
+    const DWORD written = GetEnvironmentVariableW(name, value.data(), required);
+    if (written == 0 || written >= required)
+        return std::nullopt;
+    value.resize(written);
+    return value;
+}
+
+[[nodiscard]] std::wstring CurrentDirectory()
+{
+    std::array<wchar_t, MAX_PATH + 2> stack {};
+    DWORD len = GetCurrentDirectoryW(static_cast<DWORD>(stack.size()), stack.data());
+    if (len == 0)
+        return L".";
+    if (len < stack.size())
+        return std::wstring(stack.data(), len);
+
+    std::wstring big(len + 1, L'\0');
+    len = GetCurrentDirectoryW(static_cast<DWORD>(big.size()), big.data());
+    if (len == 0 || len >= big.size())
+        return L".";
+    big.resize(len);
+    return big;
+}
+
+/// Absolute form of a value with its own separators; an unresolved value passes
+/// through so the launch reports the error.
+[[nodiscard]] std::wstring AbsolutePathName(const std::wstring& path)
+{
+    std::array<wchar_t, MAX_PATH + 2> stack {};
+    DWORD len = GetFullPathNameW(path.c_str(), static_cast<DWORD>(stack.size()), stack.data(), nullptr);
+    if (len == 0)
+        return path;
+    if (len < stack.size())
+        return std::wstring(stack.data(), len);
+
+    std::vector<wchar_t> big(len + 1);
+    len = GetFullPathNameW(path.c_str(), static_cast<DWORD>(big.size()), big.data(), nullptr);
+    if (len == 0 || len >= big.size())
+        return path;
+    return std::wstring(big.data(), len);
+}
+
+[[nodiscard]] bool IsExistingFile(const std::wstring& path)
+{
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != c_invalidFileAttributes && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+[[nodiscard]] std::wstring_view StripWrappingQuotes(std::wstring_view s)
+{
+    if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"')
+        return s.substr(1, s.size() - 2);
+    return s;
+}
+
+[[nodiscard]] std::optional<std::wstring> FindInDir(const std::wstring& dir, const std::wstring& name, const std::vector<std::wstring>& extensions)
+{
+    const bool hasSeparator = !dir.empty() && (dir.back() == L'\\' || dir.back() == L'/');
+    for (const auto& ext : extensions)
+    {
+        std::wstring candidate = dir;
+        if (!hasSeparator)
+            candidate.push_back(L'\\');
+        candidate += name;
+        candidate += ext;
+        if (IsExistingFile(candidate))
+            return candidate;
+    }
+    return std::nullopt;
+}
+
+/// Resolve `path` the way the shell does: a bare name is searched in the current
+/// directory and then PATH. CreateProcessW's own order puts the system directories
+/// ahead of PATH, which silently changes the target the caller asked for.
+/// Returns nullopt when a bare name is not found; the caller reports that launch failure.
+[[nodiscard]] std::optional<std::wstring> ResolveTarget(const std::wstring& path)
+{
+    if (path.size() >= 2 && path[1] == L':')
+        return path;
+
+    if (path.find_first_of(L"\\/") != std::wstring::npos)
+        return AbsolutePathName(path);
+
+    // A name that already carries an extension is used as written, as cmd does.
+    const std::vector<std::wstring> extensions =
+        path.find(L'.') != std::wstring::npos ? std::vector<std::wstring> {L""} : std::vector<std::wstring> {L".com", L".exe"};
+
+    if (!EnvValue(L"NoDefaultCurrentDirectoryInExePath").has_value())
+    {
+        if (auto hit = FindInDir(CurrentDirectory(), path, extensions))
+            return hit;
+    }
+
+    if (const auto pathValue = EnvValue(L"PATH"))
+    {
+        size_t start = 0;
+        while (true)
+        {
+            const size_t sep = pathValue->find(L';', start);
+            const size_t end = (sep == std::wstring::npos) ? pathValue->size() : sep;
+            const std::wstring_view dir = StripWrappingQuotes(std::wstring_view {*pathValue}.substr(start, end - start));
+            if (!dir.empty())
+            {
+                if (auto hit = FindInDir(std::wstring {dir}, path, extensions))
+                    return hit;
+            }
+            if (sep == std::wstring::npos)
+                break;
+            start = sep + 1;
+        }
+    }
+
+    return std::nullopt;
+}
+
 enum class LineKind
 {
     Blank,
@@ -924,9 +1049,21 @@ enum class LineKind
         setEnv(env.name, env.value);
     }
 
-    const auto& path = *info.path;
+    const std::optional<std::wstring> resolved = ResolveTarget(*info.path);
+    const std::wstring& path = resolved ? *resolved : *info.path;
     const auto* cwd = info.cwd ? info.cwd->c_str() : nullptr;
     std::wstring cmd = BuildCommandLine(path, info.args);
+
+    // A bare name that was not found is a launch failure, not a wider search.
+    if (!resolved)
+    {
+        std::wstring msg = L"Shim: Could not create process with command '";
+        msg += cmd;
+        msg += L"'";
+        WriteErrorW(msg.c_str());
+        WriteErrorSys(ERROR_FILE_NOT_FOUND);
+        return result;
+    }
 
     if (info.elevate) [[unlikely]]
         return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);

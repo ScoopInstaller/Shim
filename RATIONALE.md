@@ -25,7 +25,7 @@ That makes parity across the four the hard constraint: anything observable has t
 3. Create the child suspended, put it in a job object, resume it.
 4. Wait for it and exit with its code.
 
-Step 2 happens before step 3 for two reasons: `CreateProcessW` with a null environment inherits the shim's, so the overrides have to be in place first; and a `path` given as a bare name is then resolved against the overridden `PATH` rather than the inherited one.
+Step 2 happens before step 3 for two reasons: `CreateProcessW` with a null environment inherits the shim's, so the overrides have to be in place first; and the target is resolved while the file is parsed, because `%~dp0` in the other fields is its directory.
 
 Arguments come from two places -- the `args` field and the shim's own command line -- so the command line has to be rebuilt rather than appended to, and the user's arguments re-quoted on the way. `QuoteArg` implements the `CreateProcessW` rules for exactly that reason: the child must see the arguments the user typed, not a re-parse of them.
 
@@ -91,7 +91,11 @@ The line is right-trimmed before it is split, so trailing spaces in a value are 
 
 `%~dp0` means the **shim's own directory** inside `path`, and the **target's directory** everywhere else. The target's directory is not known until `path` has been resolved, so the first pass finds and absolutises `path` and the second expands every other field against it -- the only reason the parser needs two passes, and the reason `%~dp0` means two different things in the same file. The target's directory is what `GetFullPathNameW` answers for the resolved `path`; when that call fails, the shim reports it and falls back to the input with its last component dropped, because expanding `%~dp0` into a value that still ends in the target's file name puts a path where a directory belongs.
 
-A `path` value is either drive-qualified (an ASCII drive letter and `:`) or relative; a leading separator is rejected. A leading separator anchors the target to the current drive, so the same shim would find a different target depending on where it was run from; rejecting it keeps the target a function of the shim's own location alone. After expansion and unquoting, the value is passed to the platform as written, so a relative path follows the platform's executable search order; the shim does not prepend its own directory. A bare name can therefore use `PATH`, and environment overrides are applied first so it sees the overridden `PATH`.
+A `path` value is either drive-qualified (an ASCII drive letter and `:`) or relative; a leading separator is rejected. A leading separator anchors the target to the current drive, so the same shim would find a different target depending on where it was run from; rejecting it keeps the target a function of the shim's own location alone.
+
+A relative value is resolved by the shim, not by `CreateProcessW`: that order is the directory the image loaded from, the current directory, the system directories, the Windows directory, and only then `PATH`, so `path = curl.exe` launches `System32\curl.exe` even when an earlier `PATH` entry holds the one the caller meant. It is the order for loading an image, not for resolving a command a person typed, and it depends on the machine's `SafeProcessSearchMode` and on the process being 32-bit (the system directory is then `SysWOW64`). `PATHEXT` is not consulted either: most of its entries are scripts or association targets `CreateProcessW` rejects, and honouring them would mean `ShellExecute` and yet another order. A name that is not found is a launch failure rather than a fallback, because a fallback would silently launch the system copy this rule exists to reject. The shim's own directory is not special: Scoop puts it on `PATH`, and a shim beside its target names it explicitly.
+
+A value that carries its own separators is resolved against the shim's current directory, so it does not shift with the platform's order either. Resolving once, while the file is parsed, is what lets `%~dp0` and the launch share an answer: the search reads the started-in `PATH`, so an override cannot move the target away from the directory the other fields were expanded against.
 
 ### The `env:` and `env!:` prefixes
 

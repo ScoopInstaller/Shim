@@ -482,6 +482,80 @@ namespace Scoop
             }
         }
 
+        // A variable that is absent or empty yields null: the shim treats both as unset.
+        static string? EnvValue(string name)
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            return string.IsNullOrEmpty(value) ? null : value;
+        }
+
+        static string AbsolutePathName(string path)
+        {
+            int cap = 260;
+            for (; ; )
+            {
+                var sb = new StringBuilder(cap);
+                uint len = GetFullPathNameW(path, (uint)sb.Capacity, sb, IntPtr.Zero);
+                if (len == 0) return path; // as written, so the launch reports the error
+                if (len >= sb.Capacity)
+                {
+                    cap = (int)len + 1; // required size returned on overflow
+                    continue;
+                }
+                return sb.ToString(0, (int)len);
+            }
+        }
+
+        static string? FindInDir(string dir, string name, string[] extensions)
+        {
+            bool hasSeparator = dir.EndsWith("\\") || dir.EndsWith("/");
+            foreach (var ext in extensions)
+            {
+                string candidate = hasSeparator ? dir + name + ext : dir + "\\" + name + ext;
+                if (File.Exists(candidate)) return candidate;
+            }
+            return null;
+        }
+
+        static string StripWrappingQuotes(string s)
+        {
+            return s.Length >= 2 && s[0] == '"' && s[s.Length - 1] == '"'
+                ? s.Substring(1, s.Length - 2)
+                : s;
+        }
+
+        // Resolve `path` the way the shell does: a bare name is searched in the current
+        // directory and then PATH. CreateProcessW's own order puts the system directories
+        // ahead of PATH, which silently changes the target the caller asked for.
+        static string? ResolveTarget(string path)
+        {
+            if (path.Length >= 2 && path[1] == ':') return path;
+            if (path.IndexOfAny(new[] { '\\', '/' }) >= 0) return AbsolutePathName(path);
+
+            // A name that already carries an extension is used as written, as cmd does.
+            string[] extensions = path.Contains('.') ? new[] { "" } : new[] { ".com", ".exe" };
+
+            if (EnvValue("NoDefaultCurrentDirectoryInExePath") == null)
+            {
+                var hit = FindInDir(Directory.GetCurrentDirectory(), path, extensions);
+                if (hit != null) return hit;
+            }
+
+            var pathValue = EnvValue("PATH");
+            if (pathValue != null)
+            {
+                foreach (var entry in pathValue.Split(';'))
+                {
+                    string dir = StripWrappingQuotes(entry);
+                    if (dir.Length == 0) continue;
+                    var hit = FindInDir(dir, path, extensions);
+                    if (hit != null) return hit;
+                }
+            }
+
+            return null;
+        }
+
         static bool IsKey(string? key, string expected)
         {
             return IsAsciiEqual(key, expected);
@@ -944,9 +1018,17 @@ namespace Scoop
                 SetEnv(env.Name, env.Value);
             }
 
-            string path = info.Path!;
+            string? resolved = ResolveTarget(info.Path!);
+            string path = resolved ?? info.Path!;
 
             string cmd = BuildCommandLine(path, info.Args);
+
+            // A bare name that was not found is a launch failure, not a wider search.
+            if (resolved == null)
+            {
+                ReportShimError($"Could not create process with command '{cmd}'", ERROR_FILE_NOT_FOUND);
+                return 1;
+            }
 
             var si = new STARTUPINFO();
             si.cb = Marshal.SizeOf(typeof(STARTUPINFO));

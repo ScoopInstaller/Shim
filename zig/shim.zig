@@ -203,6 +203,8 @@ const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
 
 const HandlerRoutine = *const fn (DWORD) callconv(.winapi) BOOL;
 extern "kernel32" fn GetFullPathNameW(lpFileName: [*:0]const WCHAR, nBufferLength: DWORD, lpBuffer: [*:0]WCHAR, lpFilePart: ?*?*WCHAR) callconv(.winapi) DWORD;
+extern "kernel32" fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: [*]WCHAR) callconv(.winapi) DWORD;
+extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const WCHAR) callconv(.winapi) DWORD;
 extern "kernel32" fn ExpandEnvironmentStringsW(lpSrc: [*:0]const WCHAR, lpDst: ?[*]WCHAR, nSize: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn SetConsoleCtrlHandler(HandlerRoutine: HandlerRoutine, Add: BOOL) callconv(.winapi) BOOL;
 extern "kernel32" fn GetStartupInfoW(lpStartupInfo: *windows.STARTUPINFOW) callconv(.winapi) void;
@@ -685,6 +687,124 @@ fn fallbackDir(allocator: std.mem.Allocator, toResolve: []const WCHAR, err: DWOR
     return try allocator.dupe(WCHAR, dir);
 }
 
+const invalid_file_attributes: DWORD = 0xFFFFFFFF;
+const file_attribute_directory: DWORD = 0x10;
+
+/// Nulls are optional here: the result is passed on as a slice.
+fn envValue(allocator: std.mem.Allocator, name_z: [:0]const WCHAR) !?[]WCHAR {
+    var stack: [windows.MAX_PATH + 1]WCHAR = undefined;
+    const len = GetEnvironmentVariableW(name_z.ptr, stack[0..].ptr, stack.len);
+    if (len == 0) return null;
+    if (len < stack.len) return try allocator.dupe(WCHAR, stack[0..len]);
+
+    // Overflow: len is the required size, excluding the null terminator.
+    const big = try allocator.alloc(WCHAR, len);
+    const len2 = GetEnvironmentVariableW(name_z.ptr, big.ptr, @intCast(big.len));
+    if (len2 == 0 or len2 >= big.len) return null;
+    return big[0..len2];
+}
+
+fn currentDirectory(allocator: std.mem.Allocator) ![]WCHAR {
+    var stack: [windows.MAX_PATH + 1]WCHAR = undefined;
+    const len = GetCurrentDirectoryW(stack.len, stack[0..].ptr);
+    if (len == 0) return try allocator.dupe(WCHAR, w("."));
+    if (len < stack.len) return try allocator.dupe(WCHAR, stack[0..len]);
+
+    const big = try allocator.alloc(WCHAR, len);
+    const len2 = GetCurrentDirectoryW(@intCast(big.len), big.ptr);
+    if (len2 == 0 or len2 >= big.len) return try allocator.dupe(WCHAR, w("."));
+    return big[0..len2];
+}
+
+fn dupeZ(allocator: std.mem.Allocator, s: []const WCHAR) ![:0]WCHAR {
+    const buf = try allocator.alloc(WCHAR, s.len + 1);
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
+}
+
+fn stripWrappingQuotes(s: []const WCHAR) []const WCHAR {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
+    return s;
+}
+
+fn isFile(path_z: [:0]const WCHAR) bool {
+    const attrs = GetFileAttributesW(path_z.ptr);
+    return attrs != invalid_file_attributes and (attrs & file_attribute_directory) == 0;
+}
+
+/// Absolute form of a value with its own separators; an unresolved value passes
+/// through so the launch reports the error.
+fn absolutePath(allocator: std.mem.Allocator, path: [:0]const WCHAR) ![:0]WCHAR {
+    var stack: [windows.MAX_PATH + 2:0]WCHAR = undefined;
+    var len = GetFullPathNameW(path.ptr, stack.len, &stack, null);
+    if (len == 0) return try dupeZ(allocator, path);
+    if (len < stack.len) return try dupeZ(allocator, stack[0..len]);
+
+    const big = try allocator.alloc(WCHAR, len + 1);
+    len = GetFullPathNameW(path.ptr, @intCast(big.len), @ptrCast(big.ptr), null);
+    if (len == 0 or len >= big.len) return try dupeZ(allocator, path);
+    return big[0..len :0];
+}
+
+fn findInDir(allocator: std.mem.Allocator, dir: []const WCHAR, name: []const WCHAR, exts: []const []const WCHAR) !?[:0]WCHAR {
+    const needs_sep: usize = if (dir.len > 0 and (dir[dir.len - 1] == '\\' or dir[dir.len - 1] == '/')) 0 else 1;
+    for (exts) |ext| {
+        const buf = try allocator.alloc(WCHAR, dir.len + needs_sep + name.len + ext.len + 1);
+        @memcpy(buf[0..dir.len], dir);
+        var n = dir.len;
+        if (needs_sep == 1) {
+            buf[n] = '\\';
+            n += 1;
+        }
+        @memcpy(buf[n .. n + name.len], name);
+        n += name.len;
+        @memcpy(buf[n .. n + ext.len], ext);
+        n += ext.len;
+        buf[n] = 0;
+        if (isFile(buf[0..n :0])) return buf[0..n :0];
+    }
+    return null;
+}
+
+/// Resolve `path` the way the shell does: a bare name is searched in the current
+/// directory and then PATH, never through CreateProcessW's order, which puts the
+/// system directories ahead of PATH. Returns null when a bare name is not found.
+fn resolveTarget(allocator: std.mem.Allocator, path: [:0]WCHAR) !?[:0]WCHAR {
+    if (path.len >= 2 and path[1] == ':') return path;
+
+    for (path) |c| {
+        if (c == '\\' or c == '/') return try absolutePath(allocator, path);
+    }
+
+    // A name that already carries an extension is used as written, like cmd.
+    const exts: []const []const WCHAR = if (std.mem.indexOfScalar(WCHAR, path, '.') != null)
+        &.{w("")}
+    else
+        &.{ w(".com"), w(".exe") };
+
+    if ((try envValue(allocator, w("NoDefaultCurrentDirectoryInExePath"))) == null) {
+        const cwd = try currentDirectory(allocator);
+        if (try findInDir(allocator, cwd, path, exts)) |hit| return hit;
+    }
+
+    if (try envValue(allocator, w("PATH"))) |path_value| {
+        var rest = path_value;
+        while (true) {
+            const sep = std.mem.indexOfScalar(WCHAR, rest, ';');
+            const entry = if (sep) |i| rest[0..i] else rest;
+            const dir = stripWrappingQuotes(entry);
+            if (dir.len > 0) {
+                if (try findInDir(allocator, dir, path, exts)) |hit| return hit;
+            }
+            if (sep == null) break;
+            rest = rest[sep.? + 1 ..];
+        }
+    }
+
+    return null;
+}
+
 fn getModulePath(allocator: std.mem.Allocator) ![]WCHAR {
     // Resolve the shim's own path with a growing buffer, capped at the path limit.
     const max_module_path_chars = 32768;
@@ -1005,7 +1125,7 @@ fn setEnvValue(name_z: [:0]const WCHAR, name: []const WCHAR, value: [:0]const WC
 fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: ?HANDLE) !ProcessResult {
     var result = ProcessResult{};
 
-    const path = info.path orelse return result;
+    const raw_path = info.path orelse return result;
     const args = info.args.items;
     const cwd = if (info.cwd) |c| c else null;
 
@@ -1021,6 +1141,10 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
         }
         setEnvValue(name_z[0..ev.name.len :0], ev.name, ev.value);
     }
+
+    // Resolved last: a bare name sees the PATH this process is about to hand the child.
+    const resolved = try resolveTarget(allocator, raw_path);
+    const path: [:0]WCHAR = resolved orelse raw_path;
 
     var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
     si.cb = @sizeOf(windows.STARTUPINFOW);
@@ -1043,6 +1167,15 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     }
     cmd_buf[cmd_len] = 0;
     const cmd: [:0]WCHAR = cmd_buf[0..cmd_len :0];
+
+    // A bare name that was not found is a launch failure, not a wider search.
+    if (resolved == null) {
+        writeError("Shim: Could not create process with command '");
+        writeErrorUtf8(cmd);
+        writeError("'");
+        writeErrorSys(ERROR_FILE_NOT_FOUND);
+        return result;
+    }
 
     const has_args = joined.len > 0;
     const args_z: [*:0]WCHAR = if (has_args) @ptrCast(joined.ptr) else @ptrCast(&cmd_buf[cmd_len]);
