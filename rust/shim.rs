@@ -6,41 +6,41 @@ use std::fs::File;
 use std::io::Read;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, GENERIC_ACCESS_RIGHTS, GENERIC_READ, GENERIC_WRITE,
-    HANDLE,
+    CloseHandle, GENERIC_ACCESS_RIGHTS, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    LocalFree,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileType, GetFullPathNameW, WriteFile, FILE_SHARE_MODE, FILE_TYPE_CHAR,
-    OPEN_EXISTING,
+    CreateFileW, FILE_SHARE_MODE, FILE_TYPE_CHAR, GetFileType, GetFullPathNameW, OPEN_EXISTING,
+    WriteFile,
 };
 use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GetConsoleProcessList, GetStdHandle, SetConsoleCtrlHandler,
-    WriteConsoleW, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    AttachConsole, FreeConsole, GetConsoleProcessList, GetStdHandle, STD_ERROR_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, WriteConsoleW,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+    FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
 };
 use windows_sys::Win32::System::Environment::{
     ExpandEnvironmentStringsW, GetCommandLineW, GetEnvironmentVariableW, SetEnvironmentVariableW,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, GetStartupInfoW, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, GetStartupInfoW,
+    INFINITE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
-    CommandLineToArgvW, ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    CommandLineToArgvW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+use windows_sys::core::BOOL;
 
 const SHIM_VERSION: &str = env!("SHIM_VERSION");
 const SHIM_IMPL: &str = "rust";
@@ -75,52 +75,60 @@ struct ShimInfo {
     elevate: bool,
 }
 
-unsafe fn write_bytes(h: HANDLE, msg: &[u8]) {
-    if h != NULL_HANDLE && h != INVALID_HANDLE {
-        let mut written: u32 = 0;
-        WriteFile(
-            h,
-            msg.as_ptr(),
-            msg.len() as u32,
-            &mut written,
-            std::ptr::null_mut(),
-        );
+fn write_bytes(h: HANDLE, msg: &[u8]) {
+    unsafe {
+        if h != NULL_HANDLE && h != INVALID_HANDLE {
+            let mut written: u32 = 0;
+            WriteFile(
+                h,
+                msg.as_ptr(),
+                msg.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+        }
     }
 }
 
-unsafe fn write_error_bytes(msg: &[u8]) {
-    write_bytes(GetStdHandle(STD_ERROR_HANDLE), msg);
+fn write_error_bytes(msg: &[u8]) {
+    unsafe {
+        write_bytes(GetStdHandle(STD_ERROR_HANDLE), msg);
+    }
 }
 
-unsafe fn write_stdout_bytes(msg: &[u8]) {
-    write_bytes(GetStdHandle(STD_OUTPUT_HANDLE), msg);
+fn write_stdout_bytes(msg: &[u8]) {
+    unsafe {
+        write_bytes(GetStdHandle(STD_OUTPUT_HANDLE), msg);
+    }
 }
 
 // WriteConsoleW fails on redirected handles, so route by file type.
-unsafe fn write_error_wide(msg: &[u16]) {
-    if msg.is_empty() {
-        return;
+fn write_error_wide(msg: &[u16]) {
+    unsafe {
+        if msg.is_empty() {
+            return;
+        }
+        let h: HANDLE = GetStdHandle(STD_ERROR_HANDLE);
+        if h == NULL_HANDLE || h == INVALID_HANDLE {
+            return;
+        }
+        if GetFileType(h) == FILE_TYPE_CHAR {
+            let mut written: u32 = 0;
+            WriteConsoleW(
+                h,
+                msg.as_ptr(),
+                msg.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+            return;
+        }
+        write_error_bytes(&String::from_utf16_lossy(msg).into_bytes());
     }
-    let h: HANDLE = GetStdHandle(STD_ERROR_HANDLE);
-    if h == NULL_HANDLE || h == INVALID_HANDLE {
-        return;
-    }
-    if GetFileType(h) == FILE_TYPE_CHAR {
-        let mut written: u32 = 0;
-        WriteConsoleW(
-            h,
-            msg.as_ptr(),
-            msg.len() as u32,
-            &mut written,
-            std::ptr::null_mut(),
-        );
-        return;
-    }
-    write_error_bytes(&String::from_utf16_lossy(msg).into_bytes());
 }
 
 // Hand-rolled decimal render: avoids core::fmt (and its integer machinery) in the binary.
-unsafe fn write_error_num(mut v: u32) {
+fn write_error_num(mut v: u32) {
     let mut buf = [0u16; 11];
     let mut i = buf.len();
     loop {
@@ -134,32 +142,36 @@ unsafe fn write_error_num(mut v: u32) {
     write_error_wide(&buf[i..]);
 }
 
-unsafe fn write_error_sys(err: u32) {
-    write_error_wide(&to_wide(" (error "));
-    write_error_num(err);
-    write_error_wide(&to_wide(": "));
-    let mut buf = [0u16; 256];
-    let n = FormatMessageW(
-        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_MAX_WIDTH_MASK,
-        std::ptr::null(),
-        err,
-        0,
-        buf.as_mut_ptr(),
-        buf.len() as u32,
-        std::ptr::null(),
-    );
-    if n > 0 {
-        let msg = &buf[..n as usize];
-        let end = msg
-            .iter()
-            .rposition(|c| !matches!(*c, 0x20 | 0x09 | 0x0D | 0x0A))
-            .map_or(0, |i| i + 1);
-        write_error_wide(&msg[..end]);
+fn write_error_sys(err: u32) {
+    unsafe {
+        write_error_wide(&to_wide(" (error "));
+        write_error_num(err);
+        write_error_wide(&to_wide(": "));
+        let mut buf = [0u16; 256];
+        let n = FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM
+                | FORMAT_MESSAGE_IGNORE_INSERTS
+                | FORMAT_MESSAGE_MAX_WIDTH_MASK,
+            std::ptr::null(),
+            err,
+            0,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            std::ptr::null(),
+        );
+        if n > 0 {
+            let msg = &buf[..n as usize];
+            let end = msg
+                .iter()
+                .rposition(|c| !matches!(*c, 0x20 | 0x09 | 0x0D | 0x0A))
+                .map_or(0, |i| i + 1);
+            write_error_wide(&msg[..end]);
+        }
+        write_error_bytes(b").\n");
     }
-    write_error_bytes(b").\n");
 }
 
-unsafe fn write_error_ctx(context: &str, err: u32) {
+fn write_error_ctx(context: &str, err: u32) {
     write_error_wide(&to_wide("Shim: "));
     write_error_wide(&to_wide(context));
     write_error_sys(err);
@@ -238,32 +250,34 @@ fn get_shim_paths() -> Option<(String, String, Vec<u16>)> {
 }
 
 // PE headers are read directly - no image-helper dependency in windows-sys.
-unsafe fn is_gui_subsystem() -> bool {
-    let h = GetModuleHandleW(std::ptr::null());
-    if h == NULL_HANDLE {
-        return false;
-    }
-    let base = h as *const u8;
+fn is_gui_subsystem() -> bool {
+    unsafe {
+        let h = GetModuleHandleW(std::ptr::null());
+        if h == NULL_HANDLE {
+            return false;
+        }
+        let base = h as *const u8;
 
-    let dos_sig = *(base as *const u16);
-    if dos_sig != IMAGE_DOS_SIGNATURE {
-        return false;
-    }
+        let dos_sig = *(base as *const u16);
+        if dos_sig != IMAGE_DOS_SIGNATURE {
+            return false;
+        }
 
-    let pe_offset = *(base.add(0x3C) as *const i32);
-    // PE headers live in the first page, so an e_lfanew outside it is a bogus offset.
-    if pe_offset <= 0 || pe_offset >= 0x1000 {
-        return false;
-    }
-    let pe_base = base.offset(pe_offset as isize);
+        let pe_offset = *(base.add(0x3C) as *const i32);
+        // PE headers live in the first page, so an e_lfanew outside it is a bogus offset.
+        if pe_offset <= 0 || pe_offset >= 0x1000 {
+            return false;
+        }
+        let pe_base = base.offset(pe_offset as isize);
 
-    let nt_sig = *(pe_base as *const u32);
-    if nt_sig != IMAGE_NT_SIGNATURE {
-        return false;
-    }
+        let nt_sig = *(pe_base as *const u32);
+        if nt_sig != IMAGE_NT_SIGNATURE {
+            return false;
+        }
 
-    let subsystem = *(pe_base.add(0x5C) as *const u16);
-    subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI
+        let subsystem = *(pe_base.add(0x5C) as *const u16);
+        subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI
+    }
 }
 
 fn parse_bool(value: &str) -> bool {
@@ -436,12 +450,10 @@ fn parse_user_args_from_cmdline() -> Vec<OsString> {
 // Fallback after GetFullPathNameW fails: drop the last component, so %~dp0 is a directory.
 fn resolve_failed_dir(to_resolve: &[u16], err: u32) -> String {
     let input = String::from_utf16_lossy(&to_resolve[..to_resolve.len() - 1]);
-    unsafe {
-        write_error_wide(&to_wide("Shim: Could not resolve path '"));
-        write_error_wide(&to_resolve[..to_resolve.len() - 1]);
-        write_error_wide(&to_wide("'"));
-        write_error_sys(err);
-    }
+    write_error_wide(&to_wide("Shim: Could not resolve path '"));
+    write_error_wide(&to_resolve[..to_resolve.len() - 1]);
+    write_error_wide(&to_wide("'"));
+    write_error_sys(err);
     let dir = match input.rfind(['\\', '/']) {
         Some(sep) => input[..sep].to_string(),
         None => input,
@@ -548,13 +560,13 @@ fn quote_arg(arg: &OsStr) -> Vec<u16> {
             }
             let count = i - bs_start;
             if i == units.len() {
-                result.extend(std::iter::repeat(b'\\' as u16).take(count * 2));
+                result.extend(std::iter::repeat_n(b'\\' as u16, count * 2));
             } else if units[i] == b'"' as u16 {
-                result.extend(std::iter::repeat(b'\\' as u16).take(count * 2 + 1));
+                result.extend(std::iter::repeat_n(b'\\' as u16, count * 2 + 1));
                 result.push(b'"' as u16);
                 i += 1;
             } else {
-                result.extend(std::iter::repeat(b'\\' as u16).take(count));
+                result.extend(std::iter::repeat_n(b'\\' as u16, count));
             }
         } else if units[i] == b'"' as u16 {
             result.push(b'\\' as u16);
@@ -571,73 +583,75 @@ fn quote_arg(arg: &OsStr) -> Vec<u16> {
 }
 
 // Console policy lives in main; a detached GUI shim has no console, so the opens below fail.
-unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
-    // Handles must be inheritable or the child never receives them.
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
-    };
+fn ensure_standard_handles(si: &mut STARTUPINFOW) {
+    unsafe {
+        // Handles must be inheritable or the child never receives them.
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
 
-    let conin = to_wide_null("CONIN$");
-    let conout = to_wide_null("CONOUT$");
-    let mut replaced = false;
+        let conin = to_wide_null("CONIN$");
+        let conout = to_wide_null("CONOUT$");
+        let mut replaced = false;
 
-    // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
-    let seeds: [(&mut HANDLE, u32); 3] = [
-        (&mut si.hStdInput, STD_INPUT_HANDLE),
-        (&mut si.hStdOutput, STD_OUTPUT_HANDLE),
-        (&mut si.hStdError, STD_ERROR_HANDLE),
-    ];
-    for (slot, which) in seeds {
-        if *slot == NULL_HANDLE || *slot == INVALID_HANDLE {
-            let real: HANDLE = GetStdHandle(which);
-            if real != NULL_HANDLE && real != INVALID_HANDLE {
-                *slot = real;
+        // GetStartupInfoW reports 0 std handles unless the creator set STARTF_USESTDHANDLES; a fresh CONOUT$ handle is not equivalent to the console's.
+        let seeds: [(&mut HANDLE, u32); 3] = [
+            (&mut si.hStdInput, STD_INPUT_HANDLE),
+            (&mut si.hStdOutput, STD_OUTPUT_HANDLE),
+            (&mut si.hStdError, STD_ERROR_HANDLE),
+        ];
+        for (slot, which) in seeds {
+            if *slot == NULL_HANDLE || *slot == INVALID_HANDLE {
+                let real: HANDLE = GetStdHandle(which);
+                if real != NULL_HANDLE && real != INVALID_HANDLE {
+                    *slot = real;
+                }
             }
         }
-    }
 
-    let slots: [(
-        &mut HANDLE,
-        *const u16,
-        GENERIC_ACCESS_RIGHTS,
-        FILE_SHARE_MODE,
-    ); 3] = [
-        (
-            &mut si.hStdInput,
-            conin.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-        ),
-        (
-            &mut si.hStdOutput,
-            conout.as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_WRITE,
-        ),
-        (
-            &mut si.hStdError,
-            conout.as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_WRITE,
-        ),
-    ];
-    for (slot, name, access, share) in slots {
-        if *slot != NULL_HANDLE && *slot != INVALID_HANDLE {
-            continue;
+        let slots: [(
+            &mut HANDLE,
+            *const u16,
+            GENERIC_ACCESS_RIGHTS,
+            FILE_SHARE_MODE,
+        ); 3] = [
+            (
+                &mut si.hStdInput,
+                conin.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+            ),
+            (
+                &mut si.hStdOutput,
+                conout.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_WRITE,
+            ),
+            (
+                &mut si.hStdError,
+                conout.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_WRITE,
+            ),
+        ];
+        for (slot, name, access, share) in slots {
+            if *slot != NULL_HANDLE && *slot != INVALID_HANDLE {
+                continue;
+            }
+            let h: HANDLE = CreateFileW(name, access, share, &sa, OPEN_EXISTING, 0, NULL_HANDLE);
+            *slot = if h == INVALID_HANDLE { NULL_HANDLE } else { h };
+            if *slot != NULL_HANDLE {
+                replaced = true;
+            }
         }
-        let h: HANDLE = CreateFileW(name, access, share, &sa, OPEN_EXISTING, 0, NULL_HANDLE);
-        *slot = if h == INVALID_HANDLE { NULL_HANDLE } else { h };
-        if *slot != NULL_HANDLE {
-            replaced = true;
-        }
-    }
 
-    if replaced {
-        si.dwFlags |= STARTF_USESTDHANDLES;
+        if replaced {
+            si.dwFlags |= STARTF_USESTDHANDLES;
+        }
+        // Handles live for the process lifetime - do not close.
     }
-    // Handles live for the process lifetime - do not close.
 }
 
 fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInfo {
@@ -649,23 +663,19 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
         Ok(f) => f,
         Err(e) => {
             let err = e.raw_os_error().unwrap_or(0) as u32;
-            unsafe {
-                write_error_wide(&to_wide("Shim: Cannot open shim file for read: '"));
-                write_error_wide(&to_wide(shim_path));
-                write_error_wide(&to_wide("'"));
-                write_error_sys(err);
-            }
+            write_error_wide(&to_wide("Shim: Cannot open shim file for read: '"));
+            write_error_wide(&to_wide(shim_path));
+            write_error_wide(&to_wide("'"));
+            write_error_sys(err);
             return info;
         }
     };
     if let Err(e) = shim_file.read_to_end(&mut raw) {
         let err = e.raw_os_error().unwrap_or(0) as u32;
-        unsafe {
-            write_error_wide(&to_wide("Shim: Cannot read shim file: '"));
-            write_error_wide(&to_wide(shim_path));
-            write_error_wide(&to_wide("'"));
-            write_error_sys(err);
-        }
+        write_error_wide(&to_wide("Shim: Cannot read shim file: '"));
+        write_error_wide(&to_wide(shim_path));
+        write_error_wide(&to_wide("'"));
+        write_error_sys(err);
         return info;
     }
 
@@ -674,18 +684,16 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
     let mut all_lines: Vec<&str> = Vec::with_capacity(body.len() / 16 + 1);
     for chunk in body.split(|&b| b == b'\n') {
         let Ok(line) = std::str::from_utf8(chunk) else {
-            unsafe { write_error_bytes(b"Shim: invalid UTF-8 line in shim file\n") };
+            write_error_bytes(b"Shim: invalid UTF-8 line in shim file\n");
             continue;
         };
         // Classified here, not in a pass: only this loop sees every line.
         if parse_shim_line(line).is_err() {
-            unsafe {
-                write_error_wide(&to_wide("Shim: malformed line '"));
-                write_error_wide(&to_wide(line.trim_end()));
-                write_error_wide(&to_wide("' in shim file '"));
-                write_error_wide(&to_wide(shim_path));
-                write_error_wide(&to_wide("': expected 'key = value'.\n"));
-            }
+            write_error_wide(&to_wide("Shim: malformed line '"));
+            write_error_wide(&to_wide(line.trim_end()));
+            write_error_wide(&to_wide("' in shim file '"));
+            write_error_wide(&to_wide(shim_path));
+            write_error_wide(&to_wide("': expected 'key = value'.\n"));
             return ShimInfo::default();
         }
         all_lines.push(line);
@@ -737,11 +745,9 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
                 .and_then(|_| key.get(ENV_FORCE_PREFIX.len()..));
             if let Some(name) = force_name {
                 if name.is_empty() {
-                    unsafe {
-                        write_error_wide(&to_wide(
-                            "Shim: empty variable name after 'env!:' in shim file\n",
-                        ))
-                    };
+                    write_error_wide(&to_wide(
+                        "Shim: empty variable name after 'env!:' in shim file\n",
+                    ));
                     continue;
                 }
                 let mut env_val = value.to_string();
@@ -761,11 +767,9 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
                 })
                 .unwrap_or(key);
             if name.is_empty() {
-                unsafe {
-                    write_error_wide(&to_wide(
-                        "Shim: empty variable name after 'env:' or 'env?:' in shim file\n",
-                    ))
-                };
+                write_error_wide(&to_wide(
+                    "Shim: empty variable name after 'env:' or 'env?:' in shim file\n",
+                ));
                 continue;
             }
             let mut env_val = value.to_string();
@@ -780,24 +784,20 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
     }
 
     if info.path.is_none() {
-        unsafe {
-            write_error_wide(&to_wide("Shim: 'path' not found in shim file '"));
-            write_error_wide(&to_wide(shim_path));
-            write_error_wide(&to_wide("'.\n"));
-        }
+        write_error_wide(&to_wide("Shim: 'path' not found in shim file '"));
+        write_error_wide(&to_wide(shim_path));
+        write_error_wide(&to_wide("'.\n"));
     } else if info
         .path
         .as_deref()
         .is_some_and(|p| p.starts_with(['\\', '/']))
     {
         info.path = None;
-        unsafe {
-            write_error_wide(&to_wide(
-                "Shim: 'path' must not begin with a separator in shim file '",
-            ));
-            write_error_wide(&to_wide(shim_path));
-            write_error_wide(&to_wide("'.\n"));
-        }
+        write_error_wide(&to_wide(
+            "Shim: 'path' must not begin with a separator in shim file '",
+        ));
+        write_error_wide(&to_wide(shim_path));
+        write_error_wide(&to_wide("'.\n"));
     }
 
     info
@@ -815,61 +815,66 @@ fn build_params(args: &[OsString]) -> Vec<u16> {
     p
 }
 
-unsafe fn launch_elevated(
+fn launch_elevated(
     path_w: &[u16],
     params: &[u16],
-    cwd_ptr: *const u16,
+    cwd: Option<&[u16]>,
     job_handle: HANDLE,
 ) -> (HANDLE, HANDLE) {
-    let runas = to_wide_null("runas");
-    let mut sei: SHELLEXECUTEINFOW = std::mem::zeroed();
-    sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpFile = path_w.as_ptr();
-    sei.lpParameters = if params.len() <= 1 {
-        std::ptr::null()
-    } else {
-        params.as_ptr()
-    };
-    sei.lpDirectory = cwd_ptr;
-    sei.lpVerb = runas.as_ptr();
-    sei.nShow = SW_SHOW;
-
-    if ShellExecuteExW(&mut sei) == 0 {
-        // On failure hInstApp holds an SE_ERR_* value (<=32); otherwise use GetLastError.
-        let mut err = match sei.hInstApp as isize {
-            0..=32 => sei.hInstApp as isize as u32,
-            _ => 0,
+    unsafe {
+        let runas = to_wide_null("runas");
+        let mut sei: SHELLEXECUTEINFOW = std::mem::zeroed();
+        sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpFile = path_w.as_ptr();
+        sei.lpParameters = if params.len() <= 1 {
+            std::ptr::null()
+        } else {
+            params.as_ptr()
         };
-        if err == 0 {
-            err = GetLastError();
-        }
-        if err == 0 {
-            err = 1;
-        }
-        write_error_ctx("Unable to create elevated process", err);
-        return (NULL_HANDLE, NULL_HANDLE);
-    }
+        sei.lpDirectory = cwd.map_or(std::ptr::null(), |c| c.as_ptr());
+        sei.lpVerb = runas.as_ptr();
+        sei.nShow = SW_SHOW;
 
-    let proc_handle: HANDLE = sei.hProcess;
-    if job_handle != NULL_HANDLE && proc_handle != NULL_HANDLE {
-        if AssignProcessToJobObject(job_handle, proc_handle) == 0 {
+        if ShellExecuteExW(&mut sei) == 0 {
+            // On failure hInstApp holds an SE_ERR_* value (<=32); otherwise use GetLastError.
+            let mut err = match sei.hInstApp as isize {
+                0..=32 => sei.hInstApp as isize as u32,
+                _ => 0,
+            };
+            if err == 0 {
+                err = GetLastError();
+            }
+            if err == 0 {
+                err = 1;
+            }
+            write_error_ctx("Unable to create elevated process", err);
+            return (NULL_HANDLE, NULL_HANDLE);
+        }
+
+        let proc_handle: HANDLE = sei.hProcess;
+        if job_handle != NULL_HANDLE
+            && proc_handle != NULL_HANDLE
+            && AssignProcessToJobObject(job_handle, proc_handle) == 0
+        {
             write_error_ctx("Could not assign process to job object", GetLastError());
         }
-    }
 
-    (proc_handle, NULL_HANDLE)
+        (proc_handle, NULL_HANDLE)
+    }
 }
 
-unsafe fn set_env(key: &str, value: &str) {
-    let key_w = to_wide_null(key);
-    let value_w = to_wide_null(value);
-    if SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) == 0 {
-        let err = GetLastError();
-        write_error_wide(&to_wide("Shim: Could not set environment variable '"));
-        write_error_wide(&to_wide(key));
-        write_error_wide(&to_wide("'"));
-        write_error_sys(err);
+fn set_env(key: &str, value: &str) {
+    unsafe {
+        let key_w = to_wide_null(key);
+        let value_w = to_wide_null(value);
+        if SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) == 0 {
+            let err = GetLastError();
+            write_error_wide(&to_wide("Shim: Could not set environment variable '"));
+            write_error_wide(&to_wide(key));
+            write_error_wide(&to_wide("'"));
+            write_error_sys(err);
+        }
     }
 }
 
@@ -888,7 +893,7 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
                 continue;
             }
         }
-        unsafe { set_env(key, value) };
+        set_env(key, value);
     }
 
     // Keep the command line in UTF-16 end to end: quote_arg already preserves
@@ -919,7 +924,7 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
 
     if info.elevate {
         let params = build_params(&info.args);
-        return unsafe { launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle) };
+        return launch_elevated(path_w.as_slice(), &params, cwd_w.as_deref(), job_handle);
     }
 
     // SUSPENDED: the child must join the job object before it can spawn its own children.
@@ -947,16 +952,16 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
             creation_flags,
             std::ptr::null(),
             cwd_ptr,
-            &mut si,
+            &si,
             &mut pi,
         )
     } != 0
     {
-        if job_handle != NULL_HANDLE {
-            if unsafe { AssignProcessToJobObject(job_handle, pi.hProcess) } == 0 {
-                unsafe {
-                    write_error_ctx("Could not assign process to job object", GetLastError());
-                }
+        if job_handle != NULL_HANDLE
+            && unsafe { AssignProcessToJobObject(job_handle, pi.hProcess) } == 0
+        {
+            unsafe {
+                write_error_ctx("Could not assign process to job object", GetLastError());
             }
         }
         // A failed resume would leave the shim blocked in WaitForSingleObject forever.
@@ -982,21 +987,19 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     let err = unsafe { GetLastError() };
     if err == ERROR_ELEVATION_REQUIRED {
         let params = build_params(&info.args);
-        return unsafe { launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle) };
+        return launch_elevated(path_w.as_slice(), &params, cwd_w.as_deref(), job_handle);
     }
 
-    unsafe {
-        write_error_wide(&to_wide("Shim: Could not create process with command '"));
-        // Lossy copy only for the message; the spawn above used the raw UTF-16 line.
-        write_error_wide(&to_wide(&String::from_utf16_lossy(&cmd[..cmd.len() - 1])));
-        write_error_wide(&to_wide("'"));
-        write_error_sys(err);
-    }
+    write_error_wide(&to_wide("Shim: Could not create process with command '"));
+    // Lossy copy only for the message; the spawn above used the raw UTF-16 line.
+    write_error_wide(&to_wide(&String::from_utf16_lossy(&cmd[..cmd.len() - 1])));
+    write_error_wide(&to_wide("'"));
+    write_error_sys(err);
     (NULL_HANDLE, NULL_HANDLE)
 }
 
 // Swallow the known console control events so only the child handles them.
-unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
+extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
     match ctrl_type {
         0 | 1 | 2 | 5 | 6 => 1,
         _ => 0,
@@ -1027,15 +1030,13 @@ fn try_print_version(shim_path: &str, shim_wide: &[u16], user_args: &[OsString])
         }
     }
 
-    unsafe {
-        write_stdout_bytes(b"shim ");
-        write_stdout_bytes(SHIM_VERSION.as_bytes());
-        write_stdout_bytes(b" (");
-        write_stdout_bytes(SHIM_IMPL.as_bytes());
-        write_stdout_bytes(b")\nFeatures: ");
-        write_stdout_bytes(SHIM_FEATURES.as_bytes());
-        write_stdout_bytes(b"\n");
-    }
+    write_stdout_bytes(b"shim ");
+    write_stdout_bytes(SHIM_VERSION.as_bytes());
+    write_stdout_bytes(b" (");
+    write_stdout_bytes(SHIM_IMPL.as_bytes());
+    write_stdout_bytes(b")\nFeatures: ");
+    write_stdout_bytes(SHIM_FEATURES.as_bytes());
+    write_stdout_bytes(b"\n");
     true
 }
 
@@ -1063,7 +1064,7 @@ fn main() {
 
     // A GUI-subsystem shim would flash a console; with args it behaves as a CLI
     // tool, so it re-attaches to the parent console for output.
-    let is_gui = unsafe { is_gui_subsystem() };
+    let is_gui = is_gui_subsystem();
     if is_gui {
         if has_user_args || !info.args.is_empty() {
             unsafe {

@@ -38,8 +38,8 @@ fn main() {
             | (parts[3] as u64);
         res.set_version_info(winres::VersionInfo::FILEVERSION, packed);
         res.set_version_info(winres::VersionInfo::PRODUCTVERSION, packed);
-        res.set("FileVersion", &ver);
-        res.set("ProductVersion", &ver);
+        res.set("FileVersion", ver);
+        res.set("ProductVersion", ver);
         res.set("ProductName", "Scoop Shim Ex");
         res.set("CompanyName", "Scoop contributors");
         res.set(
