@@ -1,6 +1,6 @@
 [package]
 name = "shim"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 license = "MIT OR Unlicense"
 # A binary that references ../shim.manifest outside the package; never publishable.
