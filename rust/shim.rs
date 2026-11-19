@@ -5,7 +5,6 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_ACCESS_RIGHTS, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
     LocalFree,
@@ -467,7 +466,6 @@ fn resolve_failed_dir(to_resolve: &[u16], err: u32) -> String {
     dir
 }
 
-// Returns the directory portion (trailing backslash) of the absolute form of `path`.
 /// True when `wide` is null-terminated and names a file rather than a directory.
 fn is_file(wide: &[u16]) -> bool {
     let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
@@ -501,41 +499,14 @@ fn absolute(wide: &[u16]) -> Vec<u16> {
     let mut terminated = Vec::with_capacity(wide.len() + 1);
     terminated.extend_from_slice(wide);
     terminated.push(0);
-    unsafe {
-        let mut stack = [0u16; 261];
-        let mut len = GetFullPathNameW(
-            terminated.as_ptr(),
-            stack.len() as u32,
-            stack.as_mut_ptr(),
-            std::ptr::null_mut(),
-        );
-        if len == 0 {
-            return wide.to_vec();
-        }
-        if (len as usize) < stack.len() {
-            return stack[..len as usize].to_vec();
-        }
-        // Overflow: len is the required size, including the null terminator.
-        let required = len as usize + 1;
-        let mut big = vec![0u16; required];
-        len = GetFullPathNameW(
-            terminated.as_ptr(),
-            required as u32,
-            big.as_mut_ptr(),
-            std::ptr::null_mut(),
-        );
-        if len == 0 || len as usize >= required {
-            return wide.to_vec();
-        }
-        big[..len as usize].to_vec()
-    }
+    resolve_full_path(&terminated).unwrap_or_else(|_| wide.to_vec())
 }
 
-/// One pair of wrapping double quotes stripped, as the platform does for PATH entries.
-fn unquote(wide: &[u16]) -> &[u16] {
+/// None when `wide` is not one pair of wrapping double quotes around its value.
+fn unquote(mut wide: &[u16]) -> &[u16] {
     let quote = b'"' as u16;
-    if wide.len() >= 2 && wide[0] == quote && wide[wide.len() - 1] == quote {
-        return &wide[1..wide.len() - 1];
+    while wide.len() >= 2 && wide[0] == quote && wide[wide.len() - 1] == quote {
+        wide = &wide[1..wide.len() - 1];
     }
     wide
 }
@@ -545,10 +516,10 @@ fn find_in_dir(dir: &[u16], name: &str, extensions: &[&str]) -> Option<OsString>
     for ext in extensions {
         let mut candidate = Vec::with_capacity(dir.len() + name_w.len() + 6);
         candidate.extend_from_slice(dir);
-        let sep = dir
-            .last()
-            .is_some_and(|c| *c == b'\\' as u16 || *c == b'/' as u16);
-        if !dir.is_empty() && !sep {
+        if !dir.is_empty()
+            && !dir[dir.len() - 1].eq(&(b'\\' as u16))
+            && !dir[dir.len() - 1].eq(&(b'/' as u16))
+        {
             candidate.push(b'\\' as u16);
         }
         candidate.extend_from_slice(&name_w);
@@ -563,6 +534,53 @@ fn find_in_dir(dir: &[u16], name: &str, extensions: &[&str]) -> Option<OsString>
         }
     }
     None
+}
+
+/// One growth path per lane: the size is known only after a failed call, and the
+/// error is kept for the caller's diagnostic.
+/// `to_resolve` must be null-terminated, as for any Win32 path name.
+fn resolve_full_path(to_resolve: &[u16]) -> Result<Vec<u16>, u32> {
+    unsafe {
+        let mut stack = [0u16; 261];
+        let mut len = GetFullPathNameW(
+            to_resolve.as_ptr(),
+            stack.len() as u32,
+            stack.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if len == 0 {
+            return Err(GetLastError());
+        }
+        if (len as usize) < stack.len() {
+            return Ok(stack[..len as usize].to_vec());
+        }
+
+        // Overflow: len is the required size, including the null terminator.
+        let required = len as usize + 1;
+        let mut big = vec![0u16; required];
+        len = GetFullPathNameW(
+            to_resolve.as_ptr(),
+            required as u32,
+            big.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if len == 0 || len as usize >= required {
+            return Err(GetLastError());
+        }
+        Ok(big[..len as usize].to_vec())
+    }
+}
+
+/// Directory portion with a trailing separator; a value with none yields `\`, as before.
+fn directory_of(full: &[u16]) -> String {
+    let last_sep = full
+        .iter()
+        .rposition(|c| *c == b'\\' as u16 || *c == b'/' as u16);
+    match last_sep {
+        Some(sep) if sep + 1 == full.len() => String::from_utf16_lossy(full),
+        Some(sep) => String::from_utf16_lossy(&full[..sep + 1]),
+        None => String::from_utf16_lossy(full) + "\\",
+    }
 }
 
 /// Resolve `path` the way the shell does: a bare name is searched in the current
@@ -590,8 +608,10 @@ fn resolve_target(path: &str) -> Option<OsString> {
     let skip_cwd = env_wide("NoDefaultCurrentDirectoryInExePath").is_some();
 
     // "." absolutised is the working directory, so no second API is needed.
-    let cwd = absolute(&to_wide("."));
-    if !skip_cwd && let Some(hit) = find_in_dir(&cwd, path, extensions) {
+    if !skip_cwd
+        && let Ok(cwd) = resolve_full_path(&to_wide_null("."))
+        && let Some(hit) = find_in_dir(&cwd, path, extensions)
+    {
         return Some(hit);
     }
 
@@ -615,69 +635,27 @@ fn resolve_target(path: &str) -> Option<OsString> {
 fn resolve_against_base(path: &str, base_dir: &str) -> String {
     let wide_path = to_wide_null(path);
     let wide_base = to_wide_null(base_dir);
-    unsafe {
-        // Rooted per README: the second UTF-16 unit is ':' -- the wchar check the
-        // other lanes use; a byte-wise test would misread "é:x" as relative --
-        // or the first unit is a separator.
-        let is_absolute = (wide_path.len() >= 2 && wide_path[1] == b':' as u16)
-            || (wide_path[0] == b'\\' as u16 || wide_path[0] == b'/' as u16);
 
-        let to_resolve = if is_absolute {
-            wide_path
-        } else {
-            let mut combined = wide_base;
-            combined.pop(); // drop the null
-            combined.push('\\' as u16);
-            combined.extend_from_slice(&wide_path[..wide_path.len() - 1]);
-            combined.push(0);
-            combined
-        };
+    // Rooted per README: the second UTF-16 unit is ':' -- the wchar check the
+    // other lanes use; a byte-wise test would misread "é:x" as relative --
+    // or the first unit is a separator.
+    let is_absolute = (wide_path.len() >= 2 && wide_path[1] == b':' as u16)
+        || (wide_path[0] == b'\\' as u16 || wide_path[0] == b'/' as u16);
 
-        let mut stack = [0u16; 261];
-        let mut file_part: *mut u16 = std::ptr::null_mut();
-        let mut len = GetFullPathNameW(
-            to_resolve.as_ptr(),
-            stack.len() as u32,
-            stack.as_mut_ptr(),
-            &mut file_part,
-        );
+    let to_resolve = if is_absolute {
+        wide_path
+    } else {
+        let mut combined = wide_base;
+        combined.pop(); // drop the null
+        combined.push('\\' as u16);
+        combined.extend_from_slice(&wide_path[..wide_path.len() - 1]);
+        combined.push(0);
+        combined
+    };
 
-        let mut big: Vec<u16>;
-        let resolved: &[u16] = if len == 0 {
-            return resolve_failed_dir(&to_resolve, GetLastError());
-        } else if len as usize >= stack.len() {
-            // Overflow: len is the required size, including the null terminator.
-            let required = len as usize + 1;
-            big = vec![0u16; required];
-            file_part = std::ptr::null_mut();
-            len = GetFullPathNameW(
-                to_resolve.as_ptr(),
-                required as u32,
-                big.as_mut_ptr(),
-                &mut file_part,
-            );
-            if len == 0 || len as usize >= required {
-                return resolve_failed_dir(&to_resolve, GetLastError());
-            }
-            &big[..len as usize]
-        } else {
-            &stack[..len as usize]
-        };
-
-        let dir_len = if !file_part.is_null() {
-            (file_part as usize - resolved.as_ptr() as usize) / 2
-        } else {
-            len as usize
-        };
-
-        if dir_len > 0
-            && (resolved[dir_len - 1] == b'\\' as u16 || resolved[dir_len - 1] == b'/' as u16)
-        {
-            return String::from_utf16_lossy(&resolved[..dir_len]);
-        }
-        let mut result = String::from_utf16_lossy(&resolved[..dir_len]);
-        result.push('\\');
-        result
+    match resolve_full_path(&to_resolve) {
+        Ok(resolved) => directory_of(&resolved),
+        Err(err) => resolve_failed_dir(&to_resolve, err),
     }
 }
 

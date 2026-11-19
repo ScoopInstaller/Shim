@@ -463,6 +463,43 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 }
 
 // Returns the directory portion (trailing backslash) of the absolute form of `path`.
+struct ResolvedPath
+{
+    std::wstring path; // empty when the call failed
+    DWORD error = 0;
+};
+
+/// One growth path per lane: the size is known only after a failed call, and the
+/// error is kept for the caller's diagnostic.
+[[nodiscard]] ResolvedPath ResolveFullPath(const std::wstring& toResolve)
+{
+    std::array<wchar_t, MAX_PATH + 2> stack {};
+    const DWORD len = GetFullPathNameW(toResolve.c_str(), MAX_PATH, stack.data(), nullptr);
+    if (len == 0) [[unlikely]]
+        return {{}, GetLastError()};
+    if (len < MAX_PATH) [[likely]]
+        return {std::wstring(stack.data(), len), 0};
+
+    // Two-call sizing: len is the required buffer size (including the null).
+    std::vector<wchar_t> big(len);
+    const DWORD len2 = GetFullPathNameW(toResolve.c_str(), len, big.data(), nullptr);
+    if (len2 == 0 || len2 >= len) [[unlikely]]
+        return {{}, GetLastError()};
+    return {std::wstring(big.data(), len2), 0};
+}
+
+/// Directory portion with a trailing separator; a value with none yields `\`, as before.
+[[nodiscard]] std::wstring DirectoryOf(std::wstring_view fullPath)
+{
+    if (!fullPath.empty() && (fullPath.back() == L'\\' || fullPath.back() == L'/'))
+        return std::wstring(fullPath);
+
+    const size_t sep = fullPath.find_last_of(L"\\/");
+    if (sep == std::wstring_view::npos)
+        return L"\\";
+    return std::wstring(fullPath.substr(0, sep + 1));
+}
+
 [[nodiscard]] std::wstring ResolveAgainstBase(std::wstring_view path, std::wstring_view baseDir)
 {
     std::wstring toResolve;
@@ -478,35 +515,10 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         toResolve.append(path);
     }
 
-    std::array<wchar_t, MAX_PATH + 2> resolved {};
-    wchar_t* filePart = nullptr;
-    DWORD len = GetFullPathNameW(toResolve.c_str(), MAX_PATH, resolved.data(), &filePart);
-
-    std::wstring resolvedStr;
-    size_t dirLen;
-    if (len == 0 || len >= MAX_PATH) [[unlikely]]
-    {
-        // Two-call sizing: len > MAX_PATH is the required buffer size (incl. null).
-        DWORD required = (len >= MAX_PATH) ? len : GetFullPathNameW(toResolve.c_str(), 0, nullptr, nullptr);
-        if (required == 0) [[unlikely]]
-            return ResolveFailedDir(toResolve, GetLastError());
-
-        std::vector<wchar_t> big(required);
-        DWORD len2 = GetFullPathNameW(toResolve.c_str(), required, big.data(), &filePart);
-        if (len2 == 0 || len2 >= required) [[unlikely]]
-            return ResolveFailedDir(toResolve, GetLastError());
-        resolvedStr.assign(big.data());
-        dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - big.data()) : resolvedStr.size();
-    }
-    else
-    {
-        resolvedStr.assign(resolved.data());
-        dirLen = (filePart != nullptr) ? static_cast<size_t>(filePart - resolved.data()) : resolvedStr.size();
-    }
-    if (dirLen > 0 && (resolvedStr[dirLen - 1] == L'\\' || resolvedStr[dirLen - 1] == L'/'))
-        return resolvedStr.substr(0, dirLen);
-
-    return resolvedStr.substr(0, dirLen) + L'\\';
+    const ResolvedPath resolved = ResolveFullPath(toResolve);
+    if (resolved.path.empty()) [[unlikely]]
+        return ResolveFailedDir(toResolve, resolved.error);
+    return DirectoryOf(resolved.path);
 }
 
 constexpr DWORD c_invalidFileAttributes = 0xFFFFFFFF;
@@ -547,18 +559,8 @@ constexpr DWORD c_invalidFileAttributes = 0xFFFFFFFF;
 /// through so the launch reports the error.
 [[nodiscard]] std::wstring AbsolutePathName(const std::wstring& path)
 {
-    std::array<wchar_t, MAX_PATH + 2> stack {};
-    DWORD len = GetFullPathNameW(path.c_str(), static_cast<DWORD>(stack.size()), stack.data(), nullptr);
-    if (len == 0)
-        return path;
-    if (len < stack.size())
-        return std::wstring(stack.data(), len);
-
-    std::vector<wchar_t> big(len + 1);
-    len = GetFullPathNameW(path.c_str(), static_cast<DWORD>(big.size()), big.data(), nullptr);
-    if (len == 0 || len >= big.size())
-        return path;
-    return std::wstring(big.data(), len);
+    const ResolvedPath resolved = ResolveFullPath(path);
+    return resolved.path.empty() ? path : resolved.path;
 }
 
 [[nodiscard]] bool IsExistingFile(const std::wstring& path)

@@ -58,9 +58,9 @@ An installed copy carries the same facts in its version resource, so it can be r
 | Implementation | `impl` | Build Tool |      x86 |      x64 |    arm64 |
 | -------------- | ------ | ---------- | -------: | -------: | -------: |
 | C#             | `cs`   | dotnet     |  24.5 KB |  24.0 KB |  24.0 KB |
-| C++            | `cpp`  | Zig        | 126.5 KB | 151.0 KB | 143.5 KB |
-| C++            | `cpp`  | MSBuild    | 129.5 KB | 153.0 KB | 133.5 KB |
-| Rust           | `rust` | Cargo      | 119.0 KB | 137.0 KB | 133.0 KB |
+| C++            | `cpp`  | Zig        | 126.5 KB | 150.5 KB | 143.0 KB |
+| C++            | `cpp`  | MSBuild    | 129.5 KB | 152.5 KB | 133.0 KB |
+| Rust           | `rust` | Cargo      | 118.5 KB | 137.0 KB | 133.0 KB |
 | Zig            | `zig`  | Zig        |  90.0 KB |  77.5 KB |  27.0 KB |
 
 `impl` is the token reported by self-description. Sizes are the current build output.

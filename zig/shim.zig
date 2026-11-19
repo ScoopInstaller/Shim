@@ -623,9 +623,9 @@ fn parseShimLine(line: []const WCHAR, out: *ShimLine) LineKind {
 }
 
 /// Returns the *directory* portion (trailing backslash), not the resolved path.
-fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir: []const WCHAR) ![]WCHAR {
+fn resolveAgainstBase(allocator: std.mem.Allocator, path: [:0]const WCHAR, baseDir: []const WCHAR) ![]WCHAR {
     const is_absolute = (path.len >= 2 and path[1] == ':') or (path.len > 0 and (path[0] == '\\' or path[0] == '/'));
-    var toResolve: []const WCHAR = undefined;
+    var toResolve: [:0]const WCHAR = undefined;
     if (is_absolute) {
         toResolve = path;
     } else {
@@ -637,35 +637,11 @@ fn resolveAgainstBase(allocator: std.mem.Allocator, path: []const WCHAR, baseDir
         buf[combined_len] = 0;
         toResolve = buf[0..combined_len :0];
     }
-    var stack_buf: [windows.MAX_PATH + 2:0]WCHAR = undefined;
-    var file_part: ?*WCHAR = null;
-    var len = GetFullPathNameW(@ptrCast(toResolve.ptr), stack_buf.len, &stack_buf, &file_part);
-    if (len == 0) return try fallbackDir(allocator, toResolve, GetLastError());
 
-    var big: []WCHAR = undefined;
-    const resolved_buf: []const WCHAR = if (len < stack_buf.len) stack_buf[0..len] else blk: {
-        // Overflow: len is the required size, including the null terminator.
-        const required = len + 1;
-        big = try allocator.alloc(WCHAR, required);
-        file_part = null;
-        // Plain pointer: big holds no sentinel at [required]; the null the API
-        // writes lands at [required - 1], so a [:0] slice here would be invalid.
-        len = GetFullPathNameW(@ptrCast(toResolve.ptr), required, @ptrCast(big.ptr), &file_part);
-        if (len == 0 or len >= required) return try fallbackDir(allocator, toResolve, GetLastError());
-        break :blk big[0..len];
+    return switch (try resolveFullPath(allocator, toResolve)) {
+        .path => |full| try directoryOf(allocator, full),
+        .failed => |err| try fallbackDir(allocator, toResolve, err),
     };
-
-    const dir_len = if (file_part) |fp|
-        (@intFromPtr(fp) - @intFromPtr(resolved_buf.ptr)) / @sizeOf(WCHAR)
-    else
-        len;
-    if (dir_len > 0 and (resolved_buf[dir_len - 1] == '\\' or resolved_buf[dir_len - 1] == '/')) {
-        return try allocator.dupe(WCHAR, resolved_buf[0..dir_len]);
-    }
-    const result = try allocator.alloc(WCHAR, dir_len + 1);
-    @memcpy(result[0..dir_len], resolved_buf[0..dir_len]);
-    result[dir_len] = '\\';
-    return result;
 }
 
 /// Fallback after GetFullPathNameW fails: drop the last component, so %~dp0 is a directory.
@@ -735,18 +711,50 @@ fn isFile(path_z: [:0]const WCHAR) bool {
     return attrs != invalid_file_attributes and (attrs & file_attribute_directory) == 0;
 }
 
+const ResolvedPath = union(enum) {
+    path: []WCHAR,
+    failed: DWORD,
+};
+
+/// One growth path per lane: the size is known only after a failed call, and the
+/// error is kept for the caller's diagnostic.
+fn resolveFullPath(allocator: std.mem.Allocator, toResolve: [:0]const WCHAR) !ResolvedPath {
+    var stack: [windows.MAX_PATH + 2:0]WCHAR = undefined;
+    var len = GetFullPathNameW(@ptrCast(toResolve.ptr), stack.len, &stack, null);
+    if (len == 0) return .{ .failed = GetLastError() };
+    if (len < stack.len) return .{ .path = try allocator.dupe(WCHAR, stack[0..len]) };
+
+    // Overflow: len is the required size, including the null terminator.
+    const required = len + 1;
+    const big = try allocator.alloc(WCHAR, required);
+    len = GetFullPathNameW(@ptrCast(toResolve.ptr), required, @ptrCast(big.ptr), null);
+    if (len == 0 or len >= required) return .{ .failed = GetLastError() };
+    return .{ .path = big[0..len] };
+}
+
+/// Directory portion with a trailing separator; a value with none yields `\`, as before.
+fn directoryOf(allocator: std.mem.Allocator, full: []const WCHAR) ![]WCHAR {
+    const bs = std.mem.lastIndexOfScalar(WCHAR, full, '\\');
+    const fs = std.mem.lastIndexOfScalar(WCHAR, full, '/');
+    const sep: ?usize = if (bs == null) fs else if (fs == null) bs else if (bs.? > fs.?) bs else fs;
+
+    if (sep) |i| {
+        if (i + 1 == full.len) return try allocator.dupe(WCHAR, full);
+        return try allocator.dupe(WCHAR, full[0 .. i + 1]);
+    }
+    const result = try allocator.alloc(WCHAR, full.len + 1);
+    @memcpy(result[0..full.len], full);
+    result[full.len] = '\\';
+    return result;
+}
+
 /// Absolute form of a value with its own separators; an unresolved value passes
 /// through so the launch reports the error.
 fn absolutePath(allocator: std.mem.Allocator, path: [:0]const WCHAR) ![:0]WCHAR {
-    var stack: [windows.MAX_PATH + 2:0]WCHAR = undefined;
-    var len = GetFullPathNameW(path.ptr, stack.len, &stack, null);
-    if (len == 0) return try dupeZ(allocator, path);
-    if (len < stack.len) return try dupeZ(allocator, stack[0..len]);
-
-    const big = try allocator.alloc(WCHAR, len + 1);
-    len = GetFullPathNameW(path.ptr, @intCast(big.len), @ptrCast(big.ptr), null);
-    if (len == 0 or len >= big.len) return try dupeZ(allocator, path);
-    return big[0..len :0];
+    return switch (try resolveFullPath(allocator, path)) {
+        .path => |full| try dupeZ(allocator, full),
+        .failed => try dupeZ(allocator, path),
+    };
 }
 
 fn findInDir(allocator: std.mem.Allocator, dir: []const WCHAR, name: []const WCHAR, exts: []const []const WCHAR) !?[:0]WCHAR {

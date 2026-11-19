@@ -461,26 +461,10 @@ namespace Scoop
 
             string toResolve = rooted ? path : baseDir + "\\" + path;
 
-            int cap = 260;
-            for (; ; )
-            {
-                var sb = new StringBuilder(cap);
-                uint len = GetFullPathNameW(toResolve, (uint)sb.Capacity, sb, IntPtr.Zero);
-                if (len == 0)
-                    return ResolveFailedDir(toResolve, (uint)Marshal.GetLastWin32Error());
-                if (len >= sb.Capacity)
-                {
-                    cap = (int)len + 1; // required size returned on overflow
-                    continue;
-                }
-
-                var fullPath = sb.ToString(0, (int)len);
-                int dirLen = fullPath.LastIndexOf('\\');
-                if (dirLen < 0) dirLen = fullPath.LastIndexOf('/');
-                if (dirLen < 0) return fullPath + "\\";
-                if (dirLen + 1 == fullPath.Length) return fullPath;
-                return fullPath.Substring(0, dirLen + 1);
-            }
+            var resolved = ResolveFullPath(toResolve, out uint error);
+            if (resolved == null)
+                return ResolveFailedDir(toResolve, error);
+            return DirectoryOf(resolved);
         }
 
         // A variable that is absent or empty yields null: the shim treats both as unset.
@@ -492,12 +476,25 @@ namespace Scoop
 
         static string AbsolutePathName(string path)
         {
+            var resolved = ResolveFullPath(path, out _);
+            return resolved ?? path; // as written, so the launch reports the error
+        }
+
+        // One growth path per lane: the size is known only after a failed call, and the
+        // error is kept for the caller's diagnostic.
+        static string? ResolveFullPath(string toResolve, out uint error)
+        {
+            error = 0;
             int cap = 260;
             for (; ; )
             {
                 var sb = new StringBuilder(cap);
-                uint len = GetFullPathNameW(path, (uint)sb.Capacity, sb, IntPtr.Zero);
-                if (len == 0) return path; // as written, so the launch reports the error
+                uint len = GetFullPathNameW(toResolve, (uint)sb.Capacity, sb, IntPtr.Zero);
+                if (len == 0)
+                {
+                    error = (uint)Marshal.GetLastWin32Error();
+                    return null;
+                }
                 if (len >= sb.Capacity)
                 {
                     cap = (int)len + 1; // required size returned on overflow
@@ -505,6 +502,16 @@ namespace Scoop
                 }
                 return sb.ToString(0, (int)len);
             }
+        }
+
+        // Directory portion with a trailing separator; a value with none yields `\`, as before.
+        static string DirectoryOf(string fullPath)
+        {
+            int dirLen = fullPath.LastIndexOf('\\');
+            if (dirLen < 0) dirLen = fullPath.LastIndexOf('/');
+            if (dirLen < 0) return fullPath + "\\";
+            if (dirLen + 1 == fullPath.Length) return fullPath;
+            return fullPath.Substring(0, dirLen + 1);
         }
 
         // Static: a bare-name launch must not allocate a table per call.
