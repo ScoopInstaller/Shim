@@ -194,7 +194,7 @@ If `expand` is not advertised, `%VAR%` is literal.
 When advertised, `%~dp0` expands to a directory with a trailing backslash, at every occurrence:
 
 - in `path`: the shim's own directory;
-- in `args`, `cwd`, and environment-override values: the target executable's directory.
+- in `args`, `cwd`, and environment-override values: the target executable's directory; for a bare `path`, the directory the name resolved into (§2.3).
 
 `args` is the one field that expands `%~dp0` but not `%VAR%`.
 

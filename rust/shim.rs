@@ -69,6 +69,8 @@ const DIR_PLACEHOLDER: &str = "%~dp0";
 #[derive(Default)]
 struct ShimInfo {
     path: Option<String>,
+    /// The absolute target `path` resolved to; None when a bare name was not found.
+    resolved: Option<OsString>,
     args: Vec<OsString>,
     cwd: Option<String>,
     env: Vec<(String, String, bool)>,
@@ -178,10 +180,11 @@ fn write_error_ctx(context: &str, err: u32) {
 }
 
 fn to_wide_null(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+    to_wide_null_os(OsStr::new(s))
+}
+
+fn to_wide_null_os(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -464,6 +467,7 @@ fn resolve_failed_dir(to_resolve: &[u16], err: u32) -> String {
     dir
 }
 
+// Returns the directory portion (trailing backslash) of the absolute form of `path`.
 /// True when `wide` is null-terminated and names a file rather than a directory.
 fn is_file(wide: &[u16]) -> bool {
     let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
@@ -536,7 +540,7 @@ fn unquote(wide: &[u16]) -> &[u16] {
     wide
 }
 
-fn find_in_dir(dir: &[u16], name: &str, extensions: &[&str]) -> Option<String> {
+fn find_in_dir(dir: &[u16], name: &str, extensions: &[&str]) -> Option<OsString> {
     let name_w = to_wide(name);
     for ext in extensions {
         let mut candidate = Vec::with_capacity(dir.len() + name_w.len() + 6);
@@ -551,7 +555,9 @@ fn find_in_dir(dir: &[u16], name: &str, extensions: &[&str]) -> Option<String> {
         candidate.extend_from_slice(&to_wide(ext));
         candidate.push(0);
         if is_file(&candidate) {
-            return Some(String::from_utf16_lossy(&absolute(
+            // Absolute, and never lossy: CreateProcessW receives this name verbatim, so a
+            // directory entry that is not valid Unicode must survive the round trip.
+            return Some(OsString::from_wide(&absolute(
                 &candidate[..candidate.len() - 1],
             )));
         }
@@ -562,15 +568,15 @@ fn find_in_dir(dir: &[u16], name: &str, extensions: &[&str]) -> Option<String> {
 /// Resolve `path` the way the shell does: a bare name is searched in the current
 /// directory and then PATH. CreateProcessW's own order puts the system directories
 /// ahead of PATH, which silently changes the target the caller asked for.
-fn resolve_target(path: &str) -> Option<String> {
+fn resolve_target(path: &str) -> Option<OsString> {
     let mut chars = path.chars();
     let _ = chars.next();
     if chars.next() == Some(':') {
-        return Some(path.to_string());
+        return Some(OsString::from(path));
     }
 
     if path.contains(['\\', '/']) {
-        return Some(String::from_utf16_lossy(&absolute(&to_wide(path))));
+        return Some(OsString::from_wide(&absolute(&to_wide(path))));
     }
 
     // A name that already carries an extension is used as written, as cmd does.
@@ -581,12 +587,12 @@ fn resolve_target(path: &str) -> Option<String> {
     };
 
     // The variable counts only when it has a value, as in the other lanes.
-    if env_wide("NoDefaultCurrentDirectoryInExePath").is_none() {
-        // "." absolutised is the working directory, so no second API is needed.
-        let cwd = absolute(&to_wide("."));
-        if let Some(hit) = find_in_dir(&cwd, path, extensions) {
-            return Some(hit);
-        }
+    let skip_cwd = env_wide("NoDefaultCurrentDirectoryInExePath").is_some();
+
+    // "." absolutised is the working directory, so no second API is needed.
+    let cwd = absolute(&to_wide("."));
+    if !skip_cwd && let Some(hit) = find_in_dir(&cwd, path, extensions) {
+        return Some(hit);
     }
 
     if let Some(path_value) = env_wide("PATH") {
@@ -844,6 +850,7 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
     // the last path to absolute so pass 2 can expand %~dp0 against the right base.
     // A path value may itself use %~dp0, which there refers to the shim's own directory.
     let mut target_dir = cur_dir.to_string();
+    let mut resolved_target: Option<OsString> = None;
     for line in &all_lines {
         let Ok(Some((key, value))) = parse_shim_line(line) else {
             continue;
@@ -854,8 +861,13 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str, shim_wide: &[u16]) -> ShimInf
         let mut path_val = value.to_string();
         normalize_args_str(&mut path_val, cur_dir);
         let expanded = expand_and_strip_quotes(&path_val);
-        target_dir = resolve_against_base(&expanded, cur_dir);
+        resolved_target = resolve_target(&expanded);
+        let resolved_str = resolved_target
+            .as_ref()
+            .map(|s| s.to_string_lossy().into_owned());
+        target_dir = resolve_against_base(resolved_str.as_deref().unwrap_or(&expanded), cur_dir);
     }
+    info.resolved = resolved_target;
 
     for line in &all_lines {
         let Ok(Some((key, value))) = parse_shim_line(line) else {
@@ -1037,14 +1049,15 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         set_env(key, value);
     }
 
-    // Resolved last: a bare name sees the PATH this process is about to hand the child.
-    let resolved = resolve_target(raw_path);
-    let path: &str = resolved.as_deref().unwrap_or(raw_path);
+    let path_os: &OsStr = match &info.resolved {
+        Some(resolved) => resolved.as_os_str(),
+        None => OsStr::new(raw_path),
+    };
 
     // Keep the command line in UTF-16 end to end: quote_arg already preserves
     // unpaired surrogates, so a lossy round-trip here would destroy them.
     let mut cmd = {
-        let mut c = quote_arg(OsStr::new(path));
+        let mut c = quote_arg(path_os);
         for arg in &info.args {
             c.push(b' ' as u16);
             c.extend_from_slice(&quote_arg(arg));
@@ -1052,10 +1065,10 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         c.push(0);
         c
     };
-    let path_w = to_wide_null(path);
+    let path_w = to_wide_null_os(path_os);
 
     // A bare name that was not found is a launch failure, not a wider search.
-    if resolved.is_none() {
+    if info.resolved.is_none() {
         write_error_wide(&to_wide("Shim: Could not create process with command '"));
         write_error_wide(&to_wide(&String::from_utf16_lossy(&cmd[..cmd.len() - 1])));
         write_error_wide(&to_wide("'"));

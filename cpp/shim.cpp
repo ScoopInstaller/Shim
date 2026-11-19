@@ -9,6 +9,7 @@
 #include <array>
 #include <cwchar>
 #include <memory>
+#include <span>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -81,6 +82,8 @@ using UniqueHandle = std::unique_ptr<HANDLE, HandleDeleter>;
 struct ShimInfo
 {
     std::optional<std::wstring> path;
+    // The absolute target `path` resolved to; empty when a bare name was not found.
+    std::optional<std::wstring> resolved;
     std::vector<std::wstring> args;
     std::optional<std::wstring> cwd;
     EnvAssignmentList env;
@@ -571,18 +574,20 @@ constexpr DWORD c_invalidFileAttributes = 0xFFFFFFFF;
     return s;
 }
 
-[[nodiscard]] std::optional<std::wstring> FindInDir(const std::wstring& dir, const std::wstring& name, const std::vector<std::wstring>& extensions)
+[[nodiscard]] std::optional<std::wstring> FindInDir(const std::wstring& dir, const std::wstring& name, std::span<const std::wstring_view> extensions)
 {
     const bool hasSeparator = !dir.empty() && (dir.back() == L'\\' || dir.back() == L'/');
-    for (const auto& ext : extensions)
+    for (const auto ext : extensions)
     {
         std::wstring candidate = dir;
         if (!hasSeparator)
             candidate.push_back(L'\\');
         candidate += name;
         candidate += ext;
+        // Absolute before return: a relative hit would otherwise be re-resolved by
+        // CreateProcessW, and %~dp0 would anchor it to the shims directory.
         if (IsExistingFile(candidate))
-            return candidate;
+            return AbsolutePathName(candidate);
     }
     return std::nullopt;
 }
@@ -600,8 +605,10 @@ constexpr DWORD c_invalidFileAttributes = 0xFFFFFFFF;
         return AbsolutePathName(path);
 
     // A name that already carries an extension is used as written, as cmd does.
-    const std::vector<std::wstring> extensions =
-        path.find(L'.') != std::wstring::npos ? std::vector<std::wstring> {L""} : std::vector<std::wstring> {L".com", L".exe"};
+    constexpr std::array<std::wstring_view, 2> c_comThenExe {L".com", L".exe"};
+    constexpr std::array<std::wstring_view, 1> c_asWritten {L""};
+    const std::span<const std::wstring_view> extensions =
+        path.find(L'.') != std::wstring::npos ? std::span<const std::wstring_view> {c_asWritten} : std::span<const std::wstring_view> {c_comThenExe};
 
     if (!EnvValue(L"NoDefaultCurrentDirectoryInExePath").has_value())
     {
@@ -872,6 +879,7 @@ enum class LineKind
     // the last path to absolute so pass 2 can expand %~dp0 against the right base.
     // A path value may itself use %~dp0, which there refers to the shim's own directory.
     std::wstring targetDir {curDir};
+    std::optional<std::wstring> resolvedTarget;
     for (const auto& rawLine : decoded)
     {
         std::pair<std::wstring_view, std::wstring_view> field;
@@ -881,10 +889,12 @@ enum class LineKind
         std::wstring pathVal(field.second);
         NormalizeArgsInPlace(pathVal, curDir);
         std::wstring expanded = ExpandAndUnquote(pathVal);
-        targetDir = ResolveAgainstBase(expanded, curDir);
+        resolvedTarget = ResolveTarget(expanded);
+        targetDir = ResolveAgainstBase(resolvedTarget.value_or(expanded), curDir);
     }
 
     ShimInfo info;
+    info.resolved = resolvedTarget;
     for (const auto& rawLine : decoded)
     {
         std::pair<std::wstring_view, std::wstring_view> field;
@@ -1049,13 +1059,12 @@ enum class LineKind
         setEnv(env.name, env.value);
     }
 
-    const std::optional<std::wstring> resolved = ResolveTarget(*info.path);
-    const std::wstring& path = resolved ? *resolved : *info.path;
+    const std::wstring& path = info.resolved ? *info.resolved : *info.path;
     const auto* cwd = info.cwd ? info.cwd->c_str() : nullptr;
     std::wstring cmd = BuildCommandLine(path, info.args);
 
     // A bare name that was not found is a launch failure, not a wider search.
-    if (!resolved)
+    if (!info.resolved)
     {
         std::wstring msg = L"Shim: Could not create process with command '";
         msg += cmd;

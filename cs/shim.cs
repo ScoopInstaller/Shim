@@ -274,6 +274,7 @@ namespace Scoop
         class ShimInfo
         {
             public string? Path;
+            public string? Resolved; // absolute target; null when a bare name was not found
             public List<string> Args = new List<string>();
             public string? Cwd;
             public bool Elevate;
@@ -506,13 +507,19 @@ namespace Scoop
             }
         }
 
+        // Static: a bare-name launch must not allocate a table per call.
+        static readonly string[] AsWritten = { "" };
+        static readonly string[] ComThenExe = { ".com", ".exe" };
+
         static string? FindInDir(string dir, string name, string[] extensions)
         {
             bool hasSeparator = dir.EndsWith("\\") || dir.EndsWith("/");
             foreach (var ext in extensions)
             {
                 string candidate = hasSeparator ? dir + name + ext : dir + "\\" + name + ext;
-                if (File.Exists(candidate)) return candidate;
+                // Absolute before return: a relative hit would otherwise be re-resolved by
+                // CreateProcessW, and %~dp0 would anchor it to the shims directory.
+                if (File.Exists(candidate)) return AbsolutePathName(candidate);
             }
             return null;
         }
@@ -530,10 +537,10 @@ namespace Scoop
         static string? ResolveTarget(string path)
         {
             if (path.Length >= 2 && path[1] == ':') return path;
-            if (path.IndexOfAny(new[] { '\\', '/' }) >= 0) return AbsolutePathName(path);
+            if (path.IndexOf('\\') >= 0 || path.IndexOf('/') >= 0) return AbsolutePathName(path);
 
             // A name that already carries an extension is used as written, as cmd does.
-            string[] extensions = path.Contains('.') ? new[] { "" } : new[] { ".com", ".exe" };
+            string[] extensions = path.Contains('.') ? AsWritten : ComThenExe;
 
             if (EnvValue("NoDefaultCurrentDirectoryInExePath") == null)
             {
@@ -929,16 +936,19 @@ namespace Scoop
             // %~dp0 means the *target* exe directory, not the shim's own. Pass 1 resolves
             // the last path to absolute so pass 2 can expand %~dp0 against the right base.
             var targetDir = dir;
+            string? resolvedTarget = null;
             foreach (var rawLine in lines)
             {
                 if (ParseShimLine(rawLine, out var key, out var value) != LineKind.Field || !IsKey(key, "path"))
                     continue;
 
                 var expanded = ExpandAndUnquote(NormalizeArgs(value!, dir));
-                targetDir = ResolveAgainstBase(expanded, dir);
+                resolvedTarget = ResolveTarget(expanded);
+                targetDir = ResolveAgainstBase(resolvedTarget ?? expanded, dir);
             }
 
             var info = new ShimInfo();
+            info.Resolved = resolvedTarget;
 
             foreach (var rawLine in lines)
             {
@@ -1018,13 +1028,12 @@ namespace Scoop
                 SetEnv(env.Name, env.Value);
             }
 
-            string? resolved = ResolveTarget(info.Path!);
-            string path = resolved ?? info.Path!;
+            string path = info.Resolved ?? info.Path!;
 
             string cmd = BuildCommandLine(path, info.Args);
 
             // A bare name that was not found is a launch failure, not a wider search.
-            if (resolved == null)
+            if (info.Resolved == null)
             {
                 ReportShimError($"Could not create process with command '{cmd}'", ERROR_FILE_NOT_FOUND);
                 return 1;

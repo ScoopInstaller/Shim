@@ -583,6 +583,8 @@ fn expandEnvVarsAndUnquote(allocator: std.mem.Allocator, input: []const WCHAR) !
 
 const ShimInfo = struct {
     path: ?[:0]WCHAR = null,
+    /// The absolute target `path` resolved to; null when a bare name was not found.
+    resolved: ?[:0]WCHAR = null,
     args: std.ArrayListUnmanaged([]const WCHAR) = .empty,
     cwd: ?[:0]WCHAR = null,
     elevate: bool = false,
@@ -762,7 +764,9 @@ fn findInDir(allocator: std.mem.Allocator, dir: []const WCHAR, name: []const WCH
         @memcpy(buf[n .. n + ext.len], ext);
         n += ext.len;
         buf[n] = 0;
-        if (isFile(buf[0..n :0])) return buf[0..n :0];
+        // Absolute before return: a relative hit would otherwise be re-resolved by
+        // CreateProcessW, and %~dp0 would anchor it to the shims directory.
+        if (isFile(buf[0..n :0])) return try absolutePath(allocator, buf[0..n :0]);
     }
     return null;
 }
@@ -987,12 +991,15 @@ fn getShimInfo(allocator: std.mem.Allocator) !ShimInfo {
     // %~dp0 in other fields means the *target* exe directory; resolve the last
     // `path` to absolute first so later fields expand against the right base.
     var targetDir: []const WCHAR = cur_dir;
+    var resolvedTarget: ?[:0]WCHAR = null;
     for (lines.items) |l| {
         if (!eqlIgnoreCase(l.name, w("path"))) continue;
         const ex = try expandPlaceholder(allocator, l.value, cur_dir);
         const ex2 = try expandEnvVarsAndUnquote(allocator, ex);
-        targetDir = try resolveAgainstBase(allocator, ex2, cur_dir);
+        resolvedTarget = try resolveTarget(allocator, ex2);
+        targetDir = try resolveAgainstBase(allocator, resolvedTarget orelse ex2, cur_dir);
     }
+    info.resolved = resolvedTarget;
 
     for (lines.items) |l| {
         const name = l.name;
@@ -1142,9 +1149,7 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
         setEnvValue(name_z[0..ev.name.len :0], ev.name, ev.value);
     }
 
-    // Resolved last: a bare name sees the PATH this process is about to hand the child.
-    const resolved = try resolveTarget(allocator, raw_path);
-    const path: [:0]WCHAR = resolved orelse raw_path;
+    const path: [:0]WCHAR = info.resolved orelse raw_path;
 
     var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
     si.cb = @sizeOf(windows.STARTUPINFOW);
@@ -1169,7 +1174,7 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     const cmd: [:0]WCHAR = cmd_buf[0..cmd_len :0];
 
     // A bare name that was not found is a launch failure, not a wider search.
-    if (resolved == null) {
+    if (info.resolved == null) {
         writeError("Shim: Could not create process with command '");
         writeErrorUtf8(cmd);
         writeError("'");
