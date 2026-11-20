@@ -1094,12 +1094,14 @@ try {
     }
     function Wait-OrphanGone {
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        while ((Get-OrphanCount) -gt 0 -and $clock.ElapsedMilliseconds -lt 5000) { }
+        while ((Get-OrphanCount) -gt 0 -and $clock.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 10 }
         (Get-OrphanCount) -eq 0
     }
     # KILL_ON_JOB_CLOSE ends the job's processes asynchronously once the shim's handle closes,
-    # so each timed launch waits for its child to be gone. That kill lands just after the child
-    # appears, inside the window itself, so a child that outlives it already fails the test.
+    # so every count waits for the children to be gone first. Each timed launch is killed just
+    # after its child appears, inside the window itself, so a child that outlives it already
+    # fails the test. Wait-OrphanCreated and the kill delay spin rather than sleep, because a
+    # sleep's granularity is as coarse as the launch times they measure and sweep.
     $launchMs = [System.Collections.Generic.List[long]]::new()
     $outlived = $false
     while ($launchMs.Count -lt 5 -and -not $outlived) {
@@ -1121,7 +1123,7 @@ try {
             while ($delay.ElapsedMilliseconds -lt $delayMs) { }
             Stop-OrphanShim $shim
         }
-        Start-Sleep -Seconds 1
+        $null = Wait-OrphanGone
         $survivors = Get-OrphanCount
         Write-TestResult $testName ($survivors -eq 0) "Survivors after $launches launches killed at 0-$sweepToMs ms (child created after $($launchMs -join ', ') ms): $survivors"
     }
