@@ -7,6 +7,7 @@
 #include <shellapi.h>
 
 #include <array>
+#include <cstddef>
 #include <cwchar>
 #include <memory>
 #include <span>
@@ -17,6 +18,10 @@
 
 #ifndef ERROR_ELEVATION_REQUIRED
 #define ERROR_ELEVATION_REQUIRED 740
+#endif
+
+#ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
+#define PROC_THREAD_ATTRIBUTE_JOB_LIST 0x0002000D
 #endif
 
 using namespace std::string_view_literals;
@@ -1031,6 +1036,32 @@ enum class LineKind
     return result;
 }
 
+// A child created suspended and then assigned exists outside the job until the assignment,
+// and a shim killed in between leaves it suspended forever. The job-list attribute creates it
+// inside the job instead. False when the attribute is unsupported (before Windows 10 1607)
+// or the create fails, so the caller falls back to assigning, which reports either cause.
+[[nodiscard]] bool CreateProcessInJob(wchar_t* cmd, DWORD creationFlags, const wchar_t* cwd, const STARTUPINFOW& si, HANDLE jobHandle, PROCESS_INFORMATION& pi)
+{
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<std::byte> buffer(size);
+    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &size)) [[unlikely]]
+        return false;
+
+    bool created = false;
+    if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobHandle, sizeof(jobHandle), nullptr, nullptr)) [[likely]]
+    {
+        STARTUPINFOEXW siex {};
+        siex.StartupInfo = si;
+        siex.StartupInfo.cb = sizeof(siex);
+        siex.lpAttributeList = attributes;
+        created = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, creationFlags | EXTENDED_STARTUPINFO_PRESENT, nullptr, cwd, &siex.StartupInfo, &pi);
+    }
+    DeleteProcThreadAttributeList(attributes);
+    return created;
+}
+
 [[nodiscard]] ProcessResult MakeProcess(const ShimInfo& info, HANDLE jobHandle)
 {
     ProcessResult result;
@@ -1086,9 +1117,8 @@ enum class LineKind
 
     PROCESS_INFORMATION pi {};
 
-    // SUSPENDED: the child must join the job object before it can spawn its own children.
     DWORD consolePid = 0;
-    DWORD creationFlags = CREATE_SUSPENDED;
+    DWORD creationFlags = 0;
 
     // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
     // Without the flag a console target gets a fresh windowed console; the flag is right
@@ -1101,7 +1131,15 @@ enum class LineKind
             creationFlags |= CREATE_NO_WINDOW;
     }
 
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, creationFlags, nullptr, cwd, &si, &pi)) [[likely]]
+    if (jobHandle && CreateProcessInJob(cmd.data(), creationFlags, cwd, si, jobHandle, pi)) [[likely]]
+    {
+        result.thread.reset(pi.hThread);
+        result.process.reset(pi.hProcess);
+        return result;
+    }
+
+    // SUSPENDED: the child must join the job object before it can spawn its own children.
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, creationFlags | CREATE_SUSPENDED, nullptr, cwd, &si, &pi))
     {
         result.thread.reset(pi.hThread);
         result.process.reset(pi.hProcess);

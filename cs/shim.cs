@@ -36,6 +36,13 @@ namespace Scoop
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        struct STARTUPINFOEX
+        {
+            public STARTUPINFO StartupInfo;
+            public IntPtr lpAttributeList;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         struct PROCESS_INFORMATION
         {
             public IntPtr hProcess, hThread;
@@ -97,6 +104,28 @@ namespace Scoop
             IntPtr lpEnvironment, string? lpCurrentDirectory,
             ref STARTUPINFO lpStartupInfo,
             out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CreateProcessExW(
+            string? lpApplicationName, StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
+            bool bInheritHandles, uint dwCreationFlags,
+            IntPtr lpEnvironment, string? lpCurrentDirectory,
+            ref STARTUPINFOEX lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool UpdateProcThreadAttribute(
+            IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute,
+            IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
+
+        [DllImport("kernel32.dll")]
+        static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
@@ -225,6 +254,8 @@ namespace Scoop
 
         const uint CREATE_SUSPENDED = 0x00000004;
         const uint CREATE_NO_WINDOW = 0x08000000;
+        const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        const int PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D;
         const uint INFINITE = 0xFFFFFFFF;
         const uint WAIT_OBJECT_0 = 0x00000000;
         const uint SEE_MASK_NOCLOSEPROCESS = 0x00000040;
@@ -1023,6 +1054,44 @@ namespace Scoop
             }
         }
 
+        // A child created suspended and then assigned exists outside the job until the assignment,
+        // and a shim killed in between leaves it suspended forever. The job-list attribute creates it
+        // inside the job instead. False when the attribute is unsupported (before Windows 10 1607)
+        // or the create fails, so the caller falls back to assigning, which reports either cause.
+        static bool CreateProcessInJob(string cmd, uint creationFlags, string? cwd, STARTUPINFO si, IntPtr jobHandle, out PROCESS_INFORMATION pi)
+        {
+            pi = default;
+            IntPtr size = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+            IntPtr attributes = Marshal.AllocHGlobal(size);
+            IntPtr jobList = Marshal.AllocHGlobal(IntPtr.Size);
+            try
+            {
+                if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref size)) return false;
+                try
+                {
+                    Marshal.WriteIntPtr(jobList, jobHandle);
+                    if (!UpdateProcThreadAttribute(attributes, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                        jobList, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                        return false;
+                    var siex = new STARTUPINFOEX { StartupInfo = si, lpAttributeList = attributes };
+                    siex.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                    return CreateProcessExW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
+                        true, creationFlags | EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, cwd,
+                        ref siex, out pi);
+                }
+                finally
+                {
+                    DeleteProcThreadAttributeList(attributes);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(jobList);
+                Marshal.FreeHGlobal(attributes);
+            }
+        }
+
         static int LaunchProcess(ShimInfo info, IntPtr jobHandle)
         {
             foreach (var env in info.Env)
@@ -1063,7 +1132,7 @@ namespace Scoop
             // Without the flag a console target gets a fresh windowed console; the flag is right
             // only when the creator owns the output -- otherwise it needs a console of its own.
             uint consolePid = 0;
-            uint creationFlags = CREATE_SUSPENDED;
+            uint creationFlags = 0;
             if (GetConsoleProcessList(ref consolePid, 1) == 0)
             {
                 IntPtr shimOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1073,8 +1142,15 @@ namespace Scoop
                     creationFlags |= CREATE_NO_WINDOW;
             }
 
+            if (jobHandle != IntPtr.Zero && CreateProcessInJob(cmd, creationFlags, info.Cwd, si, jobHandle, out pi))
+            {
+                CloseHandle(pi.hThread);
+                return WaitAndGetExitCode(pi.hProcess);
+            }
+
+            // SUSPENDED: the child must join the job object before it can spawn its own children.
             if (CreateProcessW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
-                true, creationFlags, IntPtr.Zero, info.Cwd,
+                true, creationFlags | CREATE_SUSPENDED, IntPtr.Zero, info.Cwd,
                 ref si, out pi))
             {
                 if (jobHandle != IntPtr.Zero)

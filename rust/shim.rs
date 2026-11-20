@@ -31,9 +31,12 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, GetStartupInfoW,
-    INFINITE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
-    TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetStartupInfoW, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
     CommandLineToArgvW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -1009,6 +1012,63 @@ fn set_env(key: &str, value: &str) {
     }
 }
 
+// A child created suspended and then assigned exists outside the job until the assignment,
+// and a shim killed in between leaves it suspended forever. The job-list attribute creates it
+// inside the job instead. False when the attribute is unsupported (before Windows 10 1607)
+// or the create fails, so the caller falls back to assigning, which reports either cause.
+fn create_process_in_job(
+    cmd: &mut [u16],
+    creation_flags: PROCESS_CREATION_FLAGS,
+    cwd: *const u16,
+    si: &STARTUPINFOW,
+    job_handle: HANDLE,
+    pi: &mut PROCESS_INFORMATION,
+) -> bool {
+    let mut size: usize = 0;
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+    // usize elements keep the list pointer-aligned.
+    let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+    let attributes: LPPROC_THREAD_ATTRIBUTE_LIST = buffer.as_mut_ptr().cast();
+    if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) } == 0 {
+        return false;
+    }
+
+    let mut created = false;
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            (&job_handle as *const HANDLE).cast(),
+            std::mem::size_of::<HANDLE>(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        let mut siex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        siex.StartupInfo = *si;
+        siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        siex.lpAttributeList = attributes;
+        created = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                creation_flags | EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                cwd,
+                &siex.StartupInfo,
+                pi,
+            )
+        } != 0;
+    }
+    unsafe { DeleteProcThreadAttributeList(attributes) };
+    created
+}
+
 fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     let raw_path = match &info.path {
         Some(p) => p,
@@ -1072,14 +1132,13 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         return launch_elevated(path_w.as_slice(), &params, cwd_w.as_deref(), job_handle);
     }
 
-    // SUSPENDED: the child must join the job object before it can spawn its own children.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
     // Without the flag a console target gets a fresh windowed console; the flag is right
     // only when the creator owns the output -- otherwise it needs a console of its own.
     // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
     let mut console_pid: u32 = 0;
-    let mut creation_flags = CREATE_SUSPENDED;
+    let mut creation_flags = 0;
     let stdout: HANDLE = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let creator_owns_output = si.dwFlags & STARTF_USESTDHANDLES != 0
         || (stdout != NULL_HANDLE && stdout != INVALID_HANDLE);
@@ -1087,6 +1146,13 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         creation_flags |= CREATE_NO_WINDOW;
     }
 
+    if job_handle != NULL_HANDLE
+        && create_process_in_job(&mut cmd, creation_flags, cwd_ptr, &si, job_handle, &mut pi)
+    {
+        return (pi.hProcess, pi.hThread);
+    }
+
+    // SUSPENDED: the child must join the job object before it can spawn its own children.
     if unsafe {
         CreateProcessW(
             std::ptr::null(),
@@ -1094,7 +1160,7 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            creation_flags,
+            creation_flags | CREATE_SUSPENDED,
             std::ptr::null(),
             cwd_ptr,
             &si,
