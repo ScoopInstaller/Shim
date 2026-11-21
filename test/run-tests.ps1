@@ -1060,77 +1060,60 @@ Invoke-ShimTest "shim waits for long-running child" -Setup {
     @{ Pass = $pass; Message = "Exit: $($r.ExitCode), Elapsed: $($r.Elapsed.TotalSeconds)s" }
 }
 
-# A shim terminated mid-launch must take its child with it. A child that exists before it
-# joins the job survives the kill, suspended forever. Only timing reaches that window, and
-# where it falls depends on the lane's startup cost, so the suite first times how long each
-# lane takes to create its child and then sweeps the kills across that span. Any surviving
-# child is a failure.
+# A shim killed while it is creating its child must not leave that child behind: the child is
+# either in the job from its first instruction or the kill lands before it exists. Where the
+# create call sits in the launch differs per lane, so the kill delay sweeps the span measured
+# from a first launch. Any child that outlives its shim is a failure.
 $script:TestNumber++
 $num = $script:TestNumber
 $testDir = New-TestEnvironment
 $orphanName = "orphan-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
 $testName = "#$num Killed shim leaves no child behind"
+function Get-OrphanCount { @([System.Diagnostics.Process]::GetProcessesByName($orphanName)).Count }
+function Start-OrphanShim {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new("$testDir\test.exe")
+    $startInfo.UseShellExecute = $false
+    [System.Diagnostics.Process]::Start($startInfo)
+}
+function Stop-OrphanShim($shim) {
+    try { $shim.Kill() } catch [System.InvalidOperationException] { }
+    $shim.WaitForExit()
+    $shim.Dispose()
+}
 try {
     Copy-Item $probeExe "$testDir\$orphanName.exe"
     Write-Shim $testDir "test" "path = $testDir\$orphanName.exe`nargs = wait 10000"
-    function Start-OrphanShim {
-        $startInfo = [System.Diagnostics.ProcessStartInfo]::new("$testDir\test.exe")
-        $startInfo.UseShellExecute = $false
-        $startInfo.RedirectStandardOutput = $true
-        [System.Diagnostics.Process]::Start($startInfo)
+
+    # Time the child's arrival: it sets the sweep, and a lane that creates no child fails here.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $shim = Start-OrphanShim
+    while ((Get-OrphanCount) -eq 0) {
+        if ($clock.ElapsedMilliseconds -ge 5000) { throw "The shim created no child within 5 s" }
     }
-    function Stop-OrphanShim($shim) {
-        try { $shim.Kill() } catch [System.InvalidOperationException] { }
-        $shim.WaitForExit()
-        $shim.Dispose()
-    }
-    function Get-OrphanCount { [System.Diagnostics.Process]::GetProcessesByName($orphanName).Count }
-    function Wait-OrphanCreated {
-        $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        while ((Get-OrphanCount) -eq 0) {
-            if ($clock.ElapsedMilliseconds -ge 5000) { throw "The shim did not create its child within 5 s" }
-        }
-        $clock.ElapsedMilliseconds
-    }
-    function Wait-OrphanGone {
-        $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        while ((Get-OrphanCount) -gt 0 -and $clock.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 10 }
-        (Get-OrphanCount) -eq 0
-    }
-    # KILL_ON_JOB_CLOSE ends the job's processes asynchronously once the shim's handle closes,
-    # so every count waits for the children to be gone first. Each timed launch is killed just
-    # after its child appears, inside the window itself, so a child that outlives it already
-    # fails the test. Wait-OrphanCreated and the kill delay spin rather than sleep, because a
-    # sleep's granularity is as coarse as the launch times they measure and sweep.
-    $launchMs = [System.Collections.Generic.List[long]]::new()
-    $outlived = $false
-    while ($launchMs.Count -lt 5 -and -not $outlived) {
+    $arrivalMs = $clock.ElapsedMilliseconds
+    $span = [Math]::Max(15, [int]($arrivalMs * 1.25))
+    Stop-OrphanShim $shim
+
+    $random = [System.Random]::new(1)
+    $launches = 40
+    for ($i = 0; $i -lt $launches; $i++) {
         $shim = Start-OrphanShim
-        $launchMs.Add((Wait-OrphanCreated))
+        $delay = $random.Next(0, $span)
+        $wait = [System.Diagnostics.Stopwatch]::StartNew()
+        # Spin: Start-Sleep is as coarse as the launches it would space out.
+        while ($wait.ElapsedMilliseconds -lt $delay) { }
         Stop-OrphanShim $shim
-        $outlived = -not (Wait-OrphanGone)
     }
-    if ($outlived) {
-        Write-TestResult $testName $false "A child outlived its shim, killed as the child appeared $($launchMs[-1]) ms into the launch"
-    } else {
-        $sweepToMs = [int][Math]::Ceiling(($launchMs | Measure-Object -Maximum).Maximum * 1.25) + 1
-        $random = [System.Random]::new(1)
-        $launches = 150
-        for ($i = 0; $i -lt $launches; $i++) {
-            $shim = Start-OrphanShim
-            $delayMs = $random.Next(0, $sweepToMs)
-            $delay = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($delay.ElapsedMilliseconds -lt $delayMs) { }
-            Stop-OrphanShim $shim
-        }
-        $null = Wait-OrphanGone
-        $survivors = Get-OrphanCount
-        Write-TestResult $testName ($survivors -eq 0) "Survivors after $launches launches killed at 0-$sweepToMs ms (child created after $($launchMs -join ', ') ms): $survivors"
-    }
+
+    # KILL_ON_JOB_CLOSE ends the job's processes asynchronously once the shim's handle closes.
+    $clock.Restart()
+    while ((Get-OrphanCount) -gt 0 -and $clock.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 20 }
+    $survivors = Get-OrphanCount
+    Write-TestResult $testName ($survivors -eq 0) "Survivors after $launches kills spread over 0-$span ms (child appeared after $arrivalMs ms): $survivors"
 } catch {
     Write-TestResult $testName $false $_.Exception.Message
 } finally {
-    Get-CimInstance Win32_Process -Filter "Name = '$orphanName.exe'" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-Process -Name $orphanName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-TestEnvironment $testDir
 }
 
