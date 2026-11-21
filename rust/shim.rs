@@ -34,9 +34,8 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetStartupInfoW, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
     CommandLineToArgvW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -1012,61 +1011,38 @@ fn set_env(key: &str, value: &str) {
     }
 }
 
-// A child created suspended and then assigned exists outside the job until the assignment,
-// and a shim killed in between leaves it suspended forever. The job-list attribute creates it
-// inside the job instead. False when the attribute is unsupported (before Windows 10 1607)
-// or the create fails, so the caller falls back to assigning, which reports either cause.
-fn create_process_in_job(
-    cmd: &mut [u16],
-    creation_flags: PROCESS_CREATION_FLAGS,
-    cwd: *const u16,
-    si: &STARTUPINFOW,
-    job_handle: HANDLE,
-    pi: &mut PROCESS_INFORMATION,
+// Member from creation, so a shim killed mid-launch cannot leave the child behind; false when
+// the platform has no such attribute, which is the only case that creates it suspended instead.
+fn attach_job_list(
+    siex: &mut STARTUPINFOEXW,
+    job_handle: &HANDLE,
+    storage: &mut Vec<usize>,
 ) -> bool {
     let mut size: usize = 0;
     unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
     // usize elements keep the list pointer-aligned.
-    let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
-    let attributes: LPPROC_THREAD_ATTRIBUTE_LIST = buffer.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) } == 0 {
-        return false;
-    }
-
-    let mut created = false;
-    if unsafe {
-        UpdateProcThreadAttribute(
+    storage.resize(size.div_ceil(std::mem::size_of::<usize>()), 0);
+    let attributes: LPPROC_THREAD_ATTRIBUTE_LIST = storage.as_mut_ptr().cast();
+    unsafe {
+        if InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) == 0 {
+            return false;
+        }
+        let attached = UpdateProcThreadAttribute(
             attributes,
             0,
             PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-            (&job_handle as *const HANDLE).cast(),
+            (job_handle as *const HANDLE).cast(),
             std::mem::size_of::<HANDLE>(),
             std::ptr::null_mut(),
             std::ptr::null(),
-        )
-    } != 0
-    {
-        let mut siex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-        siex.StartupInfo = *si;
-        siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        siex.lpAttributeList = attributes;
-        created = unsafe {
-            CreateProcessW(
-                std::ptr::null(),
-                cmd.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                creation_flags | EXTENDED_STARTUPINFO_PRESENT,
-                std::ptr::null(),
-                cwd,
-                &siex.StartupInfo,
-                pi,
-            )
-        } != 0;
+        ) != 0;
+        if attached {
+            siex.lpAttributeList = attributes;
+        } else {
+            DeleteProcThreadAttributeList(attributes);
+        }
+        attached
     }
-    unsafe { DeleteProcThreadAttributeList(attributes) };
-    created
 }
 
 fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
@@ -1146,57 +1122,74 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
         creation_flags |= CREATE_NO_WINDOW;
     }
 
-    if job_handle != NULL_HANDLE
-        && create_process_in_job(&mut cmd, creation_flags, cwd_ptr, &si, job_handle, &mut pi)
-    {
-        return (pi.hProcess, pi.hThread);
-    }
+    // SUSPENDED without the attribute only: then the child must join the job before it can spawn.
+    let mut siex = STARTUPINFOEXW {
+        StartupInfo: si,
+        lpAttributeList: std::ptr::null_mut(),
+    };
+    let mut storage: Vec<usize> = Vec::new();
+    let in_job = job_handle != NULL_HANDLE && attach_job_list(&mut siex, &job_handle, &mut storage);
+    let creation_flags = if in_job {
+        siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        creation_flags | EXTENDED_STARTUPINFO_PRESENT
+    } else {
+        creation_flags | CREATE_SUSPENDED
+    };
 
-    // SUSPENDED: the child must join the job object before it can spawn its own children.
-    if unsafe {
+    let created = unsafe {
         CreateProcessW(
             std::ptr::null(),
             cmd.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             1,
-            creation_flags | CREATE_SUSPENDED,
+            creation_flags,
             std::ptr::null(),
             cwd_ptr,
-            &si,
+            &siex.StartupInfo,
             &mut pi,
         )
-    } != 0
-    {
-        if job_handle != NULL_HANDLE
-            && unsafe { AssignProcessToJobObject(job_handle, pi.hProcess) } == 0
-        {
-            unsafe {
-                write_error_ctx("Could not assign process to job object", GetLastError());
-            }
-        }
-        // A failed resume would leave the shim blocked in WaitForSingleObject forever.
-        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
-            let err = unsafe { GetLastError() };
-            unsafe {
-                write_error_ctx("Could not resume suspended process", err);
-                // No job to end when CreateJobObjectW failed, so terminate the child itself.
-                if job_handle != NULL_HANDLE {
-                    TerminateJobObject(job_handle, 1);
-                } else {
-                    TerminateProcess(pi.hProcess, 1);
+    } != 0;
+    let create_err = if created {
+        0
+    } else {
+        unsafe { GetLastError() }
+    };
+    if in_job {
+        unsafe { DeleteProcThreadAttributeList(siex.lpAttributeList) };
+    }
+
+    if created {
+        if !in_job {
+            if job_handle != NULL_HANDLE
+                && unsafe { AssignProcessToJobObject(job_handle, pi.hProcess) } == 0
+            {
+                unsafe {
+                    write_error_ctx("Could not assign process to job object", GetLastError());
                 }
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
             }
-            std::process::exit(1);
+            // A failed resume would leave the shim blocked in WaitForSingleObject forever.
+            if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+                let err = unsafe { GetLastError() };
+                unsafe {
+                    write_error_ctx("Could not resume suspended process", err);
+                    // No job to end when CreateJobObjectW failed, so terminate the child itself.
+                    if job_handle != NULL_HANDLE {
+                        TerminateJobObject(job_handle, 1);
+                    } else {
+                        TerminateProcess(pi.hProcess, 1);
+                    }
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+                std::process::exit(1);
+            }
         }
         return (pi.hProcess, pi.hThread);
     }
 
     // Target manifest requires elevation: retry through ShellExecuteExW.
-    let err = unsafe { GetLastError() };
-    if err == ERROR_ELEVATION_REQUIRED {
+    if create_err == ERROR_ELEVATION_REQUIRED {
         let params = build_params(&info.args);
         return launch_elevated(path_w.as_slice(), &params, cwd_w.as_deref(), job_handle);
     }
@@ -1205,7 +1198,7 @@ fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     // Lossy copy only for the message; the spawn above used the raw UTF-16 line.
     write_error_wide(&to_wide(&String::from_utf16_lossy(&cmd[..cmd.len() - 1])));
     write_error_wide(&to_wide("'"));
-    write_error_sys(err);
+    write_error_sys(create_err);
     (NULL_HANDLE, NULL_HANDLE)
 }
 

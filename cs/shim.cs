@@ -102,15 +102,6 @@ namespace Scoop
             IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
             bool bInheritHandles, uint dwCreationFlags,
             IntPtr lpEnvironment, string? lpCurrentDirectory,
-            ref STARTUPINFO lpStartupInfo,
-            out PROCESS_INFORMATION lpProcessInformation);
-
-        [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
-        static extern bool CreateProcessExW(
-            string? lpApplicationName, StringBuilder lpCommandLine,
-            IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
-            bool bInheritHandles, uint dwCreationFlags,
-            IntPtr lpEnvironment, string? lpCurrentDirectory,
             ref STARTUPINFOEX lpStartupInfo,
             out PROCESS_INFORMATION lpProcessInformation);
 
@@ -1054,42 +1045,28 @@ namespace Scoop
             }
         }
 
-        // A child created suspended and then assigned exists outside the job until the assignment,
-        // and a shim killed in between leaves it suspended forever. The job-list attribute creates it
-        // inside the job instead. False when the attribute is unsupported (before Windows 10 1607)
-        // or the create fails, so the caller falls back to assigning, which reports either cause.
-        static bool CreateProcessInJob(string cmd, uint creationFlags, string? cwd, STARTUPINFO si, IntPtr jobHandle, out PROCESS_INFORMATION pi)
+        // Member from creation, so a shim killed mid-launch cannot leave the child behind; false
+        // when the platform has no such attribute, which is the only case that creates it suspended.
+        static bool AttachJobList(ref STARTUPINFOEX siex, IntPtr jobHandle, out IntPtr attributes, out IntPtr jobValue)
         {
-            pi = default;
             IntPtr size = IntPtr.Zero;
             InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
-            IntPtr attributes = Marshal.AllocHGlobal(size);
-            IntPtr jobList = Marshal.AllocHGlobal(IntPtr.Size);
-            try
+            attributes = Marshal.AllocHGlobal(size);
+            jobValue = Marshal.AllocHGlobal(IntPtr.Size);
+            // The attribute reads this value until CreateProcessW returns.
+            Marshal.WriteIntPtr(jobValue, jobHandle);
+            bool initialized = InitializeProcThreadAttributeList(attributes, 1, 0, ref size);
+            bool attached = initialized && UpdateProcThreadAttribute(attributes, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                jobValue, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero);
+            if (attached)
             {
-                if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref size)) return false;
-                try
-                {
-                    Marshal.WriteIntPtr(jobList, jobHandle);
-                    if (!UpdateProcThreadAttribute(attributes, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_JOB_LIST,
-                        jobList, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
-                        return false;
-                    var siex = new STARTUPINFOEX { StartupInfo = si, lpAttributeList = attributes };
-                    siex.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
-                    return CreateProcessExW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
-                        true, creationFlags | EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, cwd,
-                        ref siex, out pi);
-                }
-                finally
-                {
-                    DeleteProcThreadAttributeList(attributes);
-                }
+                siex.lpAttributeList = attributes;
+                return true;
             }
-            finally
-            {
-                Marshal.FreeHGlobal(jobList);
-                Marshal.FreeHGlobal(attributes);
-            }
+            if (initialized) DeleteProcThreadAttributeList(attributes);
+            Marshal.FreeHGlobal(jobValue);
+            Marshal.FreeHGlobal(attributes);
+            return false;
         }
 
         static int LaunchProcess(ShimInfo info, IntPtr jobHandle)
@@ -1142,36 +1119,55 @@ namespace Scoop
                     creationFlags |= CREATE_NO_WINDOW;
             }
 
-            if (jobHandle != IntPtr.Zero && CreateProcessInJob(cmd, creationFlags, info.Cwd, si, jobHandle, out pi))
+            // SUSPENDED without the attribute only: then the child must join the job before it can spawn.
+            var siex = new STARTUPINFOEX { StartupInfo = si };
+            IntPtr attributes = IntPtr.Zero;
+            IntPtr jobValue = IntPtr.Zero;
+            bool inJob = jobHandle != IntPtr.Zero && AttachJobList(ref siex, jobHandle, out attributes, out jobValue);
+            if (inJob)
             {
-                CloseHandle(pi.hThread);
-                return WaitAndGetExitCode(pi.hProcess);
+                siex.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
+            }
+            else
+            {
+                creationFlags |= CREATE_SUSPENDED;
             }
 
-            // SUSPENDED: the child must join the job object before it can spawn its own children.
-            if (CreateProcessW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
-                true, creationFlags | CREATE_SUSPENDED, IntPtr.Zero, info.Cwd,
-                ref si, out pi))
+            bool created = CreateProcessW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
+                true, creationFlags, IntPtr.Zero, info.Cwd, ref siex, out pi);
+            int createErr = created ? 0 : Marshal.GetLastWin32Error();
+            if (inJob)
             {
-                if (jobHandle != IntPtr.Zero)
-                {
-                    if (!AssignProcessToJobObject(jobHandle, pi.hProcess))
-                        ReportShimError("Could not assign process to job object", (uint)Marshal.GetLastWin32Error());
-                }
+                DeleteProcThreadAttributeList(attributes);
+                Marshal.FreeHGlobal(jobValue);
+                Marshal.FreeHGlobal(attributes);
+            }
 
-                // A failed resume leaves the child suspended while the shim waits on it forever.
-                if (ResumeThread(pi.hThread) == uint.MaxValue)
+            if (created)
+            {
+                if (!inJob)
                 {
-                    uint resumeErr = (uint)Marshal.GetLastWin32Error();
-                    ReportShimError("Could not resume suspended process", resumeErr);
-                    // No job to end when CreateJobObjectW failed, so terminate the child itself.
                     if (jobHandle != IntPtr.Zero)
-                        TerminateJobObject(jobHandle, 1);
-                    else
-                        TerminateProcess(pi.hProcess, 1);
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                    return 1;
+                    {
+                        if (!AssignProcessToJobObject(jobHandle, pi.hProcess))
+                            ReportShimError("Could not assign process to job object", (uint)Marshal.GetLastWin32Error());
+                    }
+
+                    // A failed resume leaves the child suspended while the shim waits on it forever.
+                    if (ResumeThread(pi.hThread) == uint.MaxValue)
+                    {
+                        uint resumeErr = (uint)Marshal.GetLastWin32Error();
+                        ReportShimError("Could not resume suspended process", resumeErr);
+                        // No job to end when CreateJobObjectW failed, so terminate the child itself.
+                        if (jobHandle != IntPtr.Zero)
+                            TerminateJobObject(jobHandle, 1);
+                        else
+                            TerminateProcess(pi.hProcess, 1);
+                        CloseHandle(pi.hThread);
+                        CloseHandle(pi.hProcess);
+                        return 1;
+                    }
                 }
 
                 CloseHandle(pi.hThread);
@@ -1179,13 +1175,12 @@ namespace Scoop
                 return WaitAndGetExitCode(pi.hProcess);
             }
 
-            int error = Marshal.GetLastWin32Error();
-            if (error == ERROR_ELEVATION_REQUIRED)
+            if (createErr == ERROR_ELEVATION_REQUIRED)
             {
                 return LaunchElevated(path, BuildParams(info.Args), info.Cwd, jobHandle);
             }
 
-            ReportShimError($"Could not create process with command '{cmd}'", (uint)error);
+            ReportShimError($"Could not create process with command '{cmd}'", (uint)createErr);
             return 1;
         }
 

@@ -1036,30 +1036,22 @@ enum class LineKind
     return result;
 }
 
-// A child created suspended and then assigned exists outside the job until the assignment,
-// and a shim killed in between leaves it suspended forever. The job-list attribute creates it
-// inside the job instead. False when the attribute is unsupported (before Windows 10 1607)
-// or the create fails, so the caller falls back to assigning, which reports either cause.
-[[nodiscard]] bool CreateProcessInJob(wchar_t* cmd, DWORD creationFlags, const wchar_t* cwd, const STARTUPINFOW& si, HANDLE jobHandle, PROCESS_INFORMATION& pi)
+// Member from creation, so a shim killed mid-launch cannot leave the child behind; false when
+// the platform has no such attribute, which is the only case that creates it suspended instead.
+[[nodiscard]] bool AttachJobList(HANDLE* jobHandle, STARTUPINFOEXW& siex, std::vector<std::byte>& storage)
 {
     SIZE_T size = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
-    std::vector<std::byte> buffer(size);
-    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
-    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &size)) [[unlikely]]
+    storage.resize(size);
+    siex.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+    if (!InitializeProcThreadAttributeList(siex.lpAttributeList, 1, 0, &size)) [[unlikely]]
         return false;
-
-    bool created = false;
-    if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobHandle, sizeof(jobHandle), nullptr, nullptr)) [[likely]]
+    if (!UpdateProcThreadAttribute(siex.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobHandle, sizeof(HANDLE), nullptr, nullptr)) [[unlikely]]
     {
-        STARTUPINFOEXW siex {};
-        siex.StartupInfo = si;
-        siex.StartupInfo.cb = sizeof(siex);
-        siex.lpAttributeList = attributes;
-        created = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, creationFlags | EXTENDED_STARTUPINFO_PRESENT, nullptr, cwd, &siex.StartupInfo, &pi);
+        DeleteProcThreadAttributeList(siex.lpAttributeList);
+        return false;
     }
-    DeleteProcThreadAttributeList(attributes);
-    return created;
+    return true;
 }
 
 [[nodiscard]] ProcessResult MakeProcess(const ShimInfo& info, HANDLE jobHandle)
@@ -1110,10 +1102,10 @@ enum class LineKind
     if (info.elevate) [[unlikely]]
         return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);
 
-    STARTUPINFOW si {};
-    si.cb = sizeof(si);
-    GetStartupInfoW(&si);
-    EnsureStandardHandles(si);
+    STARTUPINFOEXW siex {};
+    siex.StartupInfo.cb = sizeof(siex.StartupInfo);
+    GetStartupInfoW(&siex.StartupInfo);
+    EnsureStandardHandles(siex.StartupInfo);
 
     PROCESS_INFORMATION pi {};
 
@@ -1126,23 +1118,36 @@ enum class LineKind
     if (GetConsoleProcessList(&consolePid, 1) == 0)
     {
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-        const bool creatorOwnsOutput = (si.dwFlags & STARTF_USESTDHANDLES) != 0 || (out != nullptr && out != INVALID_HANDLE_VALUE);
+        const bool creatorOwnsOutput = (siex.StartupInfo.dwFlags & STARTF_USESTDHANDLES) != 0 || (out != nullptr && out != INVALID_HANDLE_VALUE);
         if (creatorOwnsOutput)
             creationFlags |= CREATE_NO_WINDOW;
     }
 
-    if (jobHandle && CreateProcessInJob(cmd.data(), creationFlags, cwd, si, jobHandle, pi)) [[likely]]
+    // SUSPENDED without the attribute only: then the child must join the job before it can spawn.
+    std::vector<std::byte> attributeStorage;
+    const bool inJob = jobHandle && AttachJobList(&jobHandle, siex, attributeStorage);
+    if (inJob)
     {
-        result.thread.reset(pi.hThread);
-        result.process.reset(pi.hProcess);
-        return result;
+        siex.StartupInfo.cb = sizeof(siex);
+        creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
+    }
+    else
+    {
+        creationFlags |= CREATE_SUSPENDED;
     }
 
-    // SUSPENDED: the child must join the job object before it can spawn its own children.
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, creationFlags | CREATE_SUSPENDED, nullptr, cwd, &si, &pi))
+    const BOOL created = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, creationFlags, nullptr, cwd, &siex.StartupInfo, &pi);
+    const DWORD createErr = created ? ERROR_SUCCESS : GetLastError();
+    if (inJob)
+        DeleteProcThreadAttributeList(siex.lpAttributeList);
+
+    if (created)
     {
         result.thread.reset(pi.hThread);
         result.process.reset(pi.hProcess);
+
+        if (inJob)
+            return result;
 
         if (jobHandle && !AssignProcessToJobObject(jobHandle, pi.hProcess)) [[unlikely]]
         {
@@ -1167,16 +1172,15 @@ enum class LineKind
     }
     else
     {
-        const DWORD err = GetLastError();
         // Target manifest requires elevation: retry through ShellExecuteExW.
-        if (err == ERROR_ELEVATION_REQUIRED)
+        if (createErr == ERROR_ELEVATION_REQUIRED)
             return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);
 
         std::wstring msg = L"Shim: Could not create process with command '";
         msg += cmd;
         msg += L"'";
         WriteErrorW(msg.c_str());
-        WriteErrorSys(err);
+        WriteErrorSys(createErr);
         return result;
     }
 

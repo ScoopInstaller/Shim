@@ -1155,34 +1155,21 @@ fn setEnvValue(name_z: [:0]const WCHAR, name: []const WCHAR, value: [:0]const WC
     }
 }
 
-// A child created suspended and then assigned exists outside the job until the assignment,
-// and a shim killed in between leaves it suspended forever. The job-list attribute creates it
-// inside the job instead. False when the attribute is unsupported (before Windows 10 1607)
-// or the create fails, so the caller falls back to assigning, which reports either cause.
-fn createProcessInJob(
-    allocator: std.mem.Allocator,
-    cmd: [*:0]WCHAR,
-    creation_flags: DWORD,
-    cwd: ?[*:0]const WCHAR,
-    si: *const windows.STARTUPINFOW,
-    job_handle: HANDLE,
-    pi: *windows.PROCESS.INFORMATION,
-) !bool {
+// Member from creation, so a shim killed mid-launch cannot leave the child behind; false when
+// the platform has no such attribute, which is the only case that creates it suspended instead.
+fn attachJobList(allocator: std.mem.Allocator, si_ex: *STARTUPINFOEXW, job_handle: *const HANDLE) !bool {
     var size: usize = 0;
     _ = InitializeProcThreadAttributeList(null, 1, 0, &size);
-    // usize elements keep the list pointer-aligned.
+    // usize elements keep the list pointer-aligned; the arena never frees individually.
     const buffer = try allocator.alloc(usize, (size + @sizeOf(usize) - 1) / @sizeOf(usize));
-    defer allocator.free(buffer);
     const attributes: *anyopaque = @ptrCast(buffer.ptr);
     if (!InitializeProcThreadAttributeList(attributes, 1, 0, &size).toBool()) return false;
-    defer DeleteProcThreadAttributeList(attributes);
-
-    const job_list = [1]HANDLE{job_handle};
-    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, @ptrCast(&job_list), @sizeOf(HANDLE), null, null).toBool()) return false;
-
-    var siex = STARTUPINFOEXW{ .StartupInfo = si.*, .lpAttributeList = attributes };
-    siex.StartupInfo.cb = @sizeOf(STARTUPINFOEXW);
-    return CreateProcessW(null, cmd, null, null, .TRUE, creation_flags | EXTENDED_STARTUPINFO_PRESENT, null, cwd, &siex.StartupInfo, pi).toBool();
+    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, @ptrCast(job_handle), @sizeOf(HANDLE), null, null).toBool()) {
+        DeleteProcThreadAttributeList(attributes);
+        return false;
+    }
+    si_ex.lpAttributeList = attributes;
+    return true;
 }
 
 fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: ?HANDLE) !ProcessResult {
@@ -1259,52 +1246,61 @@ fn makeProcess(allocator: std.mem.Allocator, info: *const ShimInfo, job_handle: 
     }
 
     const cwd_ptr: ?[*:0]const WCHAR = if (cwd) |c| @ptrCast(c.ptr) else null;
-    if (job_handle) |jh| {
-        if (try createProcessInJob(allocator, cmd.ptr, creation_flags, cwd_ptr, &si, jh, &pi)) {
-            result.thread = pi.hThread;
-            result.process = pi.hProcess;
-            return result;
-        }
-    }
 
-    // SUSPENDED: the child must join the job object before it can spawn its own children.
-    if (CreateProcessW(null, @ptrCast(@constCast(cmd.ptr)), null, null, .TRUE, creation_flags | CREATE_SUSPENDED, null, cwd_ptr, &si, &pi).toBool()) {
+    // SUSPENDED without the attribute only: then the child must join the job before it can spawn.
+    var job_value: HANDLE = undefined;
+    if (job_handle) |jh| job_value = jh;
+    var si_ex = STARTUPINFOEXW{ .StartupInfo = si, .lpAttributeList = null };
+    const in_job = job_handle != null and try attachJobList(allocator, &si_ex, &job_value);
+    if (in_job) {
+        si_ex.StartupInfo.cb = @sizeOf(STARTUPINFOEXW);
+        creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
+    } else {
+        creation_flags |= CREATE_SUSPENDED;
+    }
+    defer if (in_job) DeleteProcThreadAttributeList(si_ex.lpAttributeList.?);
+
+    const created = CreateProcessW(null, @ptrCast(@constCast(cmd.ptr)), null, null, .TRUE, creation_flags, null, cwd_ptr, &si_ex.StartupInfo, &pi).toBool();
+    const create_err: DWORD = if (created) 0 else GetLastError();
+
+    if (created) {
         result.thread = pi.hThread;
         result.process = pi.hProcess;
 
-        if (job_handle) |jh| {
-            if (!AssignProcessToJobObject(jh, pi.hProcess).toBool()) {
-                const job_err = GetLastError();
-                writeError("Shim: Could not assign process to job object");
-                writeErrorSys(job_err);
-            }
-        }
-        // A failed resume would leave the shim blocked in WaitForSingleObject forever.
-        if (ResumeThread(pi.hThread) == 0xFFFFFFFF) {
-            const resume_err = GetLastError();
-            writeError("Shim: Could not resume suspended process");
-            writeErrorSys(resume_err);
-            // No job to end when CreateJobObjectW failed, so terminate the child itself.
+        if (!in_job) {
             if (job_handle) |jh| {
-                _ = TerminateJobObject(jh, 1);
-            } else {
-                _ = TerminateProcess(pi.hProcess, 1);
+                if (!AssignProcessToJobObject(jh, pi.hProcess).toBool()) {
+                    const job_err = GetLastError();
+                    writeError("Shim: Could not assign process to job object");
+                    writeErrorSys(job_err);
+                }
             }
-            _ = windows.CloseHandle(pi.hThread);
-            _ = windows.CloseHandle(pi.hProcess);
-            result.process = null;
-            result.thread = null;
-            return result;
+            // A failed resume would leave the shim blocked in WaitForSingleObject forever.
+            if (ResumeThread(pi.hThread) == 0xFFFFFFFF) {
+                const resume_err = GetLastError();
+                writeError("Shim: Could not resume suspended process");
+                writeErrorSys(resume_err);
+                // No job to end when CreateJobObjectW failed, so terminate the child itself.
+                if (job_handle) |jh| {
+                    _ = TerminateJobObject(jh, 1);
+                } else {
+                    _ = TerminateProcess(pi.hProcess, 1);
+                }
+                _ = windows.CloseHandle(pi.hThread);
+                _ = windows.CloseHandle(pi.hProcess);
+                result.process = null;
+                result.thread = null;
+                return result;
+            }
         }
     } else {
-        const err = GetLastError();
-        if (err == ERROR_ELEVATION_REQUIRED) {
+        if (create_err == ERROR_ELEVATION_REQUIRED) {
             result.process = launchElevated(path.ptr, args_z, has_args, cwd, job_handle);
         } else {
             writeError("Shim: Could not create process with command '");
             writeErrorUtf8(cmd);
             writeError("'");
-            writeErrorSys(err);
+            writeErrorSys(create_err);
             return result;
         }
     }
