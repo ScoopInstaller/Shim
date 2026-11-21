@@ -7,6 +7,7 @@
 #include <shellapi.h>
 
 #include <array>
+#include <cstddef>
 #include <cwchar>
 #include <memory>
 #include <span>
@@ -17,6 +18,10 @@
 
 #ifndef ERROR_ELEVATION_REQUIRED
 #define ERROR_ELEVATION_REQUIRED 740
+#endif
+
+#ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
+#define PROC_THREAD_ATTRIBUTE_JOB_LIST 0x0002000D
 #endif
 
 using namespace std::string_view_literals;
@@ -1031,6 +1036,24 @@ enum class LineKind
     return result;
 }
 
+// Member from creation, so a shim killed mid-launch cannot leave the child behind; false when
+// the platform has no such attribute, which is the only case that creates it suspended instead.
+[[nodiscard]] bool AttachJobList(HANDLE* jobHandle, STARTUPINFOEXW& siex, std::vector<std::byte>& storage)
+{
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    storage.resize(size);
+    siex.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+    if (!InitializeProcThreadAttributeList(siex.lpAttributeList, 1, 0, &size)) [[unlikely]]
+        return false;
+    if (!UpdateProcThreadAttribute(siex.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobHandle, sizeof(HANDLE), nullptr, nullptr)) [[unlikely]]
+    {
+        DeleteProcThreadAttributeList(siex.lpAttributeList);
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] ProcessResult MakeProcess(const ShimInfo& info, HANDLE jobHandle)
 {
     ProcessResult result;
@@ -1079,16 +1102,15 @@ enum class LineKind
     if (info.elevate) [[unlikely]]
         return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);
 
-    STARTUPINFOW si {};
-    si.cb = sizeof(si);
-    GetStartupInfoW(&si);
-    EnsureStandardHandles(si);
+    STARTUPINFOEXW siex {};
+    siex.StartupInfo.cb = sizeof(siex.StartupInfo);
+    GetStartupInfoW(&siex.StartupInfo);
+    EnsureStandardHandles(siex.StartupInfo);
 
     PROCESS_INFORMATION pi {};
 
-    // SUSPENDED: the child must join the job object before it can spawn its own children.
     DWORD consolePid = 0;
-    DWORD creationFlags = CREATE_SUSPENDED;
+    DWORD creationFlags = 0;
 
     // GetConsoleProcessList, not GetConsoleWindow: NULL also means a windowless console.
     // Without the flag a console target gets a fresh windowed console; the flag is right
@@ -1096,15 +1118,36 @@ enum class LineKind
     if (GetConsoleProcessList(&consolePid, 1) == 0)
     {
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-        const bool creatorOwnsOutput = (si.dwFlags & STARTF_USESTDHANDLES) != 0 || (out != nullptr && out != INVALID_HANDLE_VALUE);
+        const bool creatorOwnsOutput = (siex.StartupInfo.dwFlags & STARTF_USESTDHANDLES) != 0 || (out != nullptr && out != INVALID_HANDLE_VALUE);
         if (creatorOwnsOutput)
             creationFlags |= CREATE_NO_WINDOW;
     }
 
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, creationFlags, nullptr, cwd, &si, &pi)) [[likely]]
+    // SUSPENDED without the attribute only: then the child must join the job before it can spawn.
+    std::vector<std::byte> attributeStorage;
+    const bool inJob = jobHandle && AttachJobList(&jobHandle, siex, attributeStorage);
+    if (inJob)
+    {
+        siex.StartupInfo.cb = sizeof(siex);
+        creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
+    }
+    else
+    {
+        creationFlags |= CREATE_SUSPENDED;
+    }
+
+    const BOOL created = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, creationFlags, nullptr, cwd, &siex.StartupInfo, &pi);
+    const DWORD createErr = created ? ERROR_SUCCESS : GetLastError();
+    if (inJob)
+        DeleteProcThreadAttributeList(siex.lpAttributeList);
+
+    if (created)
     {
         result.thread.reset(pi.hThread);
         result.process.reset(pi.hProcess);
+
+        if (inJob)
+            return result;
 
         if (jobHandle && !AssignProcessToJobObject(jobHandle, pi.hProcess)) [[unlikely]]
         {
@@ -1129,16 +1172,15 @@ enum class LineKind
     }
     else
     {
-        const DWORD err = GetLastError();
         // Target manifest requires elevation: retry through ShellExecuteExW.
-        if (err == ERROR_ELEVATION_REQUIRED)
+        if (createErr == ERROR_ELEVATION_REQUIRED)
             return LaunchElevated(path, BuildParams(info.args), cwd, jobHandle);
 
         std::wstring msg = L"Shim: Could not create process with command '";
         msg += cmd;
         msg += L"'";
         WriteErrorW(msg.c_str());
-        WriteErrorSys(err);
+        WriteErrorSys(createErr);
         return result;
     }
 

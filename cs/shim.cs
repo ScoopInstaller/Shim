@@ -36,6 +36,13 @@ namespace Scoop
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        struct STARTUPINFOEX
+        {
+            public STARTUPINFO StartupInfo;
+            public IntPtr lpAttributeList;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         struct PROCESS_INFORMATION
         {
             public IntPtr hProcess, hThread;
@@ -95,8 +102,21 @@ namespace Scoop
             IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
             bool bInheritHandles, uint dwCreationFlags,
             IntPtr lpEnvironment, string? lpCurrentDirectory,
-            ref STARTUPINFO lpStartupInfo,
+            ref STARTUPINFOEX lpStartupInfo,
             out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool UpdateProcThreadAttribute(
+            IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute,
+            IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
+
+        [DllImport("kernel32.dll")]
+        static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
@@ -225,6 +245,8 @@ namespace Scoop
 
         const uint CREATE_SUSPENDED = 0x00000004;
         const uint CREATE_NO_WINDOW = 0x08000000;
+        const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        const int PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D;
         const uint INFINITE = 0xFFFFFFFF;
         const uint WAIT_OBJECT_0 = 0x00000000;
         const uint SEE_MASK_NOCLOSEPROCESS = 0x00000040;
@@ -1023,6 +1045,30 @@ namespace Scoop
             }
         }
 
+        // Member from creation, so a shim killed mid-launch cannot leave the child behind; false
+        // when the platform has no such attribute, which is the only case that creates it suspended.
+        static bool AttachJobList(ref STARTUPINFOEX siex, IntPtr jobHandle, out IntPtr attributes, out IntPtr jobValue)
+        {
+            IntPtr size = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+            attributes = Marshal.AllocHGlobal(size);
+            jobValue = Marshal.AllocHGlobal(IntPtr.Size);
+            // The attribute reads this value until CreateProcessW returns.
+            Marshal.WriteIntPtr(jobValue, jobHandle);
+            bool initialized = InitializeProcThreadAttributeList(attributes, 1, 0, ref size);
+            bool attached = initialized && UpdateProcThreadAttribute(attributes, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                jobValue, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero);
+            if (attached)
+            {
+                siex.lpAttributeList = attributes;
+                return true;
+            }
+            if (initialized) DeleteProcThreadAttributeList(attributes);
+            Marshal.FreeHGlobal(jobValue);
+            Marshal.FreeHGlobal(attributes);
+            return false;
+        }
+
         static int LaunchProcess(ShimInfo info, IntPtr jobHandle)
         {
             foreach (var env in info.Env)
@@ -1063,7 +1109,7 @@ namespace Scoop
             // Without the flag a console target gets a fresh windowed console; the flag is right
             // only when the creator owns the output -- otherwise it needs a console of its own.
             uint consolePid = 0;
-            uint creationFlags = CREATE_SUSPENDED;
+            uint creationFlags = 0;
             if (GetConsoleProcessList(ref consolePid, 1) == 0)
             {
                 IntPtr shimOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1073,29 +1119,55 @@ namespace Scoop
                     creationFlags |= CREATE_NO_WINDOW;
             }
 
-            if (CreateProcessW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
-                true, creationFlags, IntPtr.Zero, info.Cwd,
-                ref si, out pi))
+            // SUSPENDED without the attribute only: then the child must join the job before it can spawn.
+            var siex = new STARTUPINFOEX { StartupInfo = si };
+            IntPtr attributes = IntPtr.Zero;
+            IntPtr jobValue = IntPtr.Zero;
+            bool inJob = jobHandle != IntPtr.Zero && AttachJobList(ref siex, jobHandle, out attributes, out jobValue);
+            if (inJob)
             {
-                if (jobHandle != IntPtr.Zero)
-                {
-                    if (!AssignProcessToJobObject(jobHandle, pi.hProcess))
-                        ReportShimError("Could not assign process to job object", (uint)Marshal.GetLastWin32Error());
-                }
+                siex.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
+            }
+            else
+            {
+                creationFlags |= CREATE_SUSPENDED;
+            }
 
-                // A failed resume leaves the child suspended while the shim waits on it forever.
-                if (ResumeThread(pi.hThread) == uint.MaxValue)
+            bool created = CreateProcessW(null, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero,
+                true, creationFlags, IntPtr.Zero, info.Cwd, ref siex, out pi);
+            int createErr = created ? 0 : Marshal.GetLastWin32Error();
+            if (inJob)
+            {
+                DeleteProcThreadAttributeList(attributes);
+                Marshal.FreeHGlobal(jobValue);
+                Marshal.FreeHGlobal(attributes);
+            }
+
+            if (created)
+            {
+                if (!inJob)
                 {
-                    uint resumeErr = (uint)Marshal.GetLastWin32Error();
-                    ReportShimError("Could not resume suspended process", resumeErr);
-                    // No job to end when CreateJobObjectW failed, so terminate the child itself.
                     if (jobHandle != IntPtr.Zero)
-                        TerminateJobObject(jobHandle, 1);
-                    else
-                        TerminateProcess(pi.hProcess, 1);
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                    return 1;
+                    {
+                        if (!AssignProcessToJobObject(jobHandle, pi.hProcess))
+                            ReportShimError("Could not assign process to job object", (uint)Marshal.GetLastWin32Error());
+                    }
+
+                    // A failed resume leaves the child suspended while the shim waits on it forever.
+                    if (ResumeThread(pi.hThread) == uint.MaxValue)
+                    {
+                        uint resumeErr = (uint)Marshal.GetLastWin32Error();
+                        ReportShimError("Could not resume suspended process", resumeErr);
+                        // No job to end when CreateJobObjectW failed, so terminate the child itself.
+                        if (jobHandle != IntPtr.Zero)
+                            TerminateJobObject(jobHandle, 1);
+                        else
+                            TerminateProcess(pi.hProcess, 1);
+                        CloseHandle(pi.hThread);
+                        CloseHandle(pi.hProcess);
+                        return 1;
+                    }
                 }
 
                 CloseHandle(pi.hThread);
@@ -1103,13 +1175,12 @@ namespace Scoop
                 return WaitAndGetExitCode(pi.hProcess);
             }
 
-            int error = Marshal.GetLastWin32Error();
-            if (error == ERROR_ELEVATION_REQUIRED)
+            if (createErr == ERROR_ELEVATION_REQUIRED)
             {
                 return LaunchElevated(path, BuildParams(info.Args), info.Cwd, jobHandle);
             }
 
-            ReportShimError($"Could not create process with command '{cmd}'", (uint)error);
+            ReportShimError($"Could not create process with command '{cmd}'", (uint)createErr);
             return 1;
         }
 
