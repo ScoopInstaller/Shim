@@ -22,7 +22,7 @@ That makes parity across the four the hard constraint: anything observable has t
 
 1. Read the shim file and classify every line.
 2. Apply the environment overrides to the shim's *own* environment.
-3. Create the child suspended, put it in a job object, resume it.
+3. Create the child inside a job object.
 4. Wait for it and exit with its code.
 
 Step 2 happens before step 3 for two reasons: `CreateProcessW` with a null environment inherits the shim's, so the overrides have to be in place first; and the target is resolved while the file is parsed, because `%~dp0` in the other fields is its directory.
@@ -39,9 +39,11 @@ The shim is not supposed to outlive its job, and the child is not supposed to ou
 
 **A job object ties them together.** `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means the child dies when the shim does, so a closed console window does not leave an orphaned process behind. `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` scopes that to the *direct* child: a process the tool deliberately detaches, or a server it spawns, is its own business. Owning the whole tree would break the tools a launcher exists to run.
 
-**The child is created suspended.** It has to be in the job before it can spawn anything of its own. Without `CREATE_SUSPENDED` there is a window between creation and job assignment in which the child can start a grandchild, and that grandchild escapes the job. This holds for the `CreateProcessW` path only; `ShellExecuteExW` has no suspended option, so the elevated path and its `ERROR_ELEVATION_REQUIRED` retry keep that window open (see Elevation).
+**The child is created inside the job.** `PROC_THREAD_ATTRIBUTE_JOB_LIST` makes it a member from its first instant, so no moment exists in which the shim can die and leave it behind. Creating it suspended and assigning it afterwards is not enough: the process object exists before `CreateProcessW` returns, so a shim terminated anywhere inside that call or before `AssignProcessToJobObject` leaves a child outside the job and never resumed, suspended for good. A caller that kills a shim moments after starting it -- a timeout, a cancelled request -- hits that window often enough to pile such processes up.
 
-**A job that could not be created is not fatal** -- every lane reports each job-object failure (create, set limits, assign) and runs ungoverned, and the resume-failure branch terminates the child directly, since a child that never resumes would sit suspended holding its image.
+The attribute needs Windows 10. Where the platform has no such attribute, the shim falls back to creating the child suspended and assigning it before resuming: the child still cannot start a grandchild that escapes the job, and the window stays only there. This holds for the `CreateProcessW` path only; `ShellExecuteExW` takes neither, so the elevated path and its `ERROR_ELEVATION_REQUIRED` retry keep a window open (see Elevation).
+
+**A job that could not be created is not fatal** -- every lane reports each job-object failure (create, set limits, assign) and runs ungoverned, and the fallback's resume-failure branch terminates the child directly, since a child that never resumes would sit suspended holding its image.
 
 **The console belongs to the child.** The shim swallows every console control event and returns `TRUE`. The user is interacting with the program the shim launched, so Ctrl+C has to reach it and not the shim -- and if the shim died on Ctrl+C, `KILL_ON_JOB_CLOSE` would take the child down with it. The handler is installed *before* the spawn, closing the window where a Ctrl event would kill both.
 

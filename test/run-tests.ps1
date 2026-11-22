@@ -1060,6 +1060,63 @@ Invoke-ShimTest "shim waits for long-running child" -Setup {
     @{ Pass = $pass; Message = "Exit: $($r.ExitCode), Elapsed: $($r.Elapsed.TotalSeconds)s" }
 }
 
+# A shim killed while it is creating its child must not leave that child behind: the child is
+# either in the job from its first instruction or the kill lands before it exists. Where the
+# create call sits in the launch differs per lane, so the kill delay sweeps the span measured
+# from a first launch. Any child that outlives its shim is a failure.
+$script:TestNumber++
+$num = $script:TestNumber
+$testDir = New-TestEnvironment
+$orphanName = "orphan-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+$testName = "#$num Killed shim leaves no child behind"
+function Get-OrphanCount { @([System.Diagnostics.Process]::GetProcessesByName($orphanName)).Count }
+function Start-OrphanShim {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new("$testDir\test.exe")
+    $startInfo.UseShellExecute = $false
+    [System.Diagnostics.Process]::Start($startInfo)
+}
+function Stop-OrphanShim($shim) {
+    try { $shim.Kill() } catch [System.InvalidOperationException] { }
+    $shim.WaitForExit()
+    $shim.Dispose()
+}
+try {
+    Copy-Item $probeExe "$testDir\$orphanName.exe"
+    Write-Shim $testDir "test" "path = $testDir\$orphanName.exe`nargs = wait 10000"
+
+    # Time the child's arrival: it sets the sweep, and a lane that creates no child fails here.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $shim = Start-OrphanShim
+    while ((Get-OrphanCount) -eq 0) {
+        if ($clock.ElapsedMilliseconds -ge 5000) { throw "The shim created no child within 5 s" }
+    }
+    $arrivalMs = $clock.ElapsedMilliseconds
+    $span = [Math]::Max(15, [int]($arrivalMs * 1.25))
+    Stop-OrphanShim $shim
+
+    $random = [System.Random]::new(1)
+    $launches = 40
+    for ($i = 0; $i -lt $launches; $i++) {
+        $shim = Start-OrphanShim
+        $delay = $random.Next(0, $span)
+        $wait = [System.Diagnostics.Stopwatch]::StartNew()
+        # Spin: Start-Sleep is as coarse as the launches it would space out.
+        while ($wait.ElapsedMilliseconds -lt $delay) { }
+        Stop-OrphanShim $shim
+    }
+
+    # KILL_ON_JOB_CLOSE ends the job's processes asynchronously once the shim's handle closes.
+    $clock.Restart()
+    while ((Get-OrphanCount) -gt 0 -and $clock.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 20 }
+    $survivors = Get-OrphanCount
+    Write-TestResult $testName ($survivors -eq 0) "Survivors after $launches kills spread over 0-$span ms (child appeared after $arrivalMs ms): $survivors"
+} catch {
+    Write-TestResult $testName $false $_.Exception.Message
+} finally {
+    Get-Process -Name $orphanName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Remove-TestEnvironment $testDir
+}
+
 # --- Special key handling ------------------------------------------------------
 
 Invoke-ShimTest "Special keys not leaked as env vars" -Setup {
