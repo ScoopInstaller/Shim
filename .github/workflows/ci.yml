@@ -271,7 +271,7 @@ jobs:
       id: changelog
       uses: mikepenz/release-changelog-builder-action@b0db9d18b53447ef9f940a46c8f31653c4d9f621 # v6.5.0
       with:
-        mode: "HYBRID"
+        mode: "COMMIT"
         fromTag: ${{ steps.fromtag.outputs.tag }}
         configurationJson: >
           {
